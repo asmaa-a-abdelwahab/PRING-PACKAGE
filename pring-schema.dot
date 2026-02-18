@@ -6,7 +6,7 @@ digraph PubChemRDF_PresentationReady_WithPlugins {
     fontname="Helvetica",
     fontsize=16,
     labelloc="t",
-    label="KG schema + Enrichment Plugins (for GCN interaction prediction)"
+    label="PRING (PubChem RDF Interaction Network Graph) schema"
   ];
 
   node [
