@@ -1,0 +1,8 @@
+rdflib
+rdflib-neo4j
+neo4j
+neo4j-driver
+requests
+tenacity
+pyyaml
+pydantic
