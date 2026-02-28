@@ -1,0 +1,71 @@
+project:
+  name: "cyp450_kg"
+  data_dir: "data/"
+  cache_dir: "data/cache/"
+  seeds:
+    proteins_uniprot: ["P08684", "P05181"]   # example CYPs
+    genes: []
+    compounds_cid: []
+  scope:
+    include_text_mining: false
+    include_optional_context: true
+
+pubchem_rdf:
+  source: "ftp"
+  formats: ["nt.gz"]     # prefer n-triples for speed
+  datasets:
+    - compound
+    - substance
+    - protein
+    - gene
+    - bioassay
+    - measuregroup
+    - endpoint
+    - reference
+    - source
+    - pathway
+    - cooccurrence
+
+neo4j:
+  uri: "bolt://localhost:7687"
+  user: "neo4j"
+  password: "password"
+  database: "neo4j"
+  batch_size: 2000
+
+derive_interactions:
+  enabled: true
+  aggregation:
+    by: ["compound", "protein"]
+    endpoint_priority: ["Ki", "Kd", "IC50"]
+    choose: "best"     # best (min) or median
+    outcome_positive: ["active", "probe"]
+
+plugins:
+  uniprot:
+    enabled: true
+  go:
+    enabled: false
+  reactome:
+    enabled: false
+  interpro:
+    enabled: false
+  chembl:
+    enabled: false
+  bindingdb:
+    enabled: false
+  drugbank:
+    enabled: false
+  pdb:
+    enabled: false
+  alphafold:
+    enabled: false
+  molgraph:
+    enabled: true
+    fingerprint: "morgan"
+    radius: 2
+    nbits: 2048
+  embeddings:
+    enabled: true
+    model: "esm2_t33_650M"
+    store_in_neo4j: true
