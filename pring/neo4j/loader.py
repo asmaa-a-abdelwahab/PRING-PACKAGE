@@ -60,10 +60,10 @@ class Neo4jLoader:
             if not keys:
                 raise ValueError(f"No node key mapping for label '{label}'")
             cypher = f"""
-UNWIND $rows AS row
-MERGE (n:{label} {_merge_map_expr(keys, "row.key")})
-SET n += row.props
-""".strip()
+                    UNWIND $rows AS row
+                    MERGE (n:{label} {_merge_map_expr(keys, "row.key")})
+                    SET n += row.props
+                    """.strip()
             for chunk in _chunked(batch, self.settings.batch_size):
                 self.driver.execute(cypher, {"rows": chunk})
 
@@ -76,7 +76,8 @@ SET n += row.props
         for rtype, batch in by_type.items():
             by_pair: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
             for r in batch:
-                s = r.get("start", {}); e = r.get("end", {})
+                s = r.get("start", {})
+                e = r.get("end", {})
                 sl, el = s.get("label"), e.get("label")
                 if sl and el:
                     by_pair.setdefault((sl, el), []).append(r)

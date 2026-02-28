@@ -34,10 +34,12 @@ def to_graph_records(rows: Iterable[PubChemRow]) -> Tuple[List[Dict], List[Dict]
             rels.append({"type": "HAS_STRUCTURE", "start": {"label": "Compound", "key": {"cid": cid}}, "end": {"label": "Structure", "key": {"cid": cid}}, "props": {}})
 
         elif r.kind == "substance":
-            sid = d.get("sid"); cid = d.get("cid")
+            sid = d.get("sid")
+            cid = d.get("cid")
             if sid is None or cid is None:
                 continue
-            sid = int(sid); cid = int(cid)
+            sid = int(sid)
+            cid = int(cid)
             nodes.append({"label": "Substance", "key": {"sid": sid}, "props": {"sid": sid}})
             rels.append({"type": "STANDARDIZED_TO", "start": {"label": "Substance", "key": {"sid": sid}}, "end": {"label": "Compound", "key": {"cid": cid}}, "props": {}})
             if d.get("source_id"):
