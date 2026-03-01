@@ -22,15 +22,6 @@ def _parse_int_or_none(v: Optional[str]) -> Optional[int]:
     return int(v)
 
 
-def _read_cids(path: Path) -> List[int]:
-    raw = load_id_file(path)
-    cids: List[int] = []
-    for s in raw:
-        s = s.strip()
-        if s.upper().startswith("CID"):
-            s = s[3:]
-        cids.append(int(s))
-    return cids
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -106,14 +97,10 @@ def main() -> None:
     neo_kwargs = dict(uri=neo.uri, user=neo.user, password=neo.password, database=neo.database,
                       encrypted=neo.encrypted, max_connection_lifetime=neo.max_connection_lifetime,
                       max_connection_pool_size=neo.max_connection_pool_size, connection_timeout=neo.connection_timeout)
-    if args.neo4j_uri: 
-        neo_kwargs["uri"] = args.neo4j_uri
-    if args.neo4j_user: 
-        neo_kwargs["user"] = args.neo4j_user
-    if args.neo4j_password: 
-        neo_kwargs["password"] = args.neo4j_password
-    if args.neo4j_db: 
-        neo_kwargs["database"] = args.neo4j_db
+    if args.neo4j_uri: neo_kwargs["uri"] = args.neo4j_uri
+    if args.neo4j_user: neo_kwargs["user"] = args.neo4j_user
+    if args.neo4j_password: neo_kwargs["password"] = args.neo4j_password
+    if args.neo4j_db: neo_kwargs["database"] = args.neo4j_db
     settings = settings.with_overrides(neo4j=settings.neo4j.__class__(**neo_kwargs))
 
     # Flags / caps overrides
@@ -164,11 +151,11 @@ def main() -> None:
         return
 
     # Build command
-    chem_ids = _read_cids(Path(args.chem_ids)) if args.chem_ids else []
+    chem_ids = load_id_file(Path(args.chem_ids)) if args.chem_ids else []
     target_ids = load_id_file(Path(args.target_ids)) if args.target_ids else []
 
     mode = decide_mode(args.mode)
-    scope = decide_scope(args.scope, [str(x) for x in chem_ids], target_ids)
+    scope = decide_scope(args.scope, chem_ids, target_ids)
 
     print(f"🧭 Plan: mode={mode.value} scope={scope.value} chem_ids={len(chem_ids)} target_ids={len(target_ids)}")
     print(f"   caps={settings.caps}")
@@ -179,7 +166,7 @@ def main() -> None:
     # Extraction (RDF-REST is implemented as a structured skeleton)
     rows: List[PubChemRow] = []
     if mode == Mode.rdf_rest:
-        client = PubChemRdfRestClient(settings.rdf_rest)
+        client = PubChemRdfRestClient(settings.rdf_rest, cache_dir=settings.cache_dir / "rdfrest")
         extractor = PubChemRdfRestExtractor(client)
         try:
             if scope == Scope.intersection:

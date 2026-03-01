@@ -690,6 +690,35 @@ def load_seed_file(path: str) -> list[Seed]:
 
   * `(:Compound)-[:INTERACTS_WITH]->(:Protein)` aggregated for modeling
 
----
+```
+# 1) Create Neo4j constraints
+python -m pring schema --schema-dot pring-schema.dot \
+  --neo4j-uri bolt://localhost:7687 --neo4j-user neo4j --neo4j-password neo4j
 
-If you want, I can write the **exact extraction plan as query templates** for SPARQL (chunked `VALUES`) that populate every node/edge in your schema (A–F), plus a clean **Neo4j loader module** (constraints + batch upserts) and a **plugin base class** that lets you add UniProt/RDKit/ESM without touching core code.
+# 2) Build (intersection is default when both files are provided)
+python -m pring build --schema-dot schema/pring-schema.dot \
+  --chem-ids chemicals.txt \
+  --target-ids targets.txt \
+  --max-measuregroups-per-target 200 \
+  --max-endpoints-per-pair 50
+```
+
+
+
+python -m pring schema `
+  --schema-dot pring-schema.dot `
+  --neo4j-uri neo4j+s://4d6ba586.databases.neo4j.io `
+  --neo4j-user neo4j `
+  --neo4j-password "ZBerzvtOArtAus44d5yNZI9j2ZavdxSpqHBDPw270Tk" `
+
+python -m pring `
+  --neo4j-uri neo4j+s://4d6ba586.databases.neo4j.io `
+  --neo4j-user neo4j `
+  --neo4j-password "ZBerzvtOArtAus44d5yNZI9j2ZavdxSpqHBDPw270Tk" `
+  --neo4j-db neo4j `
+  --schema-dot schema/pring-schema.dot `
+  --chem-ids chemicals.txt `
+  --target-ids targets.txt `
+  --max-measuregroups-per-target 200 `
+  --max-endpoints-per-pair 50 `
+  build

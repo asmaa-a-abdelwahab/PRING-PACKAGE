@@ -25,7 +25,6 @@ class Neo4jDriver:
         self._driver = GraphDatabase.driver(
             self.cfg.uri,
             auth=(self.cfg.user, self.cfg.password),
-            encrypted=self.cfg.encrypted,
             max_connection_lifetime=self.cfg.max_connection_lifetime,
             max_connection_pool_size=self.cfg.max_connection_pool_size,
             connection_timeout=self.cfg.connection_timeout,
