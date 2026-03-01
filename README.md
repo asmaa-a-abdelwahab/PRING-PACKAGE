@@ -712,6 +712,11 @@ python -m pring schema `
   --neo4j-password "ZBerzvtOArtAus44d5yNZI9j2ZavdxSpqHBDPw270Tk" `
 
 python -m pring `
+  --out-dir runs `
+  --console-log-level INFO `
+  --file-log-level DEBUG `
+  --save-raw true `
+  --save-extracted true `
   --neo4j-uri neo4j+s://4d6ba586.databases.neo4j.io `
   --neo4j-user neo4j `
   --neo4j-password "ZBerzvtOArtAus44d5yNZI9j2ZavdxSpqHBDPw270Tk" `
@@ -719,6 +724,9 @@ python -m pring `
   --schema-dot schema/pring-schema.dot `
   --chem-ids chemicals.txt `
   --target-ids targets.txt `
-  --max-measuregroups-per-target 200 `
+  --scope expand-from-compounds `
+  --max-substances-per-compound 50 `
+  --max-measuregroups-per-compound 50 `
+  --max-targets-per-compound 50 `
   --max-endpoints-per-pair 50 `
   build

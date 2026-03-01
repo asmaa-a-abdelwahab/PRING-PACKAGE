@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import logging
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -11,6 +13,9 @@ from pring.extract.pubchem_core import PubChemRow, to_graph_records
 from pring.neo4j.driver import Neo4jDriver
 from pring.neo4j.loader import Neo4jLoader
 from pring.plugins import load_plugins, normalize_plugin_list
+from pring.utils import setup_logging, RunStore
+
+log = logging.getLogger("pring")
 
 
 def _parse_int_or_none(v: Optional[str]) -> Optional[int]:
@@ -60,6 +65,16 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--batch-size", type=int, default=None, help="Neo4j UNWIND batch size (default from Settings).")
     ap.add_argument("--dry-run", action="store_true", help="Plan + fetch (optional), but do not write to Neo4j.")
 
+    # Output + logging
+    ap.add_argument("--out-dir", type=str, default="runs", help="Where to store run artifacts (logs, cached responses, extracted graph).")
+    ap.add_argument("--run-id", type=str, default=None, help="Run identifier (default: timestamp).")
+    ap.add_argument("--save-raw", type=str, choices=["true", "false"], default="true",
+                    help="Save raw PubChem RDF-REST responses locally (default: true).")
+    ap.add_argument("--save-extracted", type=str, choices=["true", "false"], default="true",
+                    help="Save extracted rows/nodes/rels locally (default: true).")
+    ap.add_argument("--console-log-level", type=str, default="INFO", help="Console log level (INFO/WARNING/ERROR).")
+    ap.add_argument("--file-log-level", type=str, default="DEBUG", help="Log file level (DEBUG/INFO/WARNING/ERROR).")
+
     # Plugins
     ap.add_argument("--plugins", nargs="*", default=None,
                     help="Plugin names (e.g., molgraph embeddings uniprot) or full paths (module:callable).")
@@ -85,6 +100,20 @@ def main() -> None:
     args = build_argparser().parse_args()
     settings = Settings.from_env()
 
+    # Run folder + logging (early)
+    run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = Path(args.out_dir) / run_id
+    store = RunStore(
+        run_dir=run_dir,
+        save_raw=(args.save_raw == "true"),
+        save_extracted=(args.save_extracted == "true"),
+    )
+    log_path = setup_logging(
+        log_dir=store.logs_dir,
+        console_level=args.console_log_level,
+        file_level=args.file_log_level,
+    )
+
     # Override settings from CLI
     if args.schema_dot:
         settings = settings.with_overrides(schema_dot_path=Path(args.schema_dot))
@@ -92,6 +121,9 @@ def main() -> None:
         settings = settings.with_overrides(batch_size=int(args.batch_size))
     if args.cache_dir:
         settings = settings.with_overrides(cache_dir=Path(args.cache_dir))
+    else:
+        # Default cache dir per run (keeps thesis runs reproducible)
+        settings = settings.with_overrides(cache_dir=store.http_cache_dir)
 
     # Neo4j overrides
     neo = settings.neo4j
@@ -130,26 +162,26 @@ def main() -> None:
 
     if args.cmd == "schema":
         if args.dry_run:
-            print("dry-run: schema command does not write constraints.")
+            log.info("dry-run: schema command does not write constraints.")
             return
         with Neo4jDriver(settings.neo4j) as driver:
             loader = Neo4jLoader(settings=settings, driver=driver)
             loader.validate_against_dot_schema()
             loader.ensure_schema()
-            print("✅ Neo4j schema constraints applied.")
+            log.info("✅ Neo4j schema constraints applied.")
             return
 
     if args.cmd == "demo":
         nodes, rels = to_graph_records(_demo_rows())
         if args.dry_run:
-            print(f"[dry-run] would load demo: {len(nodes)} nodes, {len(rels)} rels")
+            log.info("[dry-run] would load demo: %d nodes, %d relationships", len(nodes), len(rels))
             return
         with Neo4jDriver(settings.neo4j) as driver:
             loader = Neo4jLoader(settings=settings, driver=driver)
             loader.ensure_schema()
             loader.upsert_nodes(nodes)
             loader.upsert_relationships(rels)
-        print("✅ Demo graph loaded.")
+        log.info("✅ Demo graph loaded.")
         return
 
     # Build command
@@ -159,30 +191,61 @@ def main() -> None:
     mode = decide_mode(args.mode)
     scope = decide_scope(args.scope, chem_ids, target_ids)
 
-    print(f"🧭 Plan: mode={mode.value} scope={scope.value} chem_ids={len(chem_ids)} target_ids={len(target_ids)}")
-    print(f"   caps={settings.caps}")
-    print(f"   flags={settings.flags}")
+    log.info("🧭 Plan: mode=%s scope=%s chem_ids=%d target_ids=%d", mode.value, scope.value, len(chem_ids), len(target_ids))
+    log.info("caps=%s", settings.caps)
+    log.info("flags=%s", settings.flags)
     if settings.enabled_plugins:
-        print(f"   plugins={settings.enabled_plugins}")
+        log.info("plugins=%s", settings.enabled_plugins)
+
+    # Save run manifest (redact Neo4j password)
+    store.write_manifest({
+        "run_id": run_id,
+        "started_at": datetime.now().isoformat(),
+        "mode": mode.value,
+        "scope": scope.value,
+        "inputs": {
+            "chem_ids": str(args.chem_ids) if args.chem_ids else None,
+            "target_ids": str(args.target_ids) if args.target_ids else None,
+        },
+        "caps": settings.caps.__dict__,
+        "flags": settings.flags.__dict__,
+        "plugins": settings.enabled_plugins,
+        "neo4j": {
+            "uri": settings.neo4j.uri,
+            "user": settings.neo4j.user,
+            "database": settings.neo4j.database,
+        },
+        "paths": {
+            "run_dir": str(run_dir),
+            "log_file": str(log_path),
+            "cache_dir": str(settings.cache_dir),
+        },
+    })
+    log.info("Run dir: %s", run_dir)
+    log.info("Log file: %s", log_path)
 
     # Extraction (RDF-REST is implemented as a structured skeleton)
     rows: List[PubChemRow] = []
     if mode == Mode.rdf_rest:
-        client = PubChemRdfRestClient(settings.rdf_rest, cache_dir=settings.cache_dir / "rdfrest")
+        rdfrest_cache = (settings.cache_dir / "rdfrest") if (args.save_raw == "true") else None
+        client = PubChemRdfRestClient(settings.rdf_rest, cache_dir=rdfrest_cache)
         extractor = PubChemRdfRestExtractor(client)
         try:
             if scope == Scope.intersection:
                 # Case A
                 for d in extractor.iter_intersection_evidence(chem_ids, target_ids, caps=settings.caps, flags=settings.flags):
                     rows.append(PubChemRow(kind=d["kind"], data=d["data"]))
+                    store.save_row(d["kind"], d["data"])
             elif scope == Scope.expand_from_targets:
                 # Case B
                 for d in extractor.iter_expand_from_targets(target_ids, caps=settings.caps, flags=settings.flags):
                     rows.append(PubChemRow(kind=d["kind"], data=d["data"]))
+                    store.save_row(d["kind"], d["data"])
             else:
                 # Case C
                 for d in extractor.iter_expand_from_compounds(chem_ids, caps=settings.caps, flags=settings.flags):
                     rows.append(PubChemRow(kind=d["kind"], data=d["data"]))
+                    store.save_row(d["kind"], d["data"])
         finally:
             client.close()
     else:
@@ -192,6 +255,10 @@ def main() -> None:
     # Note: plugins can also be run as standalone passes that 'observe' Neo4j, but we keep it pure here.
     nodes, rels = to_graph_records(rows)
 
+    log.info("Extracted rows=%d -> nodes=%d rels=%d", len(rows), len(nodes), len(rels))
+    store.save_nodes(nodes)
+    store.save_relationships(rels)
+
     for plugin in load_plugins(settings.enabled_plugins):
         if not plugin.enabled(settings):
             continue
@@ -200,7 +267,7 @@ def main() -> None:
             rels.extend(delta.rels)
 
     if args.dry_run:
-        print(f"[dry-run] would load: {len(nodes)} nodes, {len(rels)} rels")
+        log.info("[dry-run] would load: %d nodes, %d relationships", len(nodes), len(rels))
         return
 
     with Neo4jDriver(settings.neo4j) as driver:
@@ -210,7 +277,7 @@ def main() -> None:
         loader.upsert_nodes(nodes)
         loader.upsert_relationships(rels)
 
-    print(f"✅ Loaded: {len(nodes)} nodes, {len(rels)} relationships.")
+    log.info("✅ Loaded: %d nodes, %d relationships.", len(nodes), len(rels))
 
 
 if __name__ == "__main__":

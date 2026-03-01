@@ -8,3 +8,4 @@ pring/io/__pycache__/
 pring/neo4j/__pycache__/
 pring/plugins/__pycache__/
 __pycache__/
+runs/
