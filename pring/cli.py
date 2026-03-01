@@ -50,6 +50,7 @@ def build_argparser() -> argparse.ArgumentParser:
     # Caps (for Case B/C)
     ap.add_argument("--max-compounds-per-target", type=str, default=None)
     ap.add_argument("--max-targets-per-compound", type=str, default=None)
+    ap.add_argument("--max-substances-per-compound", type=str, default=None)
     ap.add_argument("--max-measuregroups-per-target", type=str, default=None)
     ap.add_argument("--max-measuregroups-per-compound", type=str, default=None)
     ap.add_argument("--max-endpoints-per-pair", type=str, default=None)
@@ -115,6 +116,7 @@ def main() -> None:
     caps = settings.caps.__class__(
         max_compounds_per_target=_parse_int_or_none(args.max_compounds_per_target) or settings.caps.max_compounds_per_target,
         max_targets_per_compound=_parse_int_or_none(args.max_targets_per_compound) or settings.caps.max_targets_per_compound,
+        max_substances_per_compound=_parse_int_or_none(args.max_substances_per_compound) or settings.caps.max_substances_per_compound,
         max_measuregroups_per_target=_parse_int_or_none(args.max_measuregroups_per_target) or settings.caps.max_measuregroups_per_target,
         max_measuregroups_per_compound=_parse_int_or_none(args.max_measuregroups_per_compound) or settings.caps.max_measuregroups_per_compound,
         max_endpoints_per_pair=_parse_int_or_none(args.max_endpoints_per_pair) or settings.caps.max_endpoints_per_pair,

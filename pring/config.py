@@ -37,6 +37,9 @@ class BuildCaps:
     """Caps to keep graphs thesis-friendly."""
     max_compounds_per_target: Optional[int] = None
     max_targets_per_compound: Optional[int] = None
+    # When expanding from compounds, a single CID can map to thousands of SIDs.
+    # Cap how many substances we will traverse per compound.
+    max_substances_per_compound: Optional[int] = None
     max_measuregroups_per_target: Optional[int] = None
     max_measuregroups_per_compound: Optional[int] = None
     max_endpoints_per_pair: Optional[int] = None
@@ -132,6 +135,7 @@ class Settings:
         caps = BuildCaps(
             max_compounds_per_target=_int_or_none(_env("PRING_MAX_COMPOUNDS_PER_TARGET")),
             max_targets_per_compound=_int_or_none(_env("PRING_MAX_TARGETS_PER_COMPOUND")),
+            max_substances_per_compound=_int_or_none(_env("PRING_MAX_SUBS_PER_COMPOUND")),
             max_measuregroups_per_target=_int_or_none(_env("PRING_MAX_MG_PER_TARGET")),
             max_measuregroups_per_compound=_int_or_none(_env("PRING_MAX_MG_PER_COMPOUND")),
             max_endpoints_per_pair=_int_or_none(_env("PRING_MAX_ENDPOINTS_PER_PAIR")),
