@@ -725,8 +725,8 @@ python -m pring `
   --chem-ids chemicals.txt `
   --target-ids targets.txt `
   --scope expand-from-compounds `
-  --max-substances-per-compound 50 `
-  --max-measuregroups-per-compound 50 `
-  --max-targets-per-compound 50 `
-  --max-endpoints-per-pair 50 `
+  --max-substances-per-compound 5 `
+  --max-measuregroups-per-compound 5 `
+  --max-targets-per-compound 5 `
+  --max-endpoints-per-pair 5 `
   build

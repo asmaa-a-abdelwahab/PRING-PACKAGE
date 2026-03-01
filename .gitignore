@@ -1,5 +1,4 @@
 .venv/
-README.md
 pring/__pycache__/
 pring/export/__pycache__/
 pring/transform/__pycache__/
@@ -9,3 +8,4 @@ pring/neo4j/__pycache__/
 pring/plugins/__pycache__/
 __pycache__/
 runs/
+README.md
