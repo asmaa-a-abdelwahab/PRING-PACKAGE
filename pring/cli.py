@@ -51,6 +51,12 @@ def build_argparser() -> argparse.ArgumentParser:
     # Flags
     ap.add_argument("--include-textmining", type=str, choices=["true", "false"], default=None)
     ap.add_argument("--include-optional-context", type=str, choices=["true", "false"], default=None)
+    ap.add_argument(
+        "--taxid",
+        type=str,
+        default=None,
+        help="Optional taxonomy filter. Examples: 9606 or TAXID9606 or 9606,10090."
+    )
 
     # Caps (for Case B/C)
     ap.add_argument("--max-compounds-per-target", type=str, default=None)
@@ -140,10 +146,22 @@ def main() -> None:
     flags = settings.flags
     if args.include_textmining is not None:
         flags = flags.__class__(include_textmining=(args.include_textmining == "true"),
-                                include_optional_context=flags.include_optional_context)
+                                include_optional_context=flags.include_optional_context,
+                                taxids=getattr(flags, "taxids", None))
     if args.include_optional_context is not None:
         flags = flags.__class__(include_textmining=flags.include_textmining,
-                                include_optional_context=(args.include_optional_context == "true"))
+                                include_optional_context=(args.include_optional_context == "true"),
+                                taxids=getattr(flags, "taxids", None))
+
+    # Taxonomy override (applies to evidence filtering + symbol->gene resolution)
+    if args.taxid is not None:
+        from pring.config import _parse_taxids
+        taxids = _parse_taxids(args.taxid)
+        flags = flags.__class__(
+            include_textmining=flags.include_textmining,
+            include_optional_context=flags.include_optional_context,
+            taxids=taxids,
+        )
 
     caps = settings.caps.__class__(
         max_compounds_per_target=_parse_int_or_none(args.max_compounds_per_target) or settings.caps.max_compounds_per_target,
@@ -247,6 +265,10 @@ def main() -> None:
                     rows.append(PubChemRow(kind=d["kind"], data=d["data"]))
                     store.save_row(d["kind"], d["data"])
         finally:
+            try:
+                extractor.close()
+            except Exception:
+                pass
             client.close()
     else:
         raise NotImplementedError("FTP mode is not implemented in this starter (you can add bulk dump ingestion later).")

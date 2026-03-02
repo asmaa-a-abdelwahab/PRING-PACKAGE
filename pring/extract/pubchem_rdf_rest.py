@@ -21,6 +21,7 @@ Notes on response format:
 """
 
 from dataclasses import dataclass
+from dataclasses import field
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -33,6 +34,7 @@ from html import unescape
 from pring.config import RdfRestConfig
 from pring.io.http import HttpClient
 from pring.transform.normalizer import make_stable_id, normalize_id
+from urllib.parse import quote
 
 
 _NTRIPLE = re.compile(
@@ -278,10 +280,84 @@ class PubChemRdfRestClient:
 
 
 @dataclass
+class PubChemPugClient:
+    """Minimal PubChem PUG-REST resolver for convenience seed formats.
+
+    This is used only to resolve user-friendly inputs (InChIKey/SMILES/InChI)
+    into PubChem CIDs, after which the KG is built from PubChemRDF.
+    """
+
+    base_url: str = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
+    cache_dir: Optional[Path] = None
+    timeout_s: float = 60.0
+    max_retries: int = 3
+
+    def __post_init__(self) -> None:
+        headers = {"User-Agent": "pring/0.1 (+https://example.org)", "Accept": "application/json"}
+        self.http = HttpClient(timeout_s=self.timeout_s, max_retries=self.max_retries, headers=headers, cache_dir=self.cache_dir)
+
+    def close(self) -> None:
+        self.http.close()
+
+    def _get(self, path: str) -> Dict[str, Any]:
+        url = self.base_url.rstrip("/") + "/" + path.lstrip("/")
+        return self.http.get_json(url)
+
+    def _extract_cids(self, data: Dict[str, Any]) -> List[int]:
+        # PUG JSON: {"IdentifierList":{"CID":[...]}}
+        try:
+            cids = (((data or {}).get("IdentifierList") or {}).get("CID"))
+            if isinstance(cids, list):
+                return [int(x) for x in cids if str(x).isdigit()]
+        except Exception:
+            pass
+        return []
+
+    def cids_from_inchikey(self, inchikey: Optional[str]) -> List[int]:
+        if not inchikey:
+            return []
+        ik = inchikey.strip()
+        data = self._get(f"compound/inchikey/{quote(ik)}/cids/JSON")
+        return self._extract_cids(data)
+
+    def cids_from_smiles(self, smiles: Optional[str]) -> List[int]:
+        if not smiles:
+            return []
+        smi = smiles.strip()
+        data = self._get(f"compound/smiles/{quote(smi, safe='')}/cids/JSON")
+        return self._extract_cids(data)
+
+    def cids_from_inchi(self, inchi: Optional[str]) -> List[int]:
+        if not inchi:
+            return []
+        inc = inchi.strip()
+        data = self._get(f"compound/inchi/{quote(inc, safe='')}/cids/JSON")
+        return self._extract_cids(data)
+
+
+@dataclass
 class PubChemRdfRestExtractor:
     """Extract PRING graph from PubChemRDF via RDF REST triple-pattern queries."""
 
     client: PubChemRdfRestClient
+    pug: "PubChemPugClient" = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # Reuse the same base cache folder as rdf-rest when available.
+        base_cache: Optional[Path] = None
+        if getattr(self.client, "cache_dir", None) is not None:
+            try:
+                base_cache = Path(self.client.cache_dir).parent
+            except Exception:
+                base_cache = None
+        pug_cache = (base_cache / "pugrest") if base_cache is not None else None
+        self.pug = PubChemPugClient(cache_dir=pug_cache)
+
+    def close(self) -> None:
+        try:
+            self.pug.close()
+        except Exception:
+            pass
 
     _PUBCHEM_IRI_RE = re.compile(r"^https?://rdf\.ncbi\.nlm\.nih\.gov/pubchem/([^/]+)/([^/#]+)$")
 
@@ -358,8 +434,14 @@ class PubChemRdfRestExtractor:
     def parse_chemical_seed(self, raw: str) -> Dict[str, Any]:
         s = raw.strip()
         u = s.upper()
+        # Common relaxed formats
+        s2 = re.sub(r"\s+", "", s)
+        u2 = s2.upper()
         if s.isdigit():
             cid = int(s)
+            return {"kind": "cid", "cid": cid, "compound": f"compound:CID{cid}"}
+        if u2.startswith("CID=") and u2[4:].isdigit():
+            cid = int(u2[4:])
             return {"kind": "cid", "cid": cid, "compound": f"compound:CID{cid}"}
         if u.startswith("CID:"):
             cid = int(s.split(":", 1)[1])
@@ -370,9 +452,24 @@ class PubChemRdfRestExtractor:
         if u.startswith("SID:"):
             sid = int(s.split(":", 1)[1])
             return {"kind": "sid", "sid": sid, "substance": f"substance:SID{sid}"}
+        if u2.startswith("SID=") and u2[4:].isdigit():
+            sid = int(u2[4:])
+            return {"kind": "sid", "sid": sid, "substance": f"substance:SID{sid}"}
         if u.startswith("SID") and u[3:].isdigit():
             sid = int(u[3:])
             return {"kind": "sid", "sid": sid, "substance": f"substance:SID{sid}"}
+        # Structure-based IDs (resolved to CID via PUG-REST)
+        if u.startswith("INCHIKEY:"):
+            ik = s.split(":", 1)[1].strip()
+            return {"kind": "inchikey", "inchikey": ik}
+        if re.fullmatch(r"[A-Z]{14}-[A-Z]{10}-[A-Z]", u):
+            return {"kind": "inchikey", "inchikey": u}
+        if u.startswith("SMILES:"):
+            smi = s.split(":", 1)[1].strip()
+            return {"kind": "smiles", "smiles": smi}
+        if u.startswith("INCHI:"):
+            inc = s.split(":", 1)[1].strip()
+            return {"kind": "inchi", "inchi": inc}
         if s.startswith("compound:") or "/compound/" in s:
             term = self.iri_to_term(s)
             m = re.search(r"CID(\d+)$", term)
@@ -413,7 +510,60 @@ class PubChemRdfRestExtractor:
         if s.isdigit():
             gid = int(s)
             return {"kind": "gene", "gene_id": gid, "gene": f"gene:GID{gid}"}
+        # Convenience: treat other short alpha-numeric tokens as gene symbol
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_\-]{2,19}", s):
+            return {"kind": "symbol", "symbol": s, "symbol_term": f"gene:{s}"}
         return {"kind": "unresolved", "raw": s}
+
+    def _extract_taxid(self, taxonomy_term: str) -> Optional[int]:
+        mt = re.search(r"TAXID(\d+)$", taxonomy_term)
+        return int(mt.group(1)) if mt else None
+
+    def _mg_matches_taxids(self, mg_term: str, taxids: tuple[int, ...]) -> bool:
+        # Check if measuregroup participants include a matching taxonomy term.
+        parts = self.objects_for("measuregroup", mg_term, "obo:RO_0000057", cap=500)
+        for t in parts:
+            if t.startswith("taxonomy:"):
+                tid = self._extract_taxid(t)
+                if tid is not None and tid in taxids:
+                    return True
+        return False
+
+    def normalize_chemical_seeds(self, chem_ids: List[str]) -> List[Dict[str, Any]]:
+        """Parse and resolve chemical seed IDs into CID/SID/terms.
+
+        Supports CID/SID/IRIs as well as InChIKey/SMILES/InChI via PUG-REST.
+        """
+        parsed = [self.parse_chemical_seed(x) for x in chem_ids]
+        out: List[Dict[str, Any]] = []
+        for p in parsed:
+            if p.get("compound") or p.get("substance"):
+                out.append(p)
+                continue
+            if p.get("kind") == "inchikey":
+                cids = self.pug.cids_from_inchikey(p.get("inchikey"))
+                for cid in cids[:20]:
+                    out.append({"kind": "cid", "cid": int(cid), "compound": f"compound:CID{int(cid)}"})
+            elif p.get("kind") == "smiles":
+                cids = self.pug.cids_from_smiles(p.get("smiles"))
+                for cid in cids[:20]:
+                    out.append({"kind": "cid", "cid": int(cid), "compound": f"compound:CID{int(cid)}"})
+            elif p.get("kind") == "inchi":
+                cids = self.pug.cids_from_inchi(p.get("inchi"))
+                for cid in cids[:20]:
+                    out.append({"kind": "cid", "cid": int(cid), "compound": f"compound:CID{int(cid)}"})
+            else:
+                out.append(p)
+        # Deduplicate by compound/substance term
+        seen = set()
+        uniq: List[Dict[str, Any]] = []
+        for p in out:
+            key = p.get("compound") or p.get("substance") or (p.get("kind"), p.get("raw"))
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(p)
+        return uniq
 
     # ---------- describe helpers ----------
     def describe_subject(self, graph: str, subject: str, *, limit: int = 500) -> List[Tuple[str, str, str]]:
@@ -440,19 +590,58 @@ class PubChemRdfRestExtractor:
         return self._subjects(rows)
 
     # ---------- resolvers ----------
-    def resolve_symbols_to_genes(self, symbols: List[str]) -> List[str]:
+    def resolve_symbols_to_genes(self, symbols: List[str], *, taxids: Optional[tuple[int, ...]] = None) -> List[str]:
+        """Resolve gene symbols to PubChem gene terms.
+
+        If taxids is provided, keep only genes whose organism matches one of
+        the requested TAXIDs.
+        """
         genes: List[str] = []
         for sym in symbols:
             rows = self.client.query(graph="gene", predicate="bao:BAO_0002870", object=f"gene:{sym}")
             genes.extend(self._subjects(rows))
-        return sorted(set(genes))
+        genes = sorted(set(genes))
+        if not taxids:
+            return genes
 
-    def resolve_genes_to_proteins(self, gene_terms: List[str]) -> List[str]:
+        filtered: List[str] = []
+        for g in genes:
+            orgs = self.objects_for("gene", g, "up:organism", cap=3)
+            ok = False
+            for o in orgs:
+                tid = self._extract_taxid(o)
+                if tid is not None and tid in taxids:
+                    ok = True
+                    break
+            if ok:
+                filtered.append(g)
+        return filtered
+
+    def resolve_genes_to_proteins(self, gene_terms: List[str], *, taxids: Optional[tuple[int, ...]] = None) -> List[str]:
+        """Resolve gene terms to PubChem protein terms.
+
+        If taxids is provided, keep only proteins whose organism matches.
+        """
         prots: List[str] = []
         for g in gene_terms:
             rows = self.client.query(graph="protein", predicate="up:encodedBy", object=g)
             prots.extend(self._subjects(rows))
-        return sorted(set(prots))
+        prots = sorted(set(prots))
+        if not taxids:
+            return prots
+
+        filtered: List[str] = []
+        for p in prots:
+            orgs = self.objects_for("protein", p, "up:organism", cap=2)
+            ok = False
+            for o in orgs:
+                tid = self._extract_taxid(o)
+                if tid is not None and tid in taxids:
+                    ok = True
+                    break
+            if ok:
+                filtered.append(p)
+        return filtered
 
     # ---------- one-hop getters ----------
     def measuregroups_for_participant(self, participant_term: str, *, cap: Optional[int] = None) -> List[str]:
@@ -518,7 +707,7 @@ class PubChemRdfRestExtractor:
         if not target_ids:
             return iter(())
 
-        chem = [self.parse_chemical_seed(x) for x in chem_ids]
+        chem = self.normalize_chemical_seeds(chem_ids)
         tgt = [self.parse_target_seed(x) for x in target_ids]
 
         compound_terms = {c["compound"] for c in chem if c.get("compound")}
@@ -527,10 +716,12 @@ class PubChemRdfRestExtractor:
         gene_terms = {t["gene"] for t in tgt if t.get("gene")}
         symbols = [t["symbol"] for t in tgt if t.get("symbol")]
 
+        taxids: Optional[tuple[int, ...]] = getattr(flags, "taxids", None)
+
         if symbols:
-            gene_terms.update(self.resolve_symbols_to_genes(symbols))
+            gene_terms.update(self.resolve_symbols_to_genes(symbols, taxids=taxids))
         if gene_terms:
-            protein_terms.update(self.resolve_genes_to_proteins(sorted(gene_terms)))
+            protein_terms.update(self.resolve_genes_to_proteins(sorted(gene_terms), taxids=taxids))
 
         participants = sorted(set(protein_terms) | set(gene_terms))
         if not participants:
@@ -604,25 +795,31 @@ class PubChemRdfRestExtractor:
         if not all_mgs:
             return iter(())
 
+        # Optional taxonomic restriction
+        if taxids:
+            all_mgs = [mg for mg in all_mgs if self._mg_matches_taxids(mg, taxids)]
+            if not all_mgs:
+                return iter(())
+
         for mg in all_mgs:
             mg_id = self._term_id(mg)
             yield from emit("measuregroup", mg_id, {"mg_id": mg_id, "mg_term": mg})
 
+            # Participants are core connectivity; always parse them.
+            mg_parts = self.objects_for("measuregroup", mg, "obo:RO_0000057", cap=500)
+            for term in mg_parts:
+                # Core connectivity: MeasureGroup -> Protein/Gene participants
+                if term.startswith("protein:ACC"):
+                    acc = re.sub(r"^protein:ACC", "", term)
+                    yield {"kind": "mg_protein", "data": {"mg_id": mg_id, "protein_id": acc}}
+                if term.startswith("gene:GID"):
+                    mgid = re.search(r"GID(\d+)$", term)
+                    if mgid:
+                        yield {"kind": "mg_gene", "data": {"mg_id": mg_id, "gene_id": mgid.group(1)}}
+
             # Optional context: organism/cell/anatomy
             if getattr(flags, "include_optional_context", True):
-                mg_triples = self.describe_subject("measuregroup", mg)
-                for (_, pred, obj) in mg_triples:
-                    if pred != "obo:RO_0000057":
-                        continue
-                    term = self.iri_to_term(obj)
-                    # Core connectivity: MeasureGroup -> Protein/Gene participants
-                    if term.startswith("protein:ACC"):
-                        acc = re.sub(r"^protein:ACC", "", term)
-                        yield {"kind": "mg_protein", "data": {"mg_id": mg_id, "protein_id": acc}}
-                    if term.startswith("gene:GID"):
-                        mgid = re.search(r"GID(\d+)$", term)
-                        if mgid:
-                            yield {"kind": "mg_gene", "data": {"mg_id": mg_id, "gene_id": mgid.group(1)}}
+                for term in mg_parts:
                     if term.startswith("taxonomy:"):
                         m = re.search(r"TAXID(\d+)$", term)
                         if m:
@@ -794,7 +991,7 @@ class PubChemRdfRestExtractor:
         if not chem_ids:
             return iter(())
 
-        chem = [self.parse_chemical_seed(x) for x in chem_ids]
+        chem = self.normalize_chemical_seeds(chem_ids)
 
         compound_terms = [c["compound"] for c in chem if c.get("compound")]
         substance_terms_seeded = [c["substance"] for c in chem if c.get("substance")]
@@ -832,6 +1029,8 @@ class PubChemRdfRestExtractor:
             yield {"kind": kind, "data": data}
 
         # Expand each compound separately to honor per-compound caps.
+        taxids: Optional[tuple[int, ...]] = getattr(flags, "taxids", None)
+
         for cmp_term in compound_terms:
             m = re.search(r"CID(\d+)$", cmp_term)
             cid = int(m.group(1)) if m else None
@@ -902,6 +1101,14 @@ class PubChemRdfRestExtractor:
             proteins_seen_for_compound: set[str] = set()
 
             for mg in all_mgs[:mg_cap]:
+                # Taxonomy restriction: keep only measuregroups with matching TAXID participant.
+                mg_parts_for_tax: Optional[List[str]] = None
+                if taxids:
+                    mg_parts_for_tax = self.objects_for("measuregroup", mg, "obo:RO_0000057", cap=500)
+                    mg_tax = [t for t in mg_parts_for_tax if t.startswith("taxonomy:")]
+                    if not any((self._extract_taxid(t) in taxids) for t in mg_tax if self._extract_taxid(t) is not None):
+                        continue
+
                 mg_id = self._term_id(mg)
                 yield from emit("measuregroup", mg_id, {"mg_id": mg_id, "mg_term": mg})
 
@@ -923,7 +1130,7 @@ class PubChemRdfRestExtractor:
                         yield {"kind": "mg_bioassay", "data": {"mg_id": mg_id, "aid": aid}}
 
                 # Participants + optional context
-                participants = self.objects_for("measuregroup", mg, "obo:RO_0000057", cap=500)
+                participants = mg_parts_for_tax if mg_parts_for_tax is not None else self.objects_for("measuregroup", mg, "obo:RO_0000057", cap=500)
                 for term in participants:
 
                     if term.startswith("protein:ACC"):
@@ -957,6 +1164,9 @@ class PubChemRdfRestExtractor:
                                 if mt:
                                     props["tax_id"] = int(mt.group(1))
                                     props["tax_term"] = tax
+                            if taxids and props.get("tax_id") is not None and int(props["tax_id"]) not in taxids:
+                                # Safety: if protein has a tax_id and doesn't match, skip it
+                                continue
                             yield from emit("protein", acc, props)
 
                     elif getattr(flags, "include_optional_context", True) and term.startswith("taxonomy:"):

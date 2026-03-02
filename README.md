@@ -730,3 +730,20 @@ python -m pring `
   --max-targets-per-compound 5 `
   --max-endpoints-per-pair 5 `
   build
+
+
+
+If you have **APOC** installed, you can drop **all indexes + constraints** in *one* Cypher statement:
+
+```cypher
+CALL apoc.schema.assert({}, {}, true);
+```
+
+This tells APOC: “the desired schema is empty,” and with `dropExisting=true` it drops everything else.
+
+If APOC is **not** available, Neo4j doesn’t currently have a built-in single Cypher command like `DROP INDEXES *` / `DROP CONSTRAINTS *`—you must `SHOW ...` then `DROP ...` by name.
+
+:use system
+DROP DATABASE neo4j IF EXISTS;
+CREATE DATABASE neo4j;
+:use neo4j

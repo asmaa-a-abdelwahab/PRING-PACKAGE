@@ -1,1 +1,2 @@
-P08684
+GeneID:1544
+UniProt:P05177

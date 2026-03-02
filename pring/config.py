@@ -49,6 +49,10 @@ class BuildCaps:
 class BuildFlags:
     include_textmining: bool = False
     include_optional_context: bool = True
+    # Optional taxonomic restriction. When provided, PRING will keep only
+    # evidence (measuregroups/endpoints) whose participants include a matching
+    # PubChem Taxonomy entity (taxonomy:TAXIDxxxx).
+    taxids: Optional[tuple[int, ...]] = None
 
 
 @dataclass(frozen=True)
@@ -130,6 +134,7 @@ class Settings:
         flags = BuildFlags(
             include_textmining=(_env("PRING_INCLUDE_TEXTMINING", "false").lower() == "true"),
             include_optional_context=(_env("PRING_INCLUDE_OPTIONAL_CONTEXT", "true").lower() == "true"),
+            taxids=_parse_taxids(_env("PRING_TAXID", None)),
         )
 
         caps = BuildCaps(
@@ -159,3 +164,28 @@ def _int_or_none(v: Optional[str]) -> Optional[int]:
     if v is None or str(v).strip() == "":
         return None
     return int(v)
+
+
+def _parse_taxids(v: Optional[str]) -> Optional[tuple[int, ...]]:
+    """Parse a taxid list from env/CLI-style input.
+
+    Accepts:
+      - "9606"
+      - "9606,10090"
+      - "TAXID9606"
+    """
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    parts = [p.strip() for p in s.replace(";", ",").split(",") if p.strip()]
+    out: list[int] = []
+    for p in parts:
+        up = p.upper()
+        if up.startswith("TAXID"):
+            p = p[5:]
+        if not p.isdigit():
+            continue
+        out.append(int(p))
+    return tuple(sorted(set(out))) if out else None
