@@ -112,3 +112,39 @@ class HttpClient:
             except Exception as e:
                 last_exc = e
         raise RuntimeError(f"HTTP GET failed after retries: {url}") from last_exc
+
+    def post_json(self, url: str, data: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        """POST form data and parse JSON response.
+
+        Used for SPARQL protocol endpoints (e.g., IDSM/ChemWebRDF).
+        """
+        # Cache key includes url + data
+        p = self._cache_path(url, data, "json")
+        if p is not None and p.exists():
+            try:
+                self._log.debug("cache hit: %s", p.name)
+                import json
+                return json.loads(p.read_text("utf-8", errors="ignore"))
+            except Exception:
+                pass
+
+        last_exc = None
+        for _ in range(self.max_retries + 1):
+            try:
+                self._log.debug("POST %s data=%s", url, list((data or {}).keys()))
+                r = self._client.post(url, data=data, headers=headers)
+                if r.status_code in (429, 500, 502, 503, 504):
+                    last_exc = RuntimeError(f"retryable status {r.status_code}")
+                    continue
+                r.raise_for_status()
+                out = r.json()
+                if p is not None:
+                    try:
+                        import json
+                        p.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
+                    except Exception:
+                        pass
+                return out
+            except Exception as e:
+                last_exc = e
+        raise RuntimeError(f"HTTP POST failed after retries: {url}") from last_exc

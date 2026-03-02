@@ -9,6 +9,7 @@ from typing import List, Optional
 from pring.config import Settings, BuildCaps, BuildFlags
 from pring.extract.query_plan import decide_mode, decide_scope, load_id_file, Mode, Scope
 from pring.extract.pubchem_rdf_rest import PubChemRdfRestClient, PubChemRdfRestExtractor
+from pring.extract.pubchem_sparql_mirror import SparqlMirrorClient, PubChemSparqlMirrorExtractor
 from pring.extract.pubchem_core import PubChemRow, to_graph_records
 from pring.neo4j.driver import Neo4jDriver
 from pring.neo4j.loader import Neo4jLoader
@@ -38,7 +39,8 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--target-ids", type=str, default=None, help="Text file of target IDs (e.g., UniProt accessions or URIs; one per line).")
 
     # Mode/scope
-    ap.add_argument("--mode", type=str, choices=[m.value for m in Mode], default=None, help="rdf-rest (default) or ftp (bulk). 'sparql' is alias for rdf-rest.")
+    ap.add_argument("--mode", type=str, choices=[m.value for m in Mode], default=None,
+                    help="rdf-rest (default), sparql (SPARQL mirror), or ftp (bulk; not implemented here).")
     ap.add_argument("--scope", type=str, choices=[s.value for s in Scope], default=None,
                     help="intersection|expand-from-targets|expand-from-compounds. Default depends on provided inputs.")
 
@@ -47,6 +49,11 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--neo4j-user", type=str, default=None)
     ap.add_argument("--neo4j-password", type=str, default=None)
     ap.add_argument("--neo4j-db", type=str, default=None)
+
+    # SPARQL mirror
+    ap.add_argument("--sparql-endpoint", type=str, default=None,
+                    help="SPARQL endpoint URL for mirror mode (default from PRING_SPARQL_ENDPOINT / Settings).")
+    ap.add_argument("--sparql-timeout-s", type=float, default=None, help="SPARQL HTTP timeout seconds.")
 
     # Flags
     ap.add_argument("--include-textmining", type=str, choices=["true", "false"], default=None)
@@ -130,6 +137,16 @@ def main() -> None:
     else:
         # Default cache dir per run (keeps thesis runs reproducible)
         settings = settings.with_overrides(cache_dir=store.http_cache_dir)
+
+    # SPARQL endpoint overrides
+    if args.sparql_endpoint or args.sparql_timeout_s:
+        sp = settings.sparql
+        sp_kwargs = dict(endpoint_url=sp.endpoint_url, timeout_s=sp.timeout_s, max_retries=sp.max_retries, user_agent=sp.user_agent)
+        if args.sparql_endpoint:
+            sp_kwargs["endpoint_url"] = args.sparql_endpoint
+        if args.sparql_timeout_s is not None:
+            sp_kwargs["timeout_s"] = float(args.sparql_timeout_s)
+        settings = settings.with_overrides(sparql=sp.__class__(**sp_kwargs))
 
     # Neo4j overrides
     neo = settings.neo4j
@@ -242,7 +259,7 @@ def main() -> None:
     log.info("Run dir: %s", run_dir)
     log.info("Log file: %s", log_path)
 
-    # Extraction (RDF-REST is implemented as a structured skeleton)
+    # Extraction
     rows: List[PubChemRow] = []
     if mode == Mode.rdf_rest:
         rdfrest_cache = (settings.cache_dir / "rdfrest") if (args.save_raw == "true") else None
@@ -261,6 +278,29 @@ def main() -> None:
                     store.save_row(d["kind"], d["data"])
             else:
                 # Case C
+                for d in extractor.iter_expand_from_compounds(chem_ids, caps=settings.caps, flags=settings.flags):
+                    rows.append(PubChemRow(kind=d["kind"], data=d["data"]))
+                    store.save_row(d["kind"], d["data"])
+        finally:
+            try:
+                extractor.close()
+            except Exception:
+                pass
+            client.close()
+    elif mode == Mode.sparql:
+        sparql_cache = (settings.cache_dir / "sparql") if (args.save_raw == "true") else None
+        client = SparqlMirrorClient(settings.sparql, cache_dir=sparql_cache)
+        extractor = PubChemSparqlMirrorExtractor(client)
+        try:
+            if scope == Scope.intersection:
+                for d in extractor.iter_intersection_evidence(chem_ids, target_ids, caps=settings.caps, flags=settings.flags):
+                    rows.append(PubChemRow(kind=d["kind"], data=d["data"]))
+                    store.save_row(d["kind"], d["data"])
+            elif scope == Scope.expand_from_targets:
+                for d in extractor.iter_expand_from_targets(target_ids, caps=settings.caps, flags=settings.flags):
+                    rows.append(PubChemRow(kind=d["kind"], data=d["data"]))
+                    store.save_row(d["kind"], d["data"])
+            else:
                 for d in extractor.iter_expand_from_compounds(chem_ids, caps=settings.caps, flags=settings.flags):
                     rows.append(PubChemRow(kind=d["kind"], data=d["data"]))
                     store.save_row(d["kind"], d["data"])

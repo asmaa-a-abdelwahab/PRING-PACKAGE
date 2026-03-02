@@ -11,7 +11,7 @@ from pring.config import BuildCaps, BuildFlags
 class Mode(str, Enum):
     rdf_rest = "rdf-rest"
     ftp = "ftp"
-    sparql = "sparql"   # alias for rdf-rest (PubChem RDF REST returns SPARQL JSON)
+    sparql = "sparql"   # SPARQL mirror endpoint (IDSM/ChemWebRDF)
 
 
 class Scope(str, Enum):
@@ -77,7 +77,4 @@ def decide_scope(user_scope: Optional[str], chem_ids: List[str], target_ids: Lis
 def decide_mode(user_mode: Optional[str]) -> Mode:
     if not user_mode:
         return Mode.rdf_rest
-    m = Mode(user_mode)
-    if m == Mode.sparql:
-        return Mode.rdf_rest
-    return m
+    return Mode(user_mode)

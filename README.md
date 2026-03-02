@@ -731,6 +731,21 @@ python -m pring `
   --max-endpoints-per-pair 5 `
   build
 
+python -m pring `
+  --save-extracted true `
+  --neo4j-uri neo4j+s://4d6ba586.databases.neo4j.io `
+  --neo4j-user neo4j `
+  --neo4j-password "ZBerzvtOArtAus44d5yNZI9j2ZavdxSpqHBDPw270Tk" `
+  --neo4j-db neo4j `
+  --mode sparql `
+  --sparql-endpoint https://idsm.elixir-czech.cz/sparql/endpoint/pubchem `
+  --taxid 9606 `
+  --target-ids targets.txt `
+  --scope expand-from-targets `
+  --max-compounds-per-target 5000 `
+  --max-measuregroups-per-target 20000 `
+  --max-endpoints-per-pair 200 `
+  build
 
 
 If you have **APOC** installed, you can drop **all indexes + constraints** in *one* Cypher statement:

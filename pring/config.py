@@ -33,6 +33,19 @@ class RdfRestConfig:
 
 
 @dataclass(frozen=True)
+class SparqlConfig:
+    """SPARQL mirror endpoint config (e.g., IDSM/ChemWebRDF).
+
+    Default points to IDSM integrated endpoint described in their docs.
+    """
+
+    endpoint_url: str = "https://idsm.elixir-czech.cz/sparql/endpoint/idsm"
+    timeout_s: float = 120.0
+    max_retries: int = 3
+    user_agent: str = "pring/0.1 (+https://example.org)"
+
+
+@dataclass(frozen=True)
 class BuildCaps:
     """Caps to keep graphs thesis-friendly."""
     max_compounds_per_target: Optional[int] = None
@@ -59,6 +72,7 @@ class BuildFlags:
 class Settings:
     neo4j: Neo4jConfig
     rdf_rest: RdfRestConfig = field(default_factory=RdfRestConfig)
+    sparql: SparqlConfig = field(default_factory=SparqlConfig)
 
     # Path to your Graphviz schema (DOT). Used for validation.
     schema_dot_path: Optional[Path] = None
@@ -151,6 +165,12 @@ class Settings:
 
         return Settings(
             neo4j=Neo4jConfig(uri=neo4j_uri, user=neo4j_user, password=neo4j_password),
+            sparql=SparqlConfig(
+                endpoint_url=_env("PRING_SPARQL_ENDPOINT", SparqlConfig().endpoint_url) or SparqlConfig().endpoint_url,
+                timeout_s=float(_env("PRING_SPARQL_TIMEOUT_S", str(SparqlConfig().timeout_s)) or SparqlConfig().timeout_s),
+                max_retries=int(_env("PRING_SPARQL_MAX_RETRIES", str(SparqlConfig().max_retries)) or SparqlConfig().max_retries),
+                user_agent=_env("PRING_SPARQL_USER_AGENT", SparqlConfig().user_agent) or SparqlConfig().user_agent,
+            ),
             schema_dot_path=schema_dot_path,
             batch_size=batch_size,
             cache_dir=cache_dir,

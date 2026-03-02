@@ -1,2 +1,1 @@
 GeneID:1544
-UniProt:P05177
