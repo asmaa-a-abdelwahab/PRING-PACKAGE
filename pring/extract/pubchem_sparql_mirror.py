@@ -295,10 +295,10 @@ SELECT DISTINCT ?protein ?gene WHERE {{
         tax = self._tax_filter_on_var("?target", "?tTax", flags)
 
         q = f"""{SPARQL_PREFIXES}
-SELECT DISTINCT ?mg WHERE {{
-  VALUES ?target {{ {values} }}
-  ?mg obo:RO_0000057 ?target .
-  }}"""
+            SELECT DISTINCT ?mg WHERE {{
+            VALUES ?target {{ {values} }}
+            ?mg obo:RO_0000057 ?target .
+            }}"""
         if limit:
             q += f"\nLIMIT {int(limit)}"
         rows = self.client.select(q)
