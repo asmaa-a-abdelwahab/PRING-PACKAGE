@@ -49,10 +49,12 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--neo4j-user", type=str, default=None)
     ap.add_argument("--neo4j-password", type=str, default=None)
     ap.add_argument("--neo4j-db", type=str, default=None)
+    ap.add_argument("--load-neo4j", type=str, choices=["true","false"], default="true",
+                    help="Whether to load extracted data into Neo4j (default: true). Set false to only save run artifacts.")
 
     # SPARQL mirror
     ap.add_argument("--sparql-endpoint", type=str, default=None,
-                    help="SPARQL endpoint URL for mirror mode (default from PRING_SPARQL_ENDPOINT / Settings).")
+                    help="SPARQL endpoint URL for mirror mode (default: https://idsm.elixir-czech.cz/sparql/endpoint/idsm).")
     ap.add_argument("--sparql-timeout-s", type=float, default=None, help="SPARQL HTTP timeout seconds.")
 
     # Flags
@@ -105,13 +107,23 @@ def _demo_rows() -> List[PubChemRow]:
         PubChemRow(kind="substance", data={"sid": 123, "cid": 2244, "source_id": "demo", "source_name": "Demo source"}),
         PubChemRow(kind="bioassay", data={"aid": 1, "name": "Demo assay"}),
         PubChemRow(kind="measuregroup", data={"mg_id": "mg:1", "aid": 1, "protein_id": "P12345"}),
-        PubChemRow(kind="endpoint", data={"aid": 1, "mg_id": "mg:1", "sid": 123, "type": "IC50", "value": 3.2, "unit": "uM", "outcome": "Active"}),
+        PubChemRow(kind="endpoint", data={
+            "endpoint_id": "ep:1",
+            "aid": 1,
+            "mg_id": "mg:1",
+            "sid": 123,
+            "type": "IC50",
+            "value": 3.2,
+            "unit": "uM",
+            "outcome": "Active",
+        }),
     ]
-
 
 def main() -> None:
     args = build_argparser().parse_args()
     settings = Settings.from_env()
+
+    load_neo4j = (args.load_neo4j == "true") and (not args.dry_run)
 
     # Run folder + logging (early)
     run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -181,13 +193,14 @@ def main() -> None:
         )
 
     caps = settings.caps.__class__(
-        max_compounds_per_target=_parse_int_or_none(args.max_compounds_per_target) or settings.caps.max_compounds_per_target,
-        max_targets_per_compound=_parse_int_or_none(args.max_targets_per_compound) or settings.caps.max_targets_per_compound,
-        max_substances_per_compound=_parse_int_or_none(args.max_substances_per_compound) or settings.caps.max_substances_per_compound,
-        max_measuregroups_per_target=_parse_int_or_none(args.max_measuregroups_per_target) or settings.caps.max_measuregroups_per_target,
-        max_measuregroups_per_compound=_parse_int_or_none(args.max_measuregroups_per_compound) or settings.caps.max_measuregroups_per_compound,
-        max_endpoints_per_pair=_parse_int_or_none(args.max_endpoints_per_pair) or settings.caps.max_endpoints_per_pair,
+        max_compounds_per_target=settings.caps.max_compounds_per_target if args.max_compounds_per_target is None else _parse_int_or_none(args.max_compounds_per_target),
+        max_targets_per_compound=settings.caps.max_targets_per_compound if args.max_targets_per_compound is None else _parse_int_or_none(args.max_targets_per_compound),
+        max_substances_per_compound=settings.caps.max_substances_per_compound if args.max_substances_per_compound is None else _parse_int_or_none(args.max_substances_per_compound),
+        max_measuregroups_per_target=settings.caps.max_measuregroups_per_target if args.max_measuregroups_per_target is None else _parse_int_or_none(args.max_measuregroups_per_target),
+        max_measuregroups_per_compound=settings.caps.max_measuregroups_per_compound if args.max_measuregroups_per_compound is None else _parse_int_or_none(args.max_measuregroups_per_compound),
+        max_endpoints_per_pair=settings.caps.max_endpoints_per_pair if args.max_endpoints_per_pair is None else _parse_int_or_none(args.max_endpoints_per_pair),
     )
+
     settings = settings.with_overrides(flags=flags, caps=caps)
 
     # Plugins
@@ -196,8 +209,8 @@ def main() -> None:
     settings = settings.with_overrides(enabled_plugins=plugin_paths)
 
     if args.cmd == "schema":
-        if args.dry_run:
-            log.info("dry-run: schema command does not write constraints.")
+        if not load_neo4j:
+            log.info("Neo4j disabled (--load-neo4j=false or --dry-run). Nothing to do for schema.")
             return
         with Neo4jDriver(settings.neo4j) as driver:
             loader = Neo4jLoader(settings=settings, driver=driver)
@@ -207,10 +220,41 @@ def main() -> None:
             return
 
     if args.cmd == "demo":
-        nodes, rels = to_graph_records(_demo_rows())
-        if args.dry_run:
-            log.info("[dry-run] would load demo: %d nodes, %d relationships", len(nodes), len(rels))
+        rows = _demo_rows()
+        nodes, rels = to_graph_records(rows)
+
+        store.write_manifest({
+            "run_id": run_id,
+            "started_at": datetime.now().isoformat(),
+            "mode": "demo",
+            "scope": "demo",
+            "caps": settings.caps.__dict__,
+            "flags": settings.flags.__dict__,
+            "neo4j": {
+                "load_enabled": load_neo4j,
+                "uri": settings.neo4j.uri,
+                "user": settings.neo4j.user,
+                "database": settings.neo4j.database,
+            },
+            "paths": {
+                "run_dir": str(run_dir),
+                "log_file": str(log_path),
+                "cache_dir": str(settings.cache_dir),
+            },
+        })
+
+        for row in rows:
+            store.save_row(row.kind, row.data)
+        store.save_nodes(nodes)
+        store.save_relationships(rels)
+
+        if not load_neo4j:
+            log.info(
+                "Neo4j disabled: demo extracted (%d nodes, %d relationships) and artifacts saved in %s.",
+                len(nodes), len(rels), run_dir
+            )
             return
+
         with Neo4jDriver(settings.neo4j) as driver:
             loader = Neo4jLoader(settings=settings, driver=driver)
             loader.ensure_schema()
@@ -246,6 +290,7 @@ def main() -> None:
         "flags": settings.flags.__dict__,
         "plugins": settings.enabled_plugins,
         "neo4j": {
+            "load_enabled": load_neo4j,
             "uri": settings.neo4j.uri,
             "user": settings.neo4j.user,
             "database": settings.neo4j.database,
@@ -328,8 +373,8 @@ def main() -> None:
             nodes.extend(delta.nodes)
             rels.extend(delta.rels)
 
-    if args.dry_run:
-        log.info("[dry-run] would load: %d nodes, %d relationships", len(nodes), len(rels))
+    if not load_neo4j:
+        log.info("✅ Neo4j disabled: extraction artifacts saved in %s", run_dir)
         return
 
     with Neo4jDriver(settings.neo4j) as driver:

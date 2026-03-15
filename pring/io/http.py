@@ -18,8 +18,8 @@ class HttpxNotInstalled(RuntimeError):
 
 @dataclass
 class HttpClient:
-    timeout_s: float = 60.0
-    max_retries: int = 3
+    timeout_s: float = 600.0
+    max_retries: int = 6
     headers: Optional[Dict[str, str]] = None
     cache_dir: Optional[Path] = None
 

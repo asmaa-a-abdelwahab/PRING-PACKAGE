@@ -86,6 +86,9 @@ PREFIX bioassay: <http://rdf.ncbi.nlm.nih.gov/pubchem/bioassay/>
 PREFIX protein: <http://rdf.ncbi.nlm.nih.gov/pubchem/protein/>
 PREFIX gene: <http://rdf.ncbi.nlm.nih.gov/pubchem/gene/>
 PREFIX taxonomy: <http://rdf.ncbi.nlm.nih.gov/pubchem/taxonomy/>
+PREFIX cell: <http://rdf.ncbi.nlm.nih.gov/pubchem/cell/>
+PREFIX anatomy: <http://rdf.ncbi.nlm.nih.gov/pubchem/anatomy/>
+PREFIX genesymbol: <http://rdf.ncbi.nlm.nih.gov/pubchem/genesymbol/>
 """.strip()
 
 
@@ -323,10 +326,10 @@ SELECT DISTINCT ?protein ?gene WHERE {{
         if caps.max_substances_per_compound:
             limit = caps.max_substances_per_compound * max(1, len(compound_terms))
         q = f"""{SPARQL_PREFIXES}
-SELECT DISTINCT ?sub WHERE {{
-  VALUES ?compound {{ {values} }}
-  ?sub sio:CHEMINF_000477 ?compound .
-}}"""
+            SELECT DISTINCT ?sub WHERE {{
+            VALUES ?compound {{ {values} }}
+            ?sub sio:CHEMINF_000477 ?compound .
+            }}"""
         if limit:
             q += f"\nLIMIT {int(limit)}"
         rows = self.client.select(q)
@@ -345,10 +348,10 @@ SELECT DISTINCT ?sub WHERE {{
             # approximate cap
             limit = caps.max_measuregroups_per_compound * max(1, len(substances))
         q = f"""{SPARQL_PREFIXES}
-SELECT DISTINCT ?mg WHERE {{
-  VALUES ?sub {{ {values} }}
-  ?sub obo:RO_0000056 ?mg .
-}}"""
+            SELECT DISTINCT ?mg WHERE {{
+            VALUES ?sub {{ {values} }}
+            ?sub obo:RO_0000056 ?mg .
+            }}"""
         if limit:
             q += f"\nLIMIT {int(limit)}"
         rows = self.client.select(q)
@@ -390,7 +393,10 @@ SELECT DISTINCT ?mg WHERE {{
             row_limit = int(caps.max_endpoints_per_pair) * max(1, len(mgs))
 
         q = f"""{SPARQL_PREFIXES}
-            SELECT ?mg ?bioassay ?endpoint ?sub ?compound ?protein ?tax ?value ?unit ?qual ?outcome ?eplabel ?ref
+            SELECT ?mg ?bioassay ?baname ?endpoint ?sub ?compound ?protein ?tax
+                ?geneTarget ?gname ?gsNode ?gsym
+                ?cell ?anat
+                ?value ?unit ?qual ?outcome ?eplabel ?ref
                 ?pname ?seq ?gene
                 ?cname ?smiles ?inchikey ?inchi ?formula ?mw ?xlogp3 ?tpsa
                 ?source
@@ -417,6 +423,17 @@ SELECT DISTINCT ?mg WHERE {{
 
             OPTIONAL {{ ?mg obo:RO_0000057 ?tax . FILTER(STRSTARTS(STR(?tax), STR(taxonomy:))) }}
             OPTIONAL {{ ?bioassay bao:BAO_0000209 ?mg }}
+            OPTIONAL {{ ?bioassay skos:prefLabel ?baname }}
+            OPTIONAL {{ ?bioassay rdfs:label ?baname }}
+
+            OPTIONAL {{ ?geneTarget skos:prefLabel ?gname }}
+            OPTIONAL {{ ?geneTarget rdfs:label ?gname }}
+            OPTIONAL {{ ?geneTarget bao:BAO_0002870 ?gsNode }}
+            OPTIONAL {{ ?gsNode skos:prefLabel ?gsym }}
+
+            OPTIONAL {{ ?mg obo:RO_0000057 ?cell . FILTER(STRSTARTS(STR(?cell), STR(cell:))) }}
+            OPTIONAL {{ ?cell obo:RO_0001000 ?anat }}
+
             OPTIONAL {{ ?endpoint sio:SIO_000300 ?value }}
             OPTIONAL {{ ?endpoint sio:SIO_000221 ?unit }}
             OPTIONAL {{ ?endpoint vocab:hasQualifier ?qual }}
@@ -467,7 +484,10 @@ SELECT DISTINCT ?mg WHERE {{
             row_limit = int(caps.max_endpoints_per_pair) * max(1, len(mgs))
 
         q = f"""{SPARQL_PREFIXES}
-            SELECT ?mg ?bioassay ?endpoint ?sub ?compound ?protein ?tax ?value ?unit ?qual ?outcome ?eplabel ?ref
+            SELECT ?mg ?bioassay ?baname ?endpoint ?sub ?compound ?protein ?tax
+                ?geneTarget ?gname ?gsNode ?gsym
+                ?cell ?anat
+                ?value ?unit ?qual ?outcome ?eplabel ?ref
                 ?pname ?seq ?gene
                 ?cname ?smiles ?inchikey ?inchi ?formula ?mw ?xlogp3 ?tpsa
                 ?source
@@ -485,6 +505,17 @@ SELECT DISTINCT ?mg WHERE {{
 
             OPTIONAL {{ ?mg obo:RO_0000057 ?tax . FILTER(STRSTARTS(STR(?tax), STR(taxonomy:))) }}
             OPTIONAL {{ ?bioassay bao:BAO_0000209 ?mg }}
+            OPTIONAL {{ ?bioassay skos:prefLabel ?baname }}
+            OPTIONAL {{ ?bioassay rdfs:label ?baname }}
+
+            OPTIONAL {{ ?geneTarget skos:prefLabel ?gname }}
+            OPTIONAL {{ ?geneTarget rdfs:label ?gname }}
+            OPTIONAL {{ ?geneTarget bao:BAO_0002870 ?gsNode }}
+            OPTIONAL {{ ?gsNode skos:prefLabel ?gsym }}
+
+            OPTIONAL {{ ?mg obo:RO_0000057 ?cell . FILTER(STRSTARTS(STR(?cell), STR(cell:))) }}
+            OPTIONAL {{ ?cell obo:RO_0001000 ?anat }}
+
             OPTIONAL {{ ?endpoint sio:SIO_000300 ?value }}
             OPTIONAL {{ ?endpoint sio:SIO_000221 ?unit }}
             OPTIONAL {{ ?endpoint vocab:hasQualifier ?qual }}
@@ -600,7 +631,7 @@ SELECT DISTINCT ?mg WHERE {{
         seen_comp: Set[int] = set()
         seen_sub: Set[int] = set()
         seen_prot: Set[str] = set()
-        seen_gene: Set[int] = set()
+        seen_gene: Set[str] = set()
         seen_org: Set[int] = set()
         seen_ba: Set[int] = set()
         seen_mg: Set[str] = set()
@@ -634,9 +665,26 @@ SELECT DISTINCT ?mg WHERE {{
                     aid = _extract_int(ba_term, r"AID(\d+)$")
                     if aid is not None and aid not in seen_ba:
                         seen_ba.add(aid)
-                        yield {"kind": "bioassay", "data": {"aid": aid, "bioassay_term": ba_term}}
+                        yield {"kind": "bioassay", "data": {"aid": aid, "bioassay_term": ba_term, "name": v("baname")}}
                     if aid is not None and mg_term:
                         yield {"kind": "mg_bioassay", "data": {"mg_id": _term_id(mg_term), "aid": aid}}
+
+                # Gene participant (direct)
+                gene_target_term = iri_to_term(v("geneTarget") or "")
+                if gene_target_term and gene_target_term.startswith("gene:"):
+                    gid = _gid(gene_target_term)
+                    if gid is not None:
+                        gid_s = str(gid)
+                        if gid_s not in seen_gene:
+                            seen_gene.add(gid_s)
+                            sym = v("gsym")
+                            if not sym:
+                                gs_node_term = iri_to_term(v("gsNode") or "")
+                                if gs_node_term and ":" in gs_node_term:
+                                    sym = gs_node_term.split(":", 1)[-1]
+                            yield {"kind": "gene", "data": {"gene_id": gid_s, "gene_term": gene_target_term, "name": v("gname"), "symbol": sym}}
+                        if mg_term:
+                            yield {"kind": "mg_gene", "data": {"mg_id": _term_id(mg_term), "gene_id": gid_s}}
 
                 # Protein
                 prot_term = iri_to_term(v("protein") or "")
@@ -654,6 +702,20 @@ SELECT DISTINCT ?mg WHERE {{
                         }}
                     if mg_term:
                         yield {"kind": "mg_protein", "data": {"mg_id": _term_id(mg_term), "protein_id": acc}}
+
+                # Cell line / anatomy (optional context)
+                if getattr(flags, "include_optional_context", True):
+                    cell_term = iri_to_term(v("cell") or "")
+                    if cell_term and cell_term.startswith("cell:"):
+                        cell_id = _term_id(cell_term)
+                        yield {"kind": "cellline", "data": {"cellline_id": cell_id, "cell_term": cell_term}}
+                        if mg_term:
+                            yield {"kind": "mg_cellline", "data": {"mg_id": _term_id(mg_term), "cellline_id": cell_id}}
+                        anat_term = iri_to_term(v("anat") or "")
+                        if anat_term and anat_term.startswith("anatomy:"):
+                            anat_id = _term_id(anat_term)
+                            yield {"kind": "anatomy", "data": {"anatomy_id": anat_id, "anatomy_term": anat_term}}
+                            yield {"kind": "cell_anatomy", "data": {"cellline_id": cell_id, "anatomy_id": anat_id}}
 
                 # Organism (taxonomy participant)
                 tax_term = iri_to_term(v("tax") or "")

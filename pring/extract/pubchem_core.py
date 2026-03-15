@@ -192,7 +192,11 @@ def to_graph_records(rows: Iterable[PubChemRow]) -> Tuple[List[Dict], List[Dict]
             # MeasureGrp -> Endpoint
             mg = d.get("mg_id")
             if mg:
-                rel("produces endpoint", {"label": "MeasureGrp", "key": {"mg_id": str(mg)}}, {"label": "Endpoint", "key": {"endpoint_id": eid}})
+                mg_id = str(mg)
+                rel("produces endpoint", {"label": "MeasureGrp", "key": {"mg_id": mg_id}}, {"label": "Endpoint", "key": {"endpoint_id": eid}})
+                # Convenience: Substance -> MeasureGrp (interaction context)
+                if sid is not None:
+                    rel("participates in", {"label": "Substance", "key": {"sid": sid}}, {"label": "MeasureGrp", "key": {"mg_id": mg_id}})
 
         elif r.kind == "reference":
             rid = d.get("ref_id")
@@ -234,6 +238,13 @@ def to_graph_records(rows: Iterable[PubChemRow]) -> Tuple[List[Dict], List[Dict]
             if not mg_id or not pid:
                 continue
             rel("tested on protein", {"label": "MeasureGrp", "key": {"mg_id": mg_id}}, {"label": "Protein", "key": {"protein_id": str(pid)}})
+
+        elif r.kind == "mg_gene":
+            mg_id = str(d.get("mg_id"))
+            gid = d.get("gene_id")
+            if not mg_id or not gid:
+                continue
+            rel("tested on gene", {"label": "MeasureGrp", "key": {"mg_id": mg_id}}, {"label": "Gene", "key": {"gene_id": str(gid)}})
 
         elif r.kind == "mg_organism":
             mg_id = str(d.get("mg_id"))
