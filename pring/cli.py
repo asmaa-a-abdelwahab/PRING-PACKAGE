@@ -28,6 +28,24 @@ def _parse_int_or_none(v: Optional[str]) -> Optional[int]:
     return int(v)
 
 
+def _fallback_worth_trying(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(token in msg for token in ("http get failed", "http post failed", "503", "504", "429", "thrott", "timed out", "timeout"))
+
+
+def _collect_rows(extractor, scope: Scope, chem_ids: List[str], target_ids: List[str], settings: Settings, store: RunStore) -> List[PubChemRow]:
+    rows: List[PubChemRow] = []
+    if scope == Scope.intersection:
+        iterator = extractor.iter_intersection_evidence(chem_ids, target_ids, caps=settings.caps, flags=settings.flags)
+    elif scope == Scope.expand_from_targets:
+        iterator = extractor.iter_expand_from_targets(target_ids, caps=settings.caps, flags=settings.flags)
+    else:
+        iterator = extractor.iter_expand_from_compounds(chem_ids, caps=settings.caps, flags=settings.flags)
+    for d in iterator:
+        rows.append(PubChemRow(kind=d["kind"], data=d["data"]))
+        store.save_row(d["kind"], d["data"])
+    return rows
+
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -60,6 +78,10 @@ def build_argparser() -> argparse.ArgumentParser:
     # Flags
     ap.add_argument("--include-textmining", type=str, choices=["true", "false"], default=None)
     ap.add_argument("--include-optional-context", type=str, choices=["true", "false"], default=None)
+    ap.add_argument("--include-endpoint-metadata", type=str, choices=["true", "false"], default=None,
+                    help="Fetch endpoint label/value/unit/outcome metadata (default: true).")
+    ap.add_argument("--include-endpoint-references", type=str, choices=["true", "false"], default=None,
+                    help="Fetch endpoint reference links (default: false; often the most throttle-prone optional lookup).")
     ap.add_argument(
         "--taxid",
         type=str,
@@ -77,6 +99,12 @@ def build_argparser() -> argparse.ArgumentParser:
 
     # Cache + runtime
     ap.add_argument("--cache-dir", type=str, default=None, help="Cache directory for downloads/HTTP responses.")
+    ap.add_argument("--prefer-sparql-fallback", type=str, choices=["true", "false"], default="true",
+                    help="If RDF REST is throttled or unavailable, retry the build through the SPARQL mirror.")
+    ap.add_argument("--rest-min-delay-s", type=float, default=None, help="Minimum spacing between RDF REST requests.")
+    ap.add_argument("--rest-max-delay-s", type=float, default=None, help="Upper bound for adaptive RDF REST backoff.")
+    ap.add_argument("--rest-honor-throttling", type=str, choices=["true", "false"], default=None,
+                    help="Honor PubChem X-Throttling-Control and Retry-After headers (default: true).")
     ap.add_argument("--batch-size", type=int, default=None, help="Neo4j UNWIND batch size (default from Settings).")
     ap.add_argument("--dry-run", action="store_true", help="Plan + fetch (optional), but do not write to Neo4j.")
 
@@ -107,17 +135,9 @@ def _demo_rows() -> List[PubChemRow]:
         PubChemRow(kind="substance", data={"sid": 123, "cid": 2244, "source_id": "demo", "source_name": "Demo source"}),
         PubChemRow(kind="bioassay", data={"aid": 1, "name": "Demo assay"}),
         PubChemRow(kind="measuregroup", data={"mg_id": "mg:1", "aid": 1, "protein_id": "P12345"}),
-        PubChemRow(kind="endpoint", data={
-            "endpoint_id": "ep:1",
-            "aid": 1,
-            "mg_id": "mg:1",
-            "sid": 123,
-            "type": "IC50",
-            "value": 3.2,
-            "unit": "uM",
-            "outcome": "Active",
-        }),
+        PubChemRow(kind="endpoint", data={"endpoint_id": "ep:1", "aid": 1, "mg_id": "mg:1", "sid": 123, "type": "IC50", "value": 3.2, "unit": "uM", "outcome": "Active"}),
     ]
+
 
 def main() -> None:
     args = build_argparser().parse_args()
@@ -150,6 +170,26 @@ def main() -> None:
         # Default cache dir per run (keeps thesis runs reproducible)
         settings = settings.with_overrides(cache_dir=store.http_cache_dir)
 
+    # RDF REST overrides
+    if args.rest_min_delay_s is not None or args.rest_max_delay_s is not None or args.rest_honor_throttling is not None:
+        rr = settings.rdf_rest
+        rr_kwargs = dict(
+            base_url=rr.base_url,
+            timeout_s=rr.timeout_s,
+            max_retries=rr.max_retries,
+            user_agent=rr.user_agent,
+            min_delay_s=rr.min_delay_s,
+            max_delay_s=rr.max_delay_s,
+            honor_throttling_headers=rr.honor_throttling_headers,
+        )
+        if args.rest_min_delay_s is not None:
+            rr_kwargs["min_delay_s"] = float(args.rest_min_delay_s)
+        if args.rest_max_delay_s is not None:
+            rr_kwargs["max_delay_s"] = float(args.rest_max_delay_s)
+        if args.rest_honor_throttling is not None:
+            rr_kwargs["honor_throttling_headers"] = (args.rest_honor_throttling == "true")
+        settings = settings.with_overrides(rdf_rest=rr.__class__(**rr_kwargs))
+
     # SPARQL endpoint overrides
     if args.sparql_endpoint or args.sparql_timeout_s:
         sp = settings.sparql
@@ -174,13 +214,37 @@ def main() -> None:
     # Flags / caps overrides
     flags = settings.flags
     if args.include_textmining is not None:
-        flags = flags.__class__(include_textmining=(args.include_textmining == "true"),
-                                include_optional_context=flags.include_optional_context,
-                                taxids=getattr(flags, "taxids", None))
+        flags = flags.__class__(
+            include_textmining=(args.include_textmining == "true"),
+            include_optional_context=flags.include_optional_context,
+            include_endpoint_metadata=getattr(flags, "include_endpoint_metadata", True),
+            include_endpoint_references=getattr(flags, "include_endpoint_references", False),
+            taxids=getattr(flags, "taxids", None),
+        )
     if args.include_optional_context is not None:
-        flags = flags.__class__(include_textmining=flags.include_textmining,
-                                include_optional_context=(args.include_optional_context == "true"),
-                                taxids=getattr(flags, "taxids", None))
+        flags = flags.__class__(
+            include_textmining=flags.include_textmining,
+            include_optional_context=(args.include_optional_context == "true"),
+            include_endpoint_metadata=getattr(flags, "include_endpoint_metadata", True),
+            include_endpoint_references=getattr(flags, "include_endpoint_references", False),
+            taxids=getattr(flags, "taxids", None),
+        )
+    if args.include_endpoint_metadata is not None:
+        flags = flags.__class__(
+            include_textmining=flags.include_textmining,
+            include_optional_context=flags.include_optional_context,
+            include_endpoint_metadata=(args.include_endpoint_metadata == "true"),
+            include_endpoint_references=getattr(flags, "include_endpoint_references", False),
+            taxids=getattr(flags, "taxids", None),
+        )
+    if args.include_endpoint_references is not None:
+        flags = flags.__class__(
+            include_textmining=flags.include_textmining,
+            include_optional_context=flags.include_optional_context,
+            include_endpoint_metadata=getattr(flags, "include_endpoint_metadata", True),
+            include_endpoint_references=(args.include_endpoint_references == "true"),
+            taxids=getattr(flags, "taxids", None),
+        )
 
     # Taxonomy override (applies to evidence filtering + symbol->gene resolution)
     if args.taxid is not None:
@@ -189,6 +253,8 @@ def main() -> None:
         flags = flags.__class__(
             include_textmining=flags.include_textmining,
             include_optional_context=flags.include_optional_context,
+            include_endpoint_metadata=getattr(flags, "include_endpoint_metadata", True),
+            include_endpoint_references=getattr(flags, "include_endpoint_references", False),
             taxids=taxids,
         )
 
@@ -200,7 +266,6 @@ def main() -> None:
         max_measuregroups_per_compound=settings.caps.max_measuregroups_per_compound if args.max_measuregroups_per_compound is None else _parse_int_or_none(args.max_measuregroups_per_compound),
         max_endpoints_per_pair=settings.caps.max_endpoints_per_pair if args.max_endpoints_per_pair is None else _parse_int_or_none(args.max_endpoints_per_pair),
     )
-
     settings = settings.with_overrides(flags=flags, caps=caps)
 
     # Plugins
@@ -222,7 +287,6 @@ def main() -> None:
     if args.cmd == "demo":
         rows = _demo_rows()
         nodes, rels = to_graph_records(rows)
-
         store.write_manifest({
             "run_id": run_id,
             "started_at": datetime.now().isoformat(),
@@ -230,6 +294,7 @@ def main() -> None:
             "scope": "demo",
             "caps": settings.caps.__dict__,
             "flags": settings.flags.__dict__,
+            "plugins": settings.enabled_plugins,
             "neo4j": {
                 "load_enabled": load_neo4j,
                 "uri": settings.neo4j.uri,
@@ -242,19 +307,13 @@ def main() -> None:
                 "cache_dir": str(settings.cache_dir),
             },
         })
-
         for row in rows:
             store.save_row(row.kind, row.data)
         store.save_nodes(nodes)
         store.save_relationships(rels)
-
         if not load_neo4j:
-            log.info(
-                "Neo4j disabled: demo extracted (%d nodes, %d relationships) and artifacts saved in %s.",
-                len(nodes), len(rels), run_dir
-            )
+            log.info("Neo4j disabled: demo extracted (%d nodes, %d relationships) and artifacts saved in %s.", len(nodes), len(rels), run_dir)
             return
-
         with Neo4jDriver(settings.neo4j) as driver:
             loader = Neo4jLoader(settings=settings, driver=driver)
             loader.ensure_schema()
@@ -306,49 +365,46 @@ def main() -> None:
 
     # Extraction
     rows: List[PubChemRow] = []
+    effective_mode = mode.value
     if mode == Mode.rdf_rest:
         rdfrest_cache = (settings.cache_dir / "rdfrest") if (args.save_raw == "true") else None
         client = PubChemRdfRestClient(settings.rdf_rest, cache_dir=rdfrest_cache)
         extractor = PubChemRdfRestExtractor(client)
+        rest_error: Optional[Exception] = None
         try:
-            if scope == Scope.intersection:
-                # Case A
-                for d in extractor.iter_intersection_evidence(chem_ids, target_ids, caps=settings.caps, flags=settings.flags):
-                    rows.append(PubChemRow(kind=d["kind"], data=d["data"]))
-                    store.save_row(d["kind"], d["data"])
-            elif scope == Scope.expand_from_targets:
-                # Case B
-                for d in extractor.iter_expand_from_targets(target_ids, caps=settings.caps, flags=settings.flags):
-                    rows.append(PubChemRow(kind=d["kind"], data=d["data"]))
-                    store.save_row(d["kind"], d["data"])
-            else:
-                # Case C
-                for d in extractor.iter_expand_from_compounds(chem_ids, caps=settings.caps, flags=settings.flags):
-                    rows.append(PubChemRow(kind=d["kind"], data=d["data"]))
-                    store.save_row(d["kind"], d["data"])
+            rows = _collect_rows(extractor, scope, chem_ids, target_ids, settings, store)
+        except Exception as exc:
+            rest_error = exc
         finally:
             try:
                 extractor.close()
             except Exception:
                 pass
             client.close()
+
+        if rest_error is not None:
+            if args.prefer_sparql_fallback == "true" and _fallback_worth_trying(rest_error):
+                log.warning("RDF REST extraction failed (%s). Falling back to SPARQL mirror.", rest_error)
+                sparql_cache = (settings.cache_dir / "sparql") if (args.save_raw == "true") else None
+                client = SparqlMirrorClient(settings.sparql, cache_dir=sparql_cache)
+                extractor = PubChemSparqlMirrorExtractor(client)
+                try:
+                    rows = _collect_rows(extractor, scope, chem_ids, target_ids, settings, store)
+                    effective_mode = "sparql-fallback"
+                finally:
+                    try:
+                        extractor.close()
+                    except Exception:
+                        pass
+                    client.close()
+            else:
+                raise rest_error
     elif mode == Mode.sparql:
         sparql_cache = (settings.cache_dir / "sparql") if (args.save_raw == "true") else None
         client = SparqlMirrorClient(settings.sparql, cache_dir=sparql_cache)
         extractor = PubChemSparqlMirrorExtractor(client)
         try:
-            if scope == Scope.intersection:
-                for d in extractor.iter_intersection_evidence(chem_ids, target_ids, caps=settings.caps, flags=settings.flags):
-                    rows.append(PubChemRow(kind=d["kind"], data=d["data"]))
-                    store.save_row(d["kind"], d["data"])
-            elif scope == Scope.expand_from_targets:
-                for d in extractor.iter_expand_from_targets(target_ids, caps=settings.caps, flags=settings.flags):
-                    rows.append(PubChemRow(kind=d["kind"], data=d["data"]))
-                    store.save_row(d["kind"], d["data"])
-            else:
-                for d in extractor.iter_expand_from_compounds(chem_ids, caps=settings.caps, flags=settings.flags):
-                    rows.append(PubChemRow(kind=d["kind"], data=d["data"]))
-                    store.save_row(d["kind"], d["data"])
+            rows = _collect_rows(extractor, scope, chem_ids, target_ids, settings, store)
         finally:
             try:
                 extractor.close()
@@ -362,6 +418,8 @@ def main() -> None:
     # Note: plugins can also be run as standalone passes that 'observe' Neo4j, but we keep it pure here.
     nodes, rels = to_graph_records(rows)
 
+    if effective_mode != mode.value:
+        log.info("effective_mode=%s", effective_mode)
     log.info("Extracted rows=%d -> nodes=%d rels=%d", len(rows), len(nodes), len(rels))
     store.save_nodes(nodes)
     store.save_relationships(rels)
@@ -372,6 +430,10 @@ def main() -> None:
         for delta in plugin.run(settings):
             nodes.extend(delta.nodes)
             rels.extend(delta.rels)
+
+    # Save final graph again so plugin-generated records are persisted even when Neo4j is disabled.
+    store.save_nodes(nodes)
+    store.save_relationships(rels)
 
     if not load_neo4j:
         log.info("✅ Neo4j disabled: extraction artifacts saved in %s", run_dir)

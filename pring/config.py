@@ -30,6 +30,9 @@ class RdfRestConfig:
     timeout_s: float = 60.0
     max_retries: int = 3
     user_agent: str = "pring/0.1 (+https://example.org)"
+    min_delay_s: float = 0.25
+    max_delay_s: float = 15.0
+    honor_throttling_headers: bool = True
 
 
 @dataclass(frozen=True)
@@ -62,6 +65,8 @@ class BuildCaps:
 class BuildFlags:
     include_textmining: bool = False
     include_optional_context: bool = True
+    include_endpoint_metadata: bool = True
+    include_endpoint_references: bool = False
     # Optional taxonomic restriction. When provided, PRING will keep only
     # evidence (measuregroups/endpoints) whose participants include a matching
     # PubChem Taxonomy entity (taxonomy:TAXIDxxxx).
@@ -148,6 +153,8 @@ class Settings:
         flags = BuildFlags(
             include_textmining=(_env("PRING_INCLUDE_TEXTMINING", "false").lower() == "true"),
             include_optional_context=(_env("PRING_INCLUDE_OPTIONAL_CONTEXT", "true").lower() == "true"),
+            include_endpoint_metadata=(_env("PRING_INCLUDE_ENDPOINT_METADATA", "true").lower() == "true"),
+            include_endpoint_references=(_env("PRING_INCLUDE_ENDPOINT_REFERENCES", "false").lower() == "true"),
             taxids=_parse_taxids(_env("PRING_TAXID", None)),
         )
 
@@ -165,6 +172,15 @@ class Settings:
 
         return Settings(
             neo4j=Neo4jConfig(uri=neo4j_uri, user=neo4j_user, password=neo4j_password),
+            rdf_rest=RdfRestConfig(
+                base_url=_env("PRING_RDFREST_BASE_URL", RdfRestConfig().base_url) or RdfRestConfig().base_url,
+                timeout_s=float(_env("PRING_RDFREST_TIMEOUT_S", str(RdfRestConfig().timeout_s)) or RdfRestConfig().timeout_s),
+                max_retries=int(_env("PRING_RDFREST_MAX_RETRIES", str(RdfRestConfig().max_retries)) or RdfRestConfig().max_retries),
+                user_agent=_env("PRING_RDFREST_USER_AGENT", RdfRestConfig().user_agent) or RdfRestConfig().user_agent,
+                min_delay_s=float(_env("PRING_RDFREST_MIN_DELAY_S", str(RdfRestConfig().min_delay_s)) or RdfRestConfig().min_delay_s),
+                max_delay_s=float(_env("PRING_RDFREST_MAX_DELAY_S", str(RdfRestConfig().max_delay_s)) or RdfRestConfig().max_delay_s),
+                honor_throttling_headers=(_env("PRING_RDFREST_HONOR_THROTTLING", "true").lower() == "true"),
+            ),
             sparql=SparqlConfig(
                 endpoint_url=_env("PRING_SPARQL_ENDPOINT", SparqlConfig().endpoint_url) or SparqlConfig().endpoint_url,
                 timeout_s=float(_env("PRING_SPARQL_TIMEOUT_S", str(SparqlConfig().timeout_s)) or SparqlConfig().timeout_s),

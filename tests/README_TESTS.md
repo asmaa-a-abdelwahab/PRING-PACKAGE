@@ -1,129 +1,98 @@
-# PRING test use cases
+# PRING test plan
 
-This test set is designed to validate PRING without requiring live PubChem, a live SPARQL endpoint, or a running Neo4j instance.
+This document explains how to run the PRING test suite and how to interpret the results for development, release, and publication.
 
-## Coverage included
+## Test structure
 
-- CLI planning and mode/scope resolution
-- Taxonomy parsing and ID file loading
-- RDF response parsing fallbacks:
-  - N-Triples-like text
-  - HTML table fallback
-  - SPARQL JSON
-- Normalization helpers and endpoint filters
-- Graph-record transformation from extracted rows
-- Run artifact writing (manifest, JSONL, CSV)
-- Mocked CLI build flow with `--load-neo4j false`
-- Offline demo flow
-- Cap handling regression: `--max-endpoints-per-pair 0`
+The suite is intentionally split into three layers.
 
-## Run locally
+### Layer A: fast offline tests
+These run without PubChem and without Neo4j.
 
-From the package root:
+They cover:
+- config parsing and environment overrides
+- CLI planning and offline command behavior
+- RDF REST response parsing
+- SPARQL helper parsing and seed normalization
+- graph transformation and normalization
+- local caching and file utilities
+- loader schema parsing and Cypher generation
+- plugin loading, plugin entry points, and graph-delta behavior
+- throttling and retry logic
+
+Run them with:
 
 ```bash
-python -m pytest -q tests
+python -m pytest -q tests -m "not live and not neo4j"
 ```
 
-If the package is not installed, make sure the current working directory is the project root that contains the `pring/` package.
+### Layer B: live smoke tests
+These confirm external integrations in a real environment.
 
-## Recommended manual use cases
+They cover:
+- PubChem RDF REST connectivity
+- Neo4j connectivity
 
-### 1) CLI help and command discovery
+Run them only when explicitly needed.
+
+PubChem smoke test:
+
+```bash
+set PRING_RUN_LIVE=1
+python -m pytest -q tests/live/test_live_smoke.py -m live
+```
+
+Neo4j smoke test:
+
+```bash
+set PRING_RUN_LIVE=1
+set PRING_RUN_NEO4J=1
+set NEO4J_URI=bolt://localhost:7687
+set NEO4J_USER=neo4j
+set NEO4J_PASSWORD=neo4j
+python -m pytest -q tests/live/test_live_smoke.py -m neo4j
+```
+
+## Coverage command
+
+Before a release or paper submission, collect coverage:
+
+```bash
+python -m pip install pytest-cov
+python -m pytest -q tests -m "not live and not neo4j" --cov=pring --cov-report=term-missing
+```
+
+## Manual smoke checks
+
+The automated suite should be supplemented with these manual checks:
+
 ```bash
 python -m pring -h
-python -m pring build -h
-```
-Expected: help text is shown without import/runtime errors.
-
-### 2) Demo mode without Neo4j
-```bash
 python -m pring --load-neo4j false --out-dir runs --run-id demo-local demo
+python -m pring --chem-ids chem_ids.txt --load-neo4j false --out-dir runs --run-id build-compounds build
+python -m pring --target-ids target_ids.txt --load-neo4j false --out-dir runs --run-id build-targets build
+python -m pring --mode sparql --chem-ids chem_ids.txt --load-neo4j false --out-dir runs --run-id build-sparql build
 ```
-Expected:
-- command exits successfully
-- `runs/demo-local/graph/nodes/*.jsonl` exists
-- `runs/demo-local/graph/rels/*.jsonl` exists
 
-### 3) Build from compounds only, artifact-only run
-Create `chem_ids.txt` with one CID per line.
-```bash
-python -m pring \
-  --chem-ids chem_ids.txt \
-  --load-neo4j false \
-  --out-dir runs \
-  --run-id build-compounds \
-  build
-```
-Expected:
-- manifest created
-- extracted rows and graph files saved under `runs/build-compounds/graph/`
-
-### 4) Scope validation failures
-```bash
-python -m pring --scope intersection --chem-ids chem_ids.txt build
-python -m pring --scope expand-from-targets --chem-ids chem_ids.txt build
-```
-Expected: clear validation errors because required paired inputs are missing.
-
-### 5) Cap edge case
-```bash
-python -m pring \
-  --chem-ids chem_ids.txt \
-  --max-endpoints-per-pair 0 \
-  --load-neo4j false \
-  build
-```
-Expected: `0` is honored as the configured cap value rather than silently falling back to defaults.
-
-### 6) Schema validation
-```bash
-python -m pring \
-  --schema-dot schema.dot \
-  --neo4j-uri bolt://localhost:7687 \
-  --neo4j-user neo4j \
-  --neo4j-password your_password \
-  schema
-```
-Expected: constraints are created successfully, or DOT/schema mapping errors are reported clearly.
-
-### 7) Neo4j smoke test
-```bash
-python -m pring \
-  --neo4j-uri bolt://localhost:7687 \
-  --neo4j-user neo4j \
-  --neo4j-password your_password \
-  demo
-```
-Expected: demo graph is loaded successfully.
-
-### 8) SPARQL mode smoke test
-Create `target_ids.txt` with a small target set.
-```bash
-python -m pring \
-  --mode sparql \
-  --target-ids target_ids.txt \
-  --load-neo4j false \
-  --run-id sparql-smoke \
-  build
-```
-Expected:
-- run folder created
-- sparql cache populated when enabled
-- small extracted graph generated
-
-## Useful troubleshooting checks
+Safer live REST example:
 
 ```bash
-ls -R runs/<run-id>
-cat runs/<run-id>/manifest.json
-cat runs/<run-id>/logs/pring.log
+python -m pring --chem-ids chem_ids.txt --prefer-sparql-fallback true --include-endpoint-references false --rest-min-delay-s 0.5 --load-neo4j false --out-dir runs --run-id build-safe build
 ```
 
-## High-risk areas still worth adding later
+## Publication gate
 
-- Live integration test against a real Neo4j container
-- Live smoke test against PubChem RDF REST
-- Live smoke test against the configured SPARQL mirror
-- Plugin loading with at least one real plugin implementation
-- DOT relationship-type collision validation with a real schema file
+Treat the package as publication-ready only when all of the following are satisfied:
+
+1. The offline suite passes on Windows and Linux.
+2. Coverage is reviewed and acceptable for the release.
+3. At least one live PubChem smoke test passes.
+4. At least one live Neo4j smoke test passes.
+5. Manual smoke runs succeed for `demo`, `build` from compounds, `build` from targets, and `build` in `sparql` mode.
+6. Throttling-aware settings are used for live PubChem runs, and optional metadata lookups are minimized when appropriate.
+
+## Notes on interpretation
+
+- Passing offline tests means core logic and package behavior are stable.
+- Passing live tests means the package still works against current external services.
+- Failing live tests do not always indicate a code bug; they can also reflect PubChem throttling, Neo4j availability, or environment-specific networking problems.

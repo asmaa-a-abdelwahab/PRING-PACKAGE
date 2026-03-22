@@ -27,6 +27,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import hashlib
 import json
+import logging
 import re
 
 from html import unescape
@@ -35,6 +36,8 @@ from pring.config import RdfRestConfig
 from pring.io.http import HttpClient
 from pring.transform.normalizer import make_stable_id, normalize_id
 from urllib.parse import quote
+
+log = logging.getLogger("pring")
 
 
 _NTRIPLE = re.compile(
@@ -151,7 +154,14 @@ class PubChemRdfRestClient:
             # Prefer n-triples (easy to parse); allow turtle as fallback.
             "Accept": "application/n-triples,text/plain;q=0.9,text/turtle;q=0.8,*/*;q=0.1",
         }
-        self.http = HttpClient(timeout_s=self.cfg.timeout_s, max_retries=self.cfg.max_retries, headers=headers)
+        self.http = HttpClient(
+            timeout_s=self.cfg.timeout_s,
+            max_retries=self.cfg.max_retries,
+            headers=headers,
+            min_delay_s=self.cfg.min_delay_s,
+            max_delay_s=self.cfg.max_delay_s,
+            honor_throttling_headers=self.cfg.honor_throttling_headers,
+        )
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -579,10 +589,20 @@ class PubChemRdfRestExtractor:
         except Exception:
             return []
 
-    def objects_for(self, graph: str, subject: str, predicate: str, *, cap: int = 50) -> List[str]:
-        """Convenience: list of object terms/literals for (subject, predicate, ?o)."""
-        rows = self.client.query(graph=graph, subject=subject, predicate=predicate, limit=cap)
-        return self._objects(rows)
+    def objects_for(self, graph: str, subject: str, predicate: str, *, cap: int = 50, strict: bool = True) -> List[str]:
+        """Convenience: list of object terms/literals for (subject, predicate, ?o).
+
+        Use strict=False for optional metadata lookups that should not abort a run
+        when PubChem briefly returns a transient error.
+        """
+        try:
+            rows = self.client.query(graph=graph, subject=subject, predicate=predicate, limit=cap)
+            return self._objects(rows)
+        except Exception:
+            if strict:
+                raise
+            log.warning("Skipping optional RDF lookup graph=%s subject=%s predicate=%s", graph, subject, predicate, exc_info=True)
+            return []
 
     def subjects_for(self, graph: str, predicate: str, object_term: str, *, cap: int = 50) -> List[str]:
         """Convenience: list of subject terms for (?s, predicate, object)."""
@@ -1180,7 +1200,7 @@ class PubChemRdfRestExtractor:
                         cell_id = self._term_id(term)
                         yield from emit("cellline", cell_id, {"cellline_id": cell_id, "cell_term": term})
                         yield {"kind": "mg_cellline", "data": {"mg_id": mg_id, "cellline_id": cell_id}}
-                        anats = self.objects_for("cell", term, "obo:RO_0001000", cap=5)
+                        anats = self.objects_for("cell", term, "obo:RO_0001000", cap=5, strict=False)
                         for anat in anats:
                             anat_id = self._term_id(anat)
                             yield from emit("anatomy", anat_id, {"anatomy_id": anat_id, "anatomy_term": anat})
@@ -1194,30 +1214,37 @@ class PubChemRdfRestExtractor:
                     refs: List[str] = []
                     sub_term: Optional[str] = None
 
-                    # Pull only what we need
-                    lab = self.objects_for("endpoint", ep, "rdfs:label", cap=1)
-                    if lab:
-                        ep_props["label"] = str(lab[0]).strip('"')
-                    val = self.objects_for("endpoint", ep, "sio:SIO_000300", cap=1)
-                    if val:
-                        try:
-                            ep_props["value"] = float(str(val[0]).strip('"'))
-                        except Exception:
-                            pass
-                    unit = self.objects_for("endpoint", ep, "sio:SIO_000221", cap=1)
-                    if unit:
-                        ep_props["unit"] = unit[0]
-                    qual = self.objects_for("endpoint", ep, "vocab:hasQualifier", cap=1)
-                    if qual:
-                        ep_props["qualifier"] = str(qual[0]).strip('"')
-                    outc = self.objects_for("endpoint", ep, "vocab:PubChemAssayOutcome", cap=1)
-                    if outc:
-                        ep_props["outcome"] = outc[0].split(":")[-1]
-                    about = self.objects_for("endpoint", ep, "obo:IAO_0000136", cap=1)
+                    include_ep_meta = getattr(flags, "include_endpoint_metadata", True)
+                    include_ep_refs = getattr(flags, "include_endpoint_references", False) and getattr(flags, "include_optional_context", True)
+
+                    # Pull only what we need. Endpoint references are opt-in because they
+                    # add a large number of optional PubChem requests and are the most
+                    # common trigger for throttling on bigger runs.
+                    if include_ep_meta:
+                        lab = self.objects_for("endpoint", ep, "rdfs:label", cap=1, strict=False)
+                        if lab:
+                            ep_props["label"] = str(lab[0]).strip('"')
+                        val = self.objects_for("endpoint", ep, "sio:SIO_000300", cap=1, strict=False)
+                        if val:
+                            try:
+                                ep_props["value"] = float(str(val[0]).strip('"'))
+                            except Exception:
+                                pass
+                        unit = self.objects_for("endpoint", ep, "sio:SIO_000221", cap=1, strict=False)
+                        if unit:
+                            ep_props["unit"] = unit[0]
+                        qual = self.objects_for("endpoint", ep, "vocab:hasQualifier", cap=1, strict=False)
+                        if qual:
+                            ep_props["qualifier"] = str(qual[0]).strip('"')
+                        outc = self.objects_for("endpoint", ep, "vocab:PubChemAssayOutcome", cap=1, strict=False)
+                        if outc:
+                            ep_props["outcome"] = outc[0].split(":")[-1]
+                    about = self.objects_for("endpoint", ep, "obo:IAO_0000136", cap=1, strict=False)
                     if about:
                         sub_term = about[0]
                     # References
-                    refs = self.objects_for("endpoint", ep, "cito:citesAsDataSource", cap=10)
+                    if include_ep_refs:
+                        refs = self.objects_for("endpoint", ep, "cito:citesAsDataSource", cap=10, strict=False)
 
                     if not sub_term:
                         sub_term = self.substance_for_endpoint(ep)

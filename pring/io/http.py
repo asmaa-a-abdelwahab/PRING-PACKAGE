@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 import hashlib
 import logging
+import re
+import time
 from pathlib import Path
 
 try:
@@ -16,14 +18,27 @@ class HttpxNotInstalled(RuntimeError):
     pass
 
 
+_THROTTLE_RE = re.compile(
+    r"Request Count status:\s*(?P<count>\w+).*?"
+    r"Request Time status:\s*(?P<time>\w+).*?"
+    r"Service status:\s*(?P<service>\w+)",
+    re.IGNORECASE,
+)
+
+
 @dataclass
 class HttpClient:
     timeout_s: float = 600.0
     max_retries: int = 6
     headers: Optional[Dict[str, str]] = None
     cache_dir: Optional[Path] = None
+    min_delay_s: float = 0.0
+    max_delay_s: float = 15.0
+    honor_throttling_headers: bool = True
 
     _log = logging.getLogger("pring.http")
+    _adaptive_delay_s: float = field(default=0.0, init=False)
+    _last_request_started_at: Optional[float] = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         if httpx is None:
@@ -42,6 +57,77 @@ class HttpClient:
         h = hashlib.sha1(raw).hexdigest()
         return self.cache_dir / f"{h}.{ext}"
 
+    def _sleep(self, seconds: float) -> None:
+        if seconds > 0:
+            time.sleep(seconds)
+
+    def _retry_sleep(self, attempt: int, retry_after_s: float = 0.0) -> None:
+        # Exponential backoff plus adaptive service feedback.
+        backoff = min(0.5 * (2 ** attempt), self.max_delay_s)
+        delay = min(self.max_delay_s, max(retry_after_s, backoff, self.min_delay_s, self._adaptive_delay_s))
+        self._sleep(delay)
+
+    @staticmethod
+    def _is_retryable_status(status_code: int) -> bool:
+        return status_code in (429, 500, 502, 503, 504)
+
+    @staticmethod
+    def _parse_retry_after(response: Any) -> float:
+        headers = getattr(response, "headers", {}) or {}
+        raw = headers.get("Retry-After")
+        if raw is None:
+            return 0.0
+        try:
+            return max(0.0, float(str(raw).strip()))
+        except Exception:
+            return 0.0
+
+    def _request_spacing_delay(self) -> float:
+        return min(self.max_delay_s, max(self.min_delay_s, self._adaptive_delay_s))
+
+    def _apply_pre_request_delay(self) -> None:
+        spacing = self._request_spacing_delay()
+        now = time.time()
+        if self._last_request_started_at is not None and spacing > 0:
+            elapsed = now - self._last_request_started_at
+            if elapsed < spacing:
+                self._sleep(spacing - elapsed)
+                now = time.time()
+        self._last_request_started_at = now
+
+    def _throttle_delay_from_header(self, header: str) -> float:
+        if not header:
+            return self.min_delay_s
+        m = _THROTTLE_RE.search(str(header))
+        if not m:
+            return self.min_delay_s
+        levels = {
+            "green": 0,
+            "idle": 0,
+            "yellow": 1,
+            "moderate": 1,
+            "red": 2,
+            "busy": 2,
+            "black": 3,
+            "overloaded": 3,
+        }
+        worst = max(levels.get(str(v).strip().lower(), 0) for v in m.groupdict().values())
+        if worst <= 0:
+            return self.min_delay_s
+        if worst == 1:
+            return min(self.max_delay_s, max(self.min_delay_s, 0.75))
+        if worst == 2:
+            return min(self.max_delay_s, max(self.min_delay_s, 2.0))
+        return self.max_delay_s
+
+    def _update_throttling_feedback(self, response: Any) -> None:
+        if not self.honor_throttling_headers:
+            return
+        headers = getattr(response, "headers", {}) or {}
+        hdr = headers.get("X-Throttling-Control")
+        if hdr:
+            self._adaptive_delay_s = self._throttle_delay_from_header(hdr)
+
     def get_text(self, url: str, params: Optional[Dict[str, Any]] = None) -> str:
         """GET a URL and return response text.
 
@@ -58,18 +144,27 @@ class HttpClient:
                 pass
 
         last_exc = None
-        for _ in range(self.max_retries + 1):
+        for attempt in range(self.max_retries + 1):
             try:
+                self._apply_pre_request_delay()
                 self._log.debug("GET %s params=%s", url, params)
                 r = self._client.get(url, params=params)
+                self._update_throttling_feedback(r)
                 # PubChem RDF-REST uses 404 (NotFound) for "no matches".
                 if r.status_code == 404:
                     return ""
-                # For very broad queries, PubChem may return 504 (Timeout).
-                # Treat it as empty so the pipeline can continue; callers should
-                # avoid broad queries and instead use selective predicates.
-                if r.status_code == 504:
-                    return ""
+                # 504 can be transient, but in PubChem RDF-REST it also often means
+                # an overly broad query. Retry first; if it keeps happening, degrade
+                # to an empty result so the pipeline can continue.
+                if self._is_retryable_status(r.status_code):
+                    if attempt < self.max_retries:
+                        self._retry_sleep(attempt, retry_after_s=self._parse_retry_after(r))
+                        continue
+                    if r.status_code == 504:
+                        self._log.warning("GET %s exhausted retries with 504; returning empty result", url)
+                        return ""
+                    last_exc = RuntimeError(f"retryable status {r.status_code}")
+                    break
                 r.raise_for_status()
                 text = r.text
                 if p is not None:
@@ -80,6 +175,9 @@ class HttpClient:
                 return text
             except Exception as e:
                 last_exc = e
+                if attempt < self.max_retries:
+                    self._retry_sleep(attempt)
+                    continue
         raise RuntimeError(f"HTTP GET failed after retries: {url}") from last_exc
 
     def get_json(self, url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -93,13 +191,21 @@ class HttpClient:
                 pass
 
         last_exc = None
-        for i in range(self.max_retries + 1):
+        for attempt in range(self.max_retries + 1):
             try:
+                self._apply_pre_request_delay()
                 self._log.debug("GET %s params=%s", url, params)
                 r = self._client.get(url, params=params)
+                self._update_throttling_feedback(r)
                 # For symmetry with get_text, treat 404 as empty JSON result.
                 if r.status_code == 404:
                     return {"head": {"vars": []}, "results": {"bindings": []}}
+                if self._is_retryable_status(r.status_code):
+                    if attempt < self.max_retries:
+                        self._retry_sleep(attempt, retry_after_s=self._parse_retry_after(r))
+                        continue
+                    last_exc = RuntimeError(f"retryable status {r.status_code}")
+                    break
                 r.raise_for_status()
                 data = r.json()
                 if p is not None:
@@ -111,6 +217,9 @@ class HttpClient:
                 return data
             except Exception as e:
                 last_exc = e
+                if attempt < self.max_retries:
+                    self._retry_sleep(attempt)
+                    continue
         raise RuntimeError(f"HTTP GET failed after retries: {url}") from last_exc
 
     def post_json(self, url: str, data: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
@@ -129,13 +238,18 @@ class HttpClient:
                 pass
 
         last_exc = None
-        for _ in range(self.max_retries + 1):
+        for attempt in range(self.max_retries + 1):
             try:
+                self._apply_pre_request_delay()
                 self._log.debug("POST %s data=%s", url, list((data or {}).keys()))
                 r = self._client.post(url, data=data, headers=headers)
+                self._update_throttling_feedback(r)
                 if r.status_code in (429, 500, 502, 503, 504):
+                    if attempt < self.max_retries:
+                        self._retry_sleep(attempt, retry_after_s=self._parse_retry_after(r))
+                        continue
                     last_exc = RuntimeError(f"retryable status {r.status_code}")
-                    continue
+                    break
                 r.raise_for_status()
                 out = r.json()
                 if p is not None:
@@ -147,4 +261,7 @@ class HttpClient:
                 return out
             except Exception as e:
                 last_exc = e
+                if attempt < self.max_retries:
+                    self._retry_sleep(attempt)
+                    continue
         raise RuntimeError(f"HTTP POST failed after retries: {url}") from last_exc
