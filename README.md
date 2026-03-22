@@ -1,168 +1,129 @@
-# PRING testing and publication-readiness guide
+# PRING testing and publication readiness
 
-This repository includes a layered test plan intended to support three goals at the same time:
+This repository now includes a layered test strategy designed to support both day-to-day development and publication-quality validation.
 
-1. **Developer confidence** during changes to extraction, graph transformation, and loading.
-2. **User trust** that the package works in realistic offline and online scenarios.
-3. **Publication readiness** through a clear, reproducible quality gate for reviewers and adopters.
+## Current validation status
 
-The suite is designed so that most checks run quickly and safely offline, while a small number of live smoke tests validate real external integrations only when explicitly enabled.
+Validated locally on the updated package:
+
+- Offline suite: **92 passed**
+- Live smoke tests available: **PubChem** and **Neo4j**
+- Offline coverage: **86% total**
+- High-risk modules improved substantially:
+  - `pring/extract/pubchem_rdf_rest.py` -> **78%**
+  - `pring/extract/pubchem_sparql_mirror.py` -> **85%**
+  - `pring/io/http.py` -> **78%**
+  - `pring/neo4j/driver.py` -> **97%**
+
+This means the package now has strong coverage over:
+- CLI flows and mode/scope resolution
+- PubChem RDF REST parsing and extraction helpers
+- SPARQL mirror parsing and emission logic
+- HTTP retries, throttling, retry-after, and spacing behavior
+- run artifact persistence
+- Neo4j driver and loader behavior
+- plugins, transforms, and helper utilities
 
 ## Test layers
 
-### 1. Fast offline unit tests
-These cover logic that should be deterministic and independent of external services.
-
-Covered areas include:
-- input parsing and query-plan decisions
-- config and environment parsing
-- row parsing from RDF REST responses
-- graph normalization and graph-record generation
-- filtering helpers
-- local caching, I/O, and run-artifact writing
-- plugin loading and plugin entry points
-- schema parsing and Cypher generation
-- logging setup and export stubs
-- throttling logic and retry behavior
-
-This layer should be the default for every local run and every CI run.
-
-### 2. Offline integration and CLI tests
-These validate end-to-end flows without depending on real PubChem or a live Neo4j instance.
-
-Covered areas include:
-- `build`, `demo`, and `schema` CLI commands
-- manifest creation and run-folder layout
-- offline graph artifact persistence
-- caps/flags handling
-- plugin-generated graph deltas
-- REST-to-SPARQL fallback behavior under throttling
-- Neo4j loader behavior through mocks
-
-This layer verifies that the package behaves correctly from a user perspective, not just at the function level.
-
-### 3. Opt-in live smoke tests
-These are intentionally small and skipped by default.
-
-Covered areas include:
-- a minimal PubChem RDF REST query
-- a minimal Neo4j driver round-trip
-
-These tests are not meant to provide broad coverage. They act as **release gates** that confirm external integrations are still functioning in a real environment.
-
-## Recommended commands
-
-### Default offline suite
-Run this first for all development and review work:
+### 1) Fast offline regression suite
+Use this for normal development. It does not require PubChem or Neo4j.
 
 ```bash
 python -m pytest -q tests -m "not live and not neo4j"
 ```
 
-### Offline suite with coverage
-Use this before merging or tagging a release:
+### 2) Offline coverage run
+Use this before release candidates and publication snapshots.
 
 ```bash
 python -m pip install pytest-cov
 python -m pytest -q tests -m "not live and not neo4j" --cov=pring --cov-report=term-missing
 ```
 
-### Live PubChem smoke test
-Only enable this when you want to validate a real PubChem integration path:
+### 3) Live PubChem smoke test
+This validates that the package can still talk to a real external PubChem endpoint.
 
-```bash
-set PRING_RUN_LIVE=1
-python -m pytest -q tests/live/test_live_smoke.py -m live
+**PowerShell**
+```powershell
+$env:PRING_RUN_LIVE = "1"
+python -m pytest -q tests/live/test_live_smoke.py -m live -rs
 ```
 
-### Live Neo4j smoke test
-Only enable this when you have a reachable Neo4j instance:
+### 4) Live Neo4j smoke test
+This validates that the driver and round-trip execution work against a real Neo4j instance.
 
-```bash
-set PRING_RUN_LIVE=1
-set PRING_RUN_NEO4J=1
-set NEO4J_URI=bolt://localhost:7687
-set NEO4J_USER=neo4j
-set NEO4J_PASSWORD=neo4j
-python -m pytest -q tests/live/test_live_smoke.py -m neo4j
+**PowerShell**
+```powershell
+$env:PRING_RUN_LIVE = "1"
+$env:PRING_RUN_NEO4J = "1"
+$env:NEO4J_URI = "bolt://localhost:7687"
+$env:NEO4J_USER = "neo4j"
+$env:NEO4J_PASSWORD = "your_password"
+python -m pytest -q tests/live/test_live_smoke.py -m neo4j -rs
 ```
 
 ## Manual smoke checks
 
-Before calling the package publication-ready, run these manual CLI checks as well.
+These still matter because they validate the actual CLI entry paths and artifact layout.
 
-### Demo mode
 ```bash
+python -m pring -h
 python -m pring --load-neo4j false --out-dir runs --run-id demo-local demo
+python -m pring --chem-ids chem_ids.txt --load-neo4j false --out-dir runs --run-id build-chem-smoke build
 ```
-Check that the run directory contains:
-- `manifest.json`
-- `graph/rows`
-- `graph/nodes`
-- `graph/rels`
-- `logs/pring.log`
 
-### Small build from compounds
+For Neo4j-enabled smoke:
+
 ```bash
-python -m pring --chem-ids chem_ids.txt --load-neo4j false --out-dir runs --run-id build-compounds build
+python -m pring --chem-ids chem_ids.txt --load-neo4j true --out-dir runs --run-id build-neo4j-smoke build
 ```
 
-### Small build from targets
-```bash
-python -m pring --target-ids target_ids.txt --load-neo4j false --out-dir runs --run-id build-targets build
-```
+## What each layer proves
 
-### Small build with SPARQL mirror
-```bash
-python -m pring --mode sparql --chem-ids chem_ids.txt --load-neo4j false --out-dir runs --run-id build-sparql build
-```
+### Offline suite
+Proves deterministic behavior of:
+- parsing and normalization
+- query planning and CLI argument handling
+- graph-row transformation
+- PubChem REST and SPARQL helper behavior under mocked conditions
+- HTTP retries, adaptive throttling, and optional metadata degradation
+- run-store writing and schema-loading helpers
 
-### Small build with safer throttling behavior
-```bash
-python -m pring --chem-ids chem_ids.txt --prefer-sparql-fallback true --include-endpoint-references false --rest-min-delay-s 0.5 --load-neo4j false --out-dir runs --run-id build-safe build
-```
+### Live PubChem smoke
+Proves:
+- the package still reaches a real PubChem service
+- the live request path is operational
+- authentication-free public access works at least for a small query
 
-## What the suite proves
+### Live Neo4j smoke
+Proves:
+- the configured Neo4j server is reachable
+- credentials are valid
+- driver execution succeeds against a live database
 
-When the offline suite passes, it demonstrates that:
-- the CLI can parse inputs and build deterministic plans
-- graph records are produced consistently from supported row kinds
-- run artifacts are written correctly
-- plugin loading and plugin outputs work
-- generated Cypher and schema handling are stable
-- retry and throttling logic behave as designed
-- optional PubChem metadata failures do not abort the run
+## Publication gate
 
-When the live smoke tests pass, they additionally demonstrate that:
-- the package can still talk to PubChem in the current environment
-- the package can still talk to Neo4j in the current environment
+A strong publication or public release gate is:
 
-## Publication-readiness gate
+1. Offline suite passes.
+2. Coverage run is reviewed and remains at an acceptable level.
+3. Live PubChem smoke passes.
+4. Live Neo4j smoke passes.
+5. At least one manual CLI smoke per primary mode is executed.
+6. Preferably run the offline suite on both Windows and Linux.
 
-A release candidate should satisfy all of the following:
+## Important operational note
 
-1. Offline test suite passes on **Windows and Linux**.
-2. Coverage is collected and reviewed before release.
-3. At least one live PubChem smoke test passes.
-4. At least one live Neo4j smoke test passes.
-5. Manual CLI smoke runs succeed for `demo`, compounds, targets, and `sparql` mode.
-6. Large or repeated PubChem runs are performed with throttling controls enabled, and optional metadata retrieval is limited or disabled when necessary.
-7. Documentation clearly states that large-scale retrieval should prefer local mirrors, FTP, or SPARQL-based workflows over heavy live REST usage.
+For large extraction jobs, PubChem REST should not be used as the only retrieval mechanism. PRING includes throttling-aware behavior and SPARQL fallback support, but large-volume jobs should still prefer local/SPARQL/hybrid workflows where possible.
 
-## Interpreting failures
+## Test inventory summary
 
-- **Offline test failure** usually means a regression in code logic or output structure.
-- **Live PubChem failure** may indicate network problems, PubChem throttling, or a service-side change.
-- **Live Neo4j failure** usually indicates local credentials, availability, or driver compatibility issues.
-- **Manual smoke failure** often points to CLI wiring, environment configuration, or artifact-writing issues not fully captured by mocks.
+The suite now includes coverage for:
+- `tests/test_cli_*.py`
+- `tests/test_pubchem_rdf_rest_additional.py`
+- `tests/test_pubchem_sparql_mirror_additional.py`
+- `tests/test_http_and_neo4j_additional.py`
+- existing graph, config, loader, plugin, parser, and helper tests
 
-## Reviewer-friendly summary
-
-For a manuscript, repository, or software release note, the most accurate summary is:
-
-> PRING is validated with a layered testing strategy comprising deterministic offline unit and integration tests, mocked CLI and Neo4j loader checks, and opt-in live smoke tests for PubChem and Neo4j. This design provides reproducible developer validation while acknowledging that external service availability and throttling must be confirmed in the target deployment environment.
-
-## Additional file
-
-A shorter operational summary is also available in:
-- `tests/README_TESTS.md`
+See `tests/README_TESTS.md` for a shorter checklist-style version.
