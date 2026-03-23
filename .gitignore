@@ -1,11 +1,7 @@
 .venv/
-pring/__pycache__/
-pring/export/__pycache__/
-pring/transform/__pycache__/
-pring/extract/__pycache__/
-pring/io/__pycache__/
-pring/neo4j/__pycache__/
-pring/plugins/__pycache__/
 __pycache__/
+*.py[cod]
+.eggs/
 runs/
 README.md
+.pytest_cache/
