@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Iterator, List, Optional, Tuple
 
 from pring.config import Settings, BuildCaps, BuildFlags
 from pring.extract.query_plan import decide_mode, decide_scope, load_id_file, Mode, Scope
 from pring.extract.pubchem_rdf_rest import PubChemRdfRestClient, PubChemRdfRestExtractor
 from pring.extract.pubchem_sparql_mirror import SparqlMirrorClient, PubChemSparqlMirrorExtractor
-from pring.extract.pubchem_core import PubChemRow, to_graph_records
+from pring.extract.pubchem_core import PubChemRow, iter_graph_records, to_graph_records
 from pring.neo4j.driver import Neo4jDriver
 from pring.neo4j.loader import Neo4jLoader
 from pring.plugins import load_plugins, normalize_plugin_list
@@ -33,8 +34,11 @@ def _fallback_worth_trying(exc: Exception) -> bool:
     return any(token in msg for token in ("http get failed", "http post failed", "503", "504", "429", "thrott", "timed out", "timeout"))
 
 
-def _collect_rows(extractor, scope: Scope, chem_ids: List[str], target_ids: List[str], settings: Settings, store: RunStore) -> List[PubChemRow]:
-    rows: List[PubChemRow] = []
+def _iter_rows(extractor, scope: Scope, chem_ids: List[str], target_ids: List[str], settings: Settings, store: RunStore) -> Iterator[PubChemRow]:
+    """Stream extracted rows to disk and yield PubChemRow objects.
+
+    This avoids holding the full row list in memory for large runs.
+    """
     if scope == Scope.intersection:
         iterator = extractor.iter_intersection_evidence(chem_ids, target_ids, caps=settings.caps, flags=settings.flags)
     elif scope == Scope.expand_from_targets:
@@ -42,90 +46,138 @@ def _collect_rows(extractor, scope: Scope, chem_ids: List[str], target_ids: List
     else:
         iterator = extractor.iter_expand_from_compounds(chem_ids, caps=settings.caps, flags=settings.flags)
     for d in iterator:
-        rows.append(PubChemRow(kind=d["kind"], data=d["data"]))
         store.save_row(d["kind"], d["data"])
-    return rows
+        yield PubChemRow(kind=d["kind"], data=d["data"])
+
+
+def _build_graph_from_rows_stream(rows: Iterator[PubChemRow], store: RunStore) -> Tuple[int, int]:
+    """Convert rows to graph records in a streaming fashion and persist to disk.
+
+    This avoids materializing all nodes/rels in memory.
+    """
+    n_nodes = 0
+    n_rels = 0
+    for rec_type, rec in iter_graph_records(rows):
+        if rec_type == "node":
+            store.save_node(rec)
+            n_nodes += 1
+        else:
+            store.save_relationship(rec)
+            n_rels += 1
+    return n_nodes, n_rels
+
+
+def _iter_jsonl(path: Path) -> Iterator[dict]:
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            yield json.loads(line)
 
 
 
-def build_argparser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="pring", description="PRING: build Neo4j graph from PubChem RDF (REST/FTP) + plugins.")
-    ap.add_argument("--schema-dot", type=str, default=None, help="Path to Graphviz DOT schema (optional but recommended).")
+def _add_shared_args(parser: argparse.ArgumentParser, *, default_suppress: bool = False) -> None:
+    default = argparse.SUPPRESS if default_suppress else None
+
+    parser.add_argument("--schema-dot", type=str, default=default, help="Path to Graphviz DOT schema (optional but recommended).")
 
     # Inputs
-    ap.add_argument("--chem-ids", type=str, default=None, help="Text file of chemical IDs (CIDs; one per line).")
-    ap.add_argument("--target-ids", type=str, default=None, help="Text file of target IDs (e.g., UniProt accessions or URIs; one per line).")
+    parser.add_argument("--chem-ids", type=str, default=default, help="Text file of chemical IDs (CIDs; one per line).")
+    parser.add_argument("--target-ids", type=str, default=default, help="Text file of target IDs (e.g., UniProt accessions or URIs; one per line).")
 
     # Mode/scope
-    ap.add_argument("--mode", type=str, choices=[m.value for m in Mode], default=None,
-                    help="rdf-rest (default), sparql (SPARQL mirror), or ftp (bulk; not implemented here).")
-    ap.add_argument("--scope", type=str, choices=[s.value for s in Scope], default=None,
-                    help="intersection|expand-from-targets|expand-from-compounds. Default depends on provided inputs.")
+    parser.add_argument("--mode", type=str, choices=[m.value for m in Mode], default=default,
+                        help="rdf-rest (default), sparql (SPARQL mirror), or ftp (bulk; not implemented here).")
+    parser.add_argument("--scope", type=str, choices=[s.value for s in Scope], default=default,
+                        help="intersection|expand-from-targets|expand-from-compounds. Default depends on provided inputs.")
 
     # Neo4j
-    ap.add_argument("--neo4j-uri", type=str, default=None)
-    ap.add_argument("--neo4j-user", type=str, default=None)
-    ap.add_argument("--neo4j-password", type=str, default=None)
-    ap.add_argument("--neo4j-db", type=str, default=None)
-    ap.add_argument("--load-neo4j", type=str, choices=["true","false"], default="true",
-                    help="Whether to load extracted data into Neo4j (default: true). Set false to only save run artifacts.")
+    parser.add_argument("--neo4j-uri", type=str, default=default)
+    parser.add_argument("--neo4j-user", type=str, default=default)
+    parser.add_argument("--neo4j-password", type=str, default=default)
+    parser.add_argument("--neo4j-db", type=str, default=default)
+    parser.add_argument("--load-neo4j", type=str, choices=["true", "false"], default=argparse.SUPPRESS if default_suppress else "true",
+                        help="Whether to load extracted data into Neo4j (default: true). Set false to only save run artifacts.")
 
     # SPARQL mirror
-    ap.add_argument("--sparql-endpoint", type=str, default=None,
-                    help="SPARQL endpoint URL for mirror mode (default: https://idsm.elixir-czech.cz/sparql/endpoint/idsm).")
-    ap.add_argument("--sparql-timeout-s", type=float, default=None, help="SPARQL HTTP timeout seconds.")
+    parser.add_argument("--sparql-endpoint", type=str, default=default,
+                        help="SPARQL endpoint URL for mirror mode (default: https://idsm.elixir-czech.cz/sparql/endpoint/idsm).")
+    parser.add_argument("--sparql-timeout-s", type=float, default=default, help="SPARQL HTTP timeout seconds.")
 
     # Flags
-    ap.add_argument("--include-textmining", type=str, choices=["true", "false"], default=None)
-    ap.add_argument("--include-optional-context", type=str, choices=["true", "false"], default=None)
-    ap.add_argument("--include-endpoint-metadata", type=str, choices=["true", "false"], default=None,
-                    help="Fetch endpoint label/value/unit/outcome metadata (default: true).")
-    ap.add_argument("--include-endpoint-references", type=str, choices=["true", "false"], default=None,
-                    help="Fetch endpoint reference links (default: false; often the most throttle-prone optional lookup).")
-    ap.add_argument(
+    parser.add_argument("--include-textmining", type=str, choices=["true", "false"], default=default)
+    parser.add_argument("--include-optional-context", type=str, choices=["true", "false"], default=default)
+    parser.add_argument("--include-endpoint-metadata", type=str, choices=["true", "false"], default=default,
+                        help="Fetch endpoint label/value/unit/outcome metadata (default: true).")
+    parser.add_argument("--include-endpoint-references", type=str, choices=["true", "false"], default=default,
+                        help="Fetch endpoint reference links (default: false; often the most throttle-prone optional lookup).")
+    parser.add_argument(
         "--taxid",
         type=str,
-        default=None,
+        default=default,
         help="Optional taxonomy filter. Examples: 9606 or TAXID9606 or 9606,10090."
     )
 
     # Caps (for Case B/C)
-    ap.add_argument("--max-compounds-per-target", type=str, default=None)
-    ap.add_argument("--max-targets-per-compound", type=str, default=None)
-    ap.add_argument("--max-substances-per-compound", type=str, default=None)
-    ap.add_argument("--max-measuregroups-per-target", type=str, default=None)
-    ap.add_argument("--max-measuregroups-per-compound", type=str, default=None)
-    ap.add_argument("--max-endpoints-per-pair", type=str, default=None)
+    parser.add_argument("--max-compounds-per-target", type=str, default=default)
+    parser.add_argument("--max-targets-per-compound", type=str, default=default)
+    parser.add_argument("--max-substances-per-compound", type=str, default=default)
+    parser.add_argument("--max-measuregroups-per-target", type=str, default=default)
+    parser.add_argument("--max-measuregroups-per-compound", type=str, default=default)
+    parser.add_argument("--max-endpoints-per-pair", type=str, default=default)
 
     # Cache + runtime
-    ap.add_argument("--cache-dir", type=str, default=None, help="Cache directory for downloads/HTTP responses.")
-    ap.add_argument("--prefer-sparql-fallback", type=str, choices=["true", "false"], default="true",
-                    help="If RDF REST is throttled or unavailable, retry the build through the SPARQL mirror.")
-    ap.add_argument("--rest-min-delay-s", type=float, default=None, help="Minimum spacing between RDF REST requests.")
-    ap.add_argument("--rest-max-delay-s", type=float, default=None, help="Upper bound for adaptive RDF REST backoff.")
-    ap.add_argument("--rest-honor-throttling", type=str, choices=["true", "false"], default=None,
-                    help="Honor PubChem X-Throttling-Control and Retry-After headers (default: true).")
-    ap.add_argument("--batch-size", type=int, default=None, help="Neo4j UNWIND batch size (default from Settings).")
-    ap.add_argument("--dry-run", action="store_true", help="Plan + fetch (optional), but do not write to Neo4j.")
+    parser.add_argument("--cache-dir", type=str, default=default, help="Cache directory for downloads/HTTP responses.")
+    parser.add_argument("--prefer-sparql-fallback", type=str, choices=["true", "false"], default=argparse.SUPPRESS if default_suppress else "true",
+                        help="If RDF REST is throttled or unavailable, retry the build through the SPARQL mirror.")
+    parser.add_argument("--rest-min-delay-s", type=float, default=default, help="Minimum spacing between RDF REST requests.")
+    parser.add_argument("--rest-max-delay-s", type=float, default=default, help="Upper bound for adaptive RDF REST backoff.")
+    parser.add_argument("--rest-honor-throttling", type=str, choices=["true", "false"], default=default,
+                        help="Honor PubChem X-Throttling-Control and Retry-After headers (default: true).")
+    parser.add_argument("--batch-size", type=int, default=default, help="Neo4j UNWIND batch size (default from Settings).")
+    parser.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS if default_suppress else False, help="Plan + fetch (optional), but do not write to Neo4j.")
 
     # Output + logging
-    ap.add_argument("--out-dir", type=str, default="runs", help="Where to store run artifacts (logs, cached responses, extracted graph).")
-    ap.add_argument("--run-id", type=str, default=None, help="Run identifier (default: timestamp).")
-    ap.add_argument("--save-raw", type=str, choices=["true", "false"], default="true",
-                    help="Save raw PubChem RDF-REST responses locally (default: true).")
-    ap.add_argument("--save-extracted", type=str, choices=["true", "false"], default="true",
-                    help="Save extracted rows/nodes/rels locally (default: true).")
-    ap.add_argument("--console-log-level", type=str, default="INFO", help="Console log level (INFO/WARNING/ERROR).")
-    ap.add_argument("--file-log-level", type=str, default="DEBUG", help="Log file level (DEBUG/INFO/WARNING/ERROR).")
+    parser.add_argument("--out-dir", type=str, default=argparse.SUPPRESS if default_suppress else "runs", help="Where to store run artifacts (logs, cached responses, extracted graph).")
+    parser.add_argument("--run-id", type=str, default=default, help="Run identifier (default: timestamp).")
+    parser.add_argument("--save-raw", type=str, choices=["true", "false"], default=argparse.SUPPRESS if default_suppress else "true",
+                        help="Save raw PubChem RDF-REST responses locally (default: true).")
+    parser.add_argument("--save-extracted", type=str, choices=["true", "false"], default=argparse.SUPPRESS if default_suppress else "true",
+                        help="Save extracted rows/nodes/rels locally (default: true).")
+    parser.add_argument("--console-log-level", type=str, default=argparse.SUPPRESS if default_suppress else "INFO", help="Console log level (INFO/WARNING/ERROR).")
+    parser.add_argument("--file-log-level", type=str, default=argparse.SUPPRESS if default_suppress else "DEBUG", help="Log file level (DEBUG/INFO/WARNING/ERROR).")
 
     # Plugins
-    ap.add_argument("--plugins", nargs="*", default=None,
-                    help="Plugin names (e.g., molgraph embeddings uniprot) or full paths (module:callable).")
+    parser.add_argument("--plugins", nargs="*", default=default,
+                        help="Plugin names (e.g., molgraph embeddings uniprot) or full paths (module:callable).")
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(prog="pring", description="PRING: build Neo4j graph from PubChem RDF (REST/FTP) + plugins.")
+    _add_shared_args(ap, default_suppress=False)
 
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("schema", help="Create Neo4j constraints for node keys.")
-    sub.add_parser("build", help="Build KG according to provided inputs and caps.")
-    sub.add_parser("demo", help="Load a tiny demo graph (sanity check).")
+    build = sub.add_parser(
+        "build",
+        help="Build KG according to provided inputs and caps.",
+        description="Build KG according to provided inputs and caps.",
+    )
+    _add_shared_args(build, default_suppress=True)
+
+    demo = sub.add_parser(
+        "demo",
+        help="Load a tiny demo graph (sanity check).",
+        description="Load a tiny demo graph (sanity check).",
+    )
+    _add_shared_args(demo, default_suppress=True)
+
+    schema = sub.add_parser(
+        "schema",
+        help="Create Neo4j constraints for node keys.",
+        description="Create Neo4j constraints for node keys.",
+    )
+    _add_shared_args(schema, default_suppress=True)
     return ap
 
 
@@ -139,8 +191,8 @@ def _demo_rows() -> List[PubChemRow]:
     ]
 
 
-def main() -> None:
-    args = build_argparser().parse_args()
+def main(argv: Optional[List[str]] = None) -> None:
+    args = build_argparser().parse_args(argv)
     settings = Settings.from_env()
 
     load_neo4j = (args.load_neo4j == "true") and (not args.dry_run)
@@ -363,8 +415,10 @@ def main() -> None:
     log.info("Run dir: %s", run_dir)
     log.info("Log file: %s", log_path)
 
-    # Extraction
-    rows: List[PubChemRow] = []
+    # Extraction (streamed)
+    row_count = 0
+    node_count = 0
+    rel_count = 0
     effective_mode = mode.value
     if mode == Mode.rdf_rest:
         rdfrest_cache = (settings.cache_dir / "rdfrest") if (args.save_raw == "true") else None
@@ -372,7 +426,12 @@ def main() -> None:
         extractor = PubChemRdfRestExtractor(client)
         rest_error: Optional[Exception] = None
         try:
-            rows = _collect_rows(extractor, scope, chem_ids, target_ids, settings, store)
+            def _rows():
+                nonlocal row_count
+                for r in _iter_rows(extractor, scope, chem_ids, target_ids, settings, store):
+                    row_count += 1
+                    yield r
+            node_count, rel_count = _build_graph_from_rows_stream(_rows(), store)
         except Exception as exc:
             rest_error = exc
         finally:
@@ -380,23 +439,37 @@ def main() -> None:
                 extractor.close()
             except Exception:
                 pass
-            client.close()
+            try:
+                client.close()
+            except Exception:
+                pass
 
         if rest_error is not None:
             if args.prefer_sparql_fallback == "true" and _fallback_worth_trying(rest_error):
                 log.warning("RDF REST extraction failed (%s). Falling back to SPARQL mirror.", rest_error)
+                # Avoid mixing partial REST artifacts with fallback artifacts.
+                store.clear_extracted_artifacts()
+                row_count = 0
                 sparql_cache = (settings.cache_dir / "sparql") if (args.save_raw == "true") else None
                 client = SparqlMirrorClient(settings.sparql, cache_dir=sparql_cache)
                 extractor = PubChemSparqlMirrorExtractor(client)
                 try:
-                    rows = _collect_rows(extractor, scope, chem_ids, target_ids, settings, store)
+                    def _rows2():
+                        nonlocal row_count
+                        for r in _iter_rows(extractor, scope, chem_ids, target_ids, settings, store):
+                            row_count += 1
+                            yield r
+                    node_count, rel_count = _build_graph_from_rows_stream(_rows2(), store)
                     effective_mode = "sparql-fallback"
                 finally:
                     try:
                         extractor.close()
                     except Exception:
                         pass
-                    client.close()
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
             else:
                 raise rest_error
     elif mode == Mode.sparql:
@@ -404,36 +477,41 @@ def main() -> None:
         client = SparqlMirrorClient(settings.sparql, cache_dir=sparql_cache)
         extractor = PubChemSparqlMirrorExtractor(client)
         try:
-            rows = _collect_rows(extractor, scope, chem_ids, target_ids, settings, store)
+            def _rows3():
+                nonlocal row_count
+                for r in _iter_rows(extractor, scope, chem_ids, target_ids, settings, store):
+                    row_count += 1
+                    yield r
+            node_count, rel_count = _build_graph_from_rows_stream(_rows3(), store)
         finally:
             try:
                 extractor.close()
             except Exception:
                 pass
-            client.close()
+            try:
+                client.close()
+            except Exception:
+                pass
     else:
         raise NotImplementedError("FTP mode is not implemented in this starter (you can add bulk dump ingestion later).")
 
-    # Plugins: executed after core extraction (still stubs until you implement)
-    # Note: plugins can also be run as standalone passes that 'observe' Neo4j, but we keep it pure here.
-    nodes, rels = to_graph_records(rows)
-
     if effective_mode != mode.value:
         log.info("effective_mode=%s", effective_mode)
-    log.info("Extracted rows=%d -> nodes=%d rels=%d", len(rows), len(nodes), len(rels))
-    store.save_nodes(nodes)
-    store.save_relationships(rels)
+    log.info("Extracted rows=%d -> nodes=%d rels=%d", row_count, node_count, rel_count)
 
+    plugin_node_count = 0
+    plugin_rel_count = 0
     for plugin in load_plugins(settings.enabled_plugins):
         if not plugin.enabled(settings):
             continue
         for delta in plugin.run(settings):
-            nodes.extend(delta.nodes)
-            rels.extend(delta.rels)
+            plugin_node_count += len(delta.nodes)
+            plugin_rel_count += len(delta.rels)
+            store.save_nodes(delta.nodes)
+            store.save_relationships(delta.rels)
 
-    # Save final graph again so plugin-generated records are persisted even when Neo4j is disabled.
-    store.save_nodes(nodes)
-    store.save_relationships(rels)
+    if settings.enabled_plugins:
+        log.info("Plugin additions: nodes=%d rels=%d", plugin_node_count, plugin_rel_count)
 
     if not load_neo4j:
         log.info("✅ Neo4j disabled: extraction artifacts saved in %s", run_dir)
@@ -443,10 +521,15 @@ def main() -> None:
         loader = Neo4jLoader(settings=settings, driver=driver)
         loader.validate_against_dot_schema()
         loader.ensure_schema()
-        loader.upsert_nodes(nodes)
-        loader.upsert_relationships(rels)
 
-    log.info("✅ Loaded: %d nodes, %d relationships.", len(nodes), len(rels))
+        # Stream nodes and relationships from disk to bound memory use.
+        for node_file in sorted(store.nodes_dir.glob("*.jsonl")):
+            loader.upsert_nodes_iter(_iter_jsonl(node_file))
+        for rel_file in sorted(store.rels_dir.glob("*.jsonl")):
+            loader.upsert_relationships_iter(_iter_jsonl(rel_file))
+
+    log.info("✅ Loaded (streamed): rows=%d nodes=%d rels=%d (+plugins nodes=%d rels=%d).",
+             row_count, node_count, rel_count, plugin_node_count, plugin_rel_count)
 
 
 if __name__ == "__main__":

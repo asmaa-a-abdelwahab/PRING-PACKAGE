@@ -228,6 +228,9 @@ def test_iter_intersection_evidence_emits_gene_protein_and_filters_by_compound(e
     extractor.measuregroups_for_participant = lambda part, cap=None: ["measuregroup:MG1"]
     extractor._mg_matches_taxids = lambda mg, taxids: True
     extractor.endpoints_for_measuregroup = lambda mg, cap=None: ["endpoint:EP1"]
+    # Intersection is now compound-anchored, so we stub the compound->substance->measuregroup traversal.
+    extractor.substances_for_compound = lambda cmp_term, cap=None: ["substance:SID1"]
+    extractor.measuregroups_for_substance = lambda sub, cap=None: ["measuregroup:MG1"]
     extractor.substance_for_endpoint = lambda ep: "substance:SID1"
     extractor.compound_for_substance = lambda sub: "compound:CID2244"
     extractor.bioassays_for_measuregroup = lambda mg: ["bioassay:AID10"]
@@ -260,7 +263,9 @@ def test_iter_intersection_evidence_emits_gene_protein_and_filters_by_compound(e
     }.get((graph, subject, predicate), [])
 
     rows = list(extractor.iter_intersection_evidence(
-        ["2244"], ["P08684", "1576"], caps=BuildCaps(max_measuregroups_per_target=1, max_endpoints_per_pair=1), flags=BuildFlags(include_optional_context=True, taxids=(9606,))
+        ["2244"], ["P08684", "1576"],
+        caps=BuildCaps(max_measuregroups_per_target=1, max_endpoints_per_pair=1),
+        flags=BuildFlags(include_optional_context=True, include_endpoint_references=True, taxids=(9606,))
     ))
     kinds = {r["kind"] for r in rows}
     assert {"protein", "gene", "measuregroup", "mg_protein", "mg_gene", "organism", "cellline", "anatomy", "endpoint", "reference", "ep_reference", "compound", "substance", "bioassay"}.issubset(kinds)

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Tuple
+from collections import deque
+from typing import Dict, Iterable, Iterator, List, Tuple
 
 from pring.transform.normalizer import make_stable_id, normalize_id
 
@@ -23,12 +24,27 @@ def to_graph_records(rows: Iterable[PubChemRow]) -> Tuple[List[Dict], List[Dict]
 
     nodes: List[Dict] = []
     rels: List[Dict] = []
+    for rec_type, rec in iter_graph_records(rows):
+        if rec_type == "node":
+            nodes.append(rec)
+        else:
+            rels.append(rec)
+    return nodes, rels
+
+
+def iter_graph_records(rows: Iterable[PubChemRow]) -> Iterator[Tuple[str, Dict]]:
+    """Stream graph node/relationship records from extracted rows.
+
+    Yields ("node", node_record) and ("rel", relationship_record).
+    This is used by the CLI to avoid materializing the full graph in memory.
+    """
+    q: deque[Tuple[str, Dict]] = deque()
 
     def node(label: str, key: Dict, props: Dict) -> None:
-        nodes.append({"label": label, "key": key, "props": props})
+        q.append(("node", {"label": label, "key": key, "props": props}))
 
     def rel(schema_label: str, start: Dict, end: Dict, props: Dict | None = None) -> None:
-        rels.append({"schema_label": schema_label, "start": start, "end": end, "props": props or {}})
+        q.append(("rel", {"schema_label": schema_label, "start": start, "end": end, "props": props or {}}))
 
     for r in rows:
         d = r.data
@@ -47,7 +63,6 @@ def to_graph_records(rows: Iterable[PubChemRow]) -> Tuple[List[Dict], List[Dict]
                 "term": d.get("compound_term"),
             })
 
-            # Structure node
             node("Structure", {"cid": cid}, {
                 "cid": cid,
                 "smiles": d.get("smiles"),
@@ -56,7 +71,6 @@ def to_graph_records(rows: Iterable[PubChemRow]) -> Tuple[List[Dict], List[Dict]
             })
             rel("has structure", {"label": "Compound", "key": {"cid": cid}}, {"label": "Structure", "key": {"cid": cid}})
 
-            # Properties node
             node("Properties", {"cid": cid}, {
                 "cid": cid,
                 "formula": d.get("formula"),
@@ -66,7 +80,6 @@ def to_graph_records(rows: Iterable[PubChemRow]) -> Tuple[List[Dict], List[Dict]
             })
             rel("has properties", {"label": "Compound", "key": {"cid": cid}}, {"label": "Properties", "key": {"cid": cid}})
 
-            # Synonyms node (optional; we at least store preferred name)
             node("Synonyms", {"cid": cid}, {
                 "cid": cid,
                 "preferred": d.get("name"),
@@ -74,7 +87,6 @@ def to_graph_records(rows: Iterable[PubChemRow]) -> Tuple[List[Dict], List[Dict]
             })
             rel("has names", {"label": "Compound", "key": {"cid": cid}}, {"label": "Synonyms", "key": {"cid": cid}})
 
-            # Neighbors (optional)
             node("Neighbors", {"cid": cid}, {
                 "cid": cid,
                 "neighbors": d.get("neighbors"),
@@ -91,15 +103,12 @@ def to_graph_records(rows: Iterable[PubChemRow]) -> Tuple[List[Dict], List[Dict]
                 "term": d.get("substance_term"),
             })
 
-            # Substance -> Source (submitted by)
             src_term = d.get("source_term")
             if src_term:
                 src_id = normalize_id(src_term)
                 node("Source", {"source_id": src_id}, {"source_id": src_id, "term": src_term})
                 rel("submitted by", {"label": "Substance", "key": {"sid": sid}}, {"label": "Source", "key": {"source_id": src_id}})
 
-            # Normalization edge Substance -> Compound is created from endpoint-derived mapping
-            # (we don't force it here because extractor may load Substance before Compound)
             if d.get("cid") is not None:
                 cid = int(d["cid"])
                 rel("standardized to\n(normalized)", {"label": "Substance", "key": {"sid": sid}}, {"label": "Compound", "key": {"cid": cid}})
@@ -116,7 +125,6 @@ def to_graph_records(rows: Iterable[PubChemRow]) -> Tuple[List[Dict], List[Dict]
                 "term": d.get("protein_term"),
             })
 
-            # Protein -> Gene (encoded by)
             gid = d.get("gene_id")
             if gid:
                 gid = str(gid)
@@ -152,8 +160,6 @@ def to_graph_records(rows: Iterable[PubChemRow]) -> Tuple[List[Dict], List[Dict]
                 "name": d.get("name"),
                 "term": d.get("bioassay_term"),
             })
-
-            # BioAssay -> Source
             src_term = d.get("source_term")
             if src_term:
                 src_id = normalize_id(src_term)
@@ -182,19 +188,15 @@ def to_graph_records(rows: Iterable[PubChemRow]) -> Tuple[List[Dict], List[Dict]
                 "label": d.get("label"),
                 "term": d.get("endpoint_term"),
             })
-
-            # Endpoint -> Substance
             sid = d.get("sid")
             if sid is not None:
                 sid = int(sid)
                 rel("is about tested record", {"label": "Endpoint", "key": {"endpoint_id": eid}}, {"label": "Substance", "key": {"sid": sid}})
 
-            # MeasureGrp -> Endpoint
             mg = d.get("mg_id")
             if mg:
                 mg_id = str(mg)
                 rel("produces endpoint", {"label": "MeasureGrp", "key": {"mg_id": mg_id}}, {"label": "Endpoint", "key": {"endpoint_id": eid}})
-                # Convenience: Substance -> MeasureGrp (interaction context)
                 if sid is not None:
                     rel("participates in", {"label": "Substance", "key": {"sid": sid}}, {"label": "MeasureGrp", "key": {"mg_id": mg_id}})
 
@@ -274,6 +276,5 @@ def to_graph_records(rows: Iterable[PubChemRow]) -> Tuple[List[Dict], List[Dict]
                 continue
             rel("supported by", {"label": "Endpoint", "key": {"endpoint_id": str(eid)}}, {"label": "Reference", "key": {"ref_id": str(rid)}})
 
-        # else: ignore unknown kinds
-
-    return nodes, rels
+        while q:
+            yield q.popleft()

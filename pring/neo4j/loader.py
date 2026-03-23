@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from pring.config import Settings
 from pring.neo4j.driver import Neo4jDriver
@@ -49,13 +49,21 @@ class Neo4jLoader:
             seen[key] = (src, dst, lab)
 
     def upsert_nodes(self, nodes: List[Dict[str, Any]]) -> None:
-        by_label: Dict[str, List[Dict[str, Any]]] = {}
-        for n in nodes:
-            label = n.get("label")
-            if label:
-                by_label.setdefault(label, []).append(n)
+        """Backwards-compatible list-based upsert."""
+        self.upsert_nodes_iter(nodes)
 
-        for label, batch in by_label.items():
+    def upsert_nodes_iter(self, nodes: Iterable[Dict[str, Any]]) -> None:
+        """Streaming node upsert.
+
+        Avoids holding the full node list in memory. Nodes are buffered per label
+        and flushed in batches.
+        """
+        buffers: Dict[str, List[Dict[str, Any]]] = {}
+
+        def flush(label: str) -> None:
+            batch = buffers.get(label) or []
+            if not batch:
+                return
             keys = self.settings.node_keys.get(label)
             if not keys:
                 raise ValueError(f"No node key mapping for label '{label}'")
@@ -66,28 +74,41 @@ SET n += row.props
 """.strip()
             for chunk in _chunked(batch, self.settings.batch_size):
                 self.driver.execute(cypher, {"rows": chunk})
+            buffers[label] = []
+
+        for n in nodes:
+            label = n.get("label")
+            if not label:
+                continue
+            buffers.setdefault(label, []).append(n)
+            if len(buffers[label]) >= self.settings.batch_size:
+                flush(label)
+
+        for label in list(buffers.keys()):
+            flush(label)
 
     def upsert_relationships(self, rels: List[Dict[str, Any]]) -> None:
-        by_type: Dict[str, List[Dict[str, Any]]] = {}
-        for r in rels:
-            rtype = r.get("type") or rel_type_from_schema_label(r.get("schema_label", ""))
-            by_type.setdefault(rtype, []).append(r)
+        """Backwards-compatible list-based upsert."""
+        self.upsert_relationships_iter(rels)
 
-        for rtype, batch in by_type.items():
-            by_pair: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
-            for r in batch:
-                s = r.get("start", {}); e = r.get("end", {})
-                sl, el = s.get("label"), e.get("label")
-                if sl and el:
-                    by_pair.setdefault((sl, el), []).append(r)
+    def upsert_relationships_iter(self, rels: Iterable[Dict[str, Any]]) -> None:
+        """Streaming relationship upsert.
 
-            for (sl, el), rows in by_pair.items():
-                skeys = self.settings.node_keys.get(sl)
-                ekeys = self.settings.node_keys.get(el)
-                if not skeys or not ekeys:
-                    raise ValueError(f"Missing node key mapping for endpoints: {sl}->{el}")
+        Relationships are buffered by (rtype, start_label, end_label) and flushed
+        in batches to keep memory bounded.
+        """
+        buffers: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
 
-                cypher = f"""
+        def flush(key: Tuple[str, str, str]) -> None:
+            rows = buffers.get(key) or []
+            if not rows:
+                return
+            rtype, sl, el = key
+            skeys = self.settings.node_keys.get(sl)
+            ekeys = self.settings.node_keys.get(el)
+            if not skeys or not ekeys:
+                raise ValueError(f"Missing node key mapping for endpoints: {sl}->{el}")
+            cypher = f"""
 UNWIND $rows AS row
 MERGE (a:{sl} {_merge_map_expr(skeys, "row.start.key")})
 SET a += coalesce(row.start.props, {{}})
@@ -96,6 +117,21 @@ SET b += coalesce(row.end.props, {{}})
 MERGE (a)-[r:{rtype}]->(b)
 SET r += coalesce(row.props, {{}})
 """.strip()
+            for chunk in _chunked(rows, self.settings.batch_size):
+                self.driver.execute(cypher, {"rows": chunk})
+            buffers[key] = []
 
-                for chunk in _chunked(rows, self.settings.batch_size):
-                    self.driver.execute(cypher, {"rows": chunk})
+        for r in rels:
+            rtype = r.get("type") or rel_type_from_schema_label(r.get("schema_label", ""))
+            s = r.get("start", {}) or {}
+            e = r.get("end", {}) or {}
+            sl, el = s.get("label"), e.get("label")
+            if not (sl and el):
+                continue
+            key = (rtype, sl, el)
+            buffers.setdefault(key, []).append(r)
+            if len(buffers[key]) >= self.settings.batch_size:
+                flush(key)
+
+        for key in list(buffers.keys()):
+            flush(key)

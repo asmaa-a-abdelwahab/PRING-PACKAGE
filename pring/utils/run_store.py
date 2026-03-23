@@ -90,36 +90,59 @@ class RunStore:
         if not self.save_extracted:
             return
         for n in nodes:
-            label = n.get("label", "Unknown")
-            self.append_jsonl(self.nodes_dir / f"{label}.jsonl", n)
+            self.save_node(n)
 
-            # CSV mirror: stable columns
-            self.append_csv(
-                self.nodes_csv_dir / f"{label}.csv",
-                fieldnames=["label", "key_json", "props_json"],
-                row={"label": label, "key_json": n.get("key"), "props_json": n.get("props")},
-            )
+    def save_node(self, n: Dict[str, Any]) -> None:
+        """Persist a single node record."""
+        if not self.save_extracted:
+            return
+        label = n.get("label", "Unknown")
+        self.append_jsonl(self.nodes_dir / f"{label}.jsonl", n)
+        self.append_csv(
+            self.nodes_csv_dir / f"{label}.csv",
+            fieldnames=["label", "key_json", "props_json"],
+            row={"label": label, "key_json": n.get("key"), "props_json": n.get("props")},
+        )
 
     def save_relationships(self, rels: Iterable[Dict[str, Any]]) -> None:
         if not self.save_extracted:
             return
         for r in rels:
-            schema_label = r.get("schema_label", "REL")
-            safe = _sanitize_filename(str(schema_label))
-            self.append_jsonl(self.rels_dir / f"{safe}.jsonl", r)
+            self.save_relationship(r)
 
-            self.append_csv(
-                self.rels_csv_dir / f"{safe}.csv",
-                fieldnames=["schema_label", "start_label", "start_key_json", "end_label", "end_key_json", "props_json"],
-                row={
-                    "schema_label": schema_label,
-                    "start_label": (r.get("start") or {}).get("label"),
-                    "start_key_json": (r.get("start") or {}).get("key"),
-                    "end_label": (r.get("end") or {}).get("label"),
-                    "end_key_json": (r.get("end") or {}).get("key"),
-                    "props_json": r.get("props") or {},
-                },
-            )
+    def save_relationship(self, r: Dict[str, Any]) -> None:
+        """Persist a single relationship record."""
+        if not self.save_extracted:
+            return
+        schema_label = r.get("schema_label", "REL")
+        safe = _sanitize_filename(str(schema_label))
+        self.append_jsonl(self.rels_dir / f"{safe}.jsonl", r)
+        self.append_csv(
+            self.rels_csv_dir / f"{safe}.csv",
+            fieldnames=["schema_label", "start_label", "start_key_json", "end_label", "end_key_json", "props_json"],
+            row={
+                "schema_label": schema_label,
+                "start_label": (r.get("start") or {}).get("label"),
+                "start_key_json": (r.get("start") or {}).get("key"),
+                "end_label": (r.get("end") or {}).get("label"),
+                "end_key_json": (r.get("end") or {}).get("key"),
+                "props_json": r.get("props") or {},
+            },
+        )
+
+    def clear_extracted_artifacts(self) -> None:
+        """Delete previously saved extracted artifacts (rows/nodes/rels) for restart/fallback."""
+        if not self.save_extracted:
+            return
+        for d in [self.rows_dir, self.nodes_dir, self.rels_dir, self.rows_csv_dir, self.nodes_csv_dir, self.rels_csv_dir]:
+            if not d.exists():
+                continue
+            for p in d.glob("*"):
+                try:
+                    p.unlink()
+                except Exception:
+                    # best-effort cleanup
+                    pass
 
 
 def _sanitize_filename(s: str) -> str:

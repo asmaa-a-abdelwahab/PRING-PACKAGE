@@ -723,32 +723,48 @@ class PubChemRdfRestExtractor:
     # ---------- main entry points ----------
 
     def iter_intersection_evidence(self, chem_ids: List[str], target_ids: List[str], *, caps: Any, flags: Any) -> Iterator[Dict[str, Any]]:
-        """Case A — Both inputs provided: keep the intersection evidence only."""
-        if not target_ids:
+        """Case A — Both inputs provided: keep the intersection evidence only.
+
+        Optimization note:
+        The previous implementation expanded from targets (participants -> measuregroups -> endpoints)
+        and then filtered by compound. This can over-retrieve massively for broad targets.
+
+        This implementation anchors on the provided compounds first (compound -> substances -> measuregroups),
+        then keeps only measuregroups whose protein/gene participants overlap the requested targets, and
+        finally keeps only endpoints that map back to the requested compounds.
+        """
+        if not chem_ids or not target_ids:
             return iter(())
 
         chem = self.normalize_chemical_seeds(chem_ids)
         tgt = [self.parse_target_seed(x) for x in target_ids]
 
         compound_terms = {c["compound"] for c in chem if c.get("compound")}
+        if not compound_terms:
+            return iter(())
 
         protein_terms = {t["protein"] for t in tgt if t.get("protein")}
         gene_terms = {t["gene"] for t in tgt if t.get("gene")}
         symbols = [t["symbol"] for t in tgt if t.get("symbol")]
 
         taxids: Optional[tuple[int, ...]] = getattr(flags, "taxids", None)
-
         if symbols:
             gene_terms.update(self.resolve_symbols_to_genes(symbols, taxids=taxids))
         if gene_terms:
             protein_terms.update(self.resolve_genes_to_proteins(sorted(gene_terms), taxids=taxids))
 
-        participants = sorted(set(protein_terms) | set(gene_terms))
-        if not participants:
+        target_parts = set(protein_terms) | set(gene_terms)
+        if not target_parts:
             return iter(())
 
-        mg_cap = getattr(caps, "max_measuregroups_per_target", None)
+        # Conservative caps for compound-first intersection.
+        sub_cap = getattr(caps, "max_substances_per_compound", None) or 200
+        mg_cap = getattr(caps, "max_measuregroups_per_compound", None) or 200
         max_eps = getattr(caps, "max_endpoints_per_pair", None)
+
+        include_optional = getattr(flags, "include_optional_context", True)
+        include_ep_meta = getattr(flags, "include_endpoint_metadata", True)
+        include_ep_refs = getattr(flags, "include_endpoint_references", False)
 
         seen: Dict[str, set[str]] = {
             "compound": set(),
@@ -770,7 +786,298 @@ class PubChemRdfRestExtractor:
             seen[kind].add(key)
             yield {"kind": kind, "data": data}
 
-        # Proteins (materialize first)
+        def materialize_protein(term: str) -> Iterator[Dict[str, Any]]:
+            acc = re.sub(r"^protein:ACC", "", term)
+            if acc in seen["protein"]:
+                return
+            triples = self.describe_subject("protein", term)
+            props: Dict[str, Any] = {"protein_id": acc, "protein_term": term}
+            for (_, pred, obj) in triples:
+                if pred == "skos:prefLabel":
+                    props.setdefault("name", obj.strip('"'))
+                elif pred == "bao:BAO_0002817":
+                    props["sequence"] = obj.strip('"')
+                elif pred == "up:encodedBy":
+                    g = self.iri_to_term(obj)
+                    m = re.search(r"GID(\d+)$", g)
+                    if m:
+                        props["gene_id"] = m.group(1)
+                        props["gene_term"] = g
+                elif pred == "up:organism":
+                    tax = self.iri_to_term(obj)
+                    m = re.search(r"TAXID(\d+)$", tax)
+                    if m:
+                        props["tax_id"] = int(m.group(1))
+                        props["tax_term"] = tax
+            yield from emit("protein", acc, props)
+
+        def materialize_gene(term: str) -> Iterator[Dict[str, Any]]:
+            m = re.search(r"GID(\d+)$", term)
+            gid = m.group(1) if m else self._term_id(term)
+            if gid in seen["gene"]:
+                return
+            triples = self.describe_subject("gene", term)
+            props: Dict[str, Any] = {"gene_id": gid, "gene_term": term}
+            for (_, pred, obj) in triples:
+                if pred == "bao:BAO_0002870":
+                    props["symbol"] = self.iri_to_term(obj).split(":", 1)[-1]
+                elif pred == "skos:prefLabel":
+                    props.setdefault("name", obj.strip('"'))
+            yield from emit("gene", gid, props)
+
+        # Candidate measuregroups from the compound side.
+        mg_candidates: List[str] = []
+        for cmp_term in sorted(compound_terms):
+            subs = self.substances_for_compound(cmp_term, cap=sub_cap)
+            # bounded aggregation: stop once we have enough measuregroups
+            for sub in subs:
+                for mg in self.measuregroups_for_substance(sub, cap=mg_cap):
+                    mg_candidates.append(mg)
+                    if len(set(mg_candidates)) >= mg_cap:
+                        break
+                if len(set(mg_candidates)) >= mg_cap:
+                    break
+        mg_candidates = sorted(set(mg_candidates))
+        if not mg_candidates:
+            return iter(())
+
+        # Optional taxonomic restriction (applied early)
+        if taxids:
+            mg_candidates = [mg for mg in mg_candidates if self._mg_matches_taxids(mg, taxids)]
+            if not mg_candidates:
+                return iter(())
+
+        for mg in mg_candidates:
+            mg_id = self._term_id(mg)
+            # Participants are needed to decide if this MG intersects with requested targets.
+            mg_parts = self.objects_for("measuregroup", mg, "obo:RO_0000057", cap=500)
+            mg_target_terms = [t for t in mg_parts if t.startswith("protein:ACC") or t.startswith("gene:GID")]
+            overlap = set(mg_target_terms) & target_parts
+            if not overlap:
+                continue
+
+            yield from emit("measuregroup", mg_id, {"mg_id": mg_id, "mg_term": mg})
+
+            # Emit only overlapping target participants (avoid hydrating unrelated proteins/genes).
+            for term in sorted(overlap):
+                if term.startswith("protein:ACC"):
+                    yield from materialize_protein(term)
+                    acc = re.sub(r"^protein:ACC", "", term)
+                    yield {"kind": "mg_protein", "data": {"mg_id": mg_id, "protein_id": acc}}
+                elif term.startswith("gene:GID"):
+                    yield from materialize_gene(term)
+                    mgid = re.search(r"GID(\d+)$", term)
+                    if mgid:
+                        yield {"kind": "mg_gene", "data": {"mg_id": mg_id, "gene_id": mgid.group(1)}}
+
+            # Optional context: organism/cell/anatomy (only for retained MGs)
+            if include_optional:
+                for term in mg_parts:
+                    if term.startswith("taxonomy:"):
+                        m = re.search(r"TAXID(\d+)$", term)
+                        if m:
+                            tax_id = int(m.group(1))
+                            yield from emit("organism", str(tax_id), {"tax_id": tax_id, "tax_term": term})
+                            yield {"kind": "mg_organism", "data": {"mg_id": mg_id, "tax_id": tax_id}}
+                    if term.startswith("cell:"):
+                        cell_id = self._term_id(term)
+                        yield from emit("cellline", cell_id, {"cellline_id": cell_id, "cell_term": term})
+                        yield {"kind": "mg_cellline", "data": {"mg_id": mg_id, "cellline_id": cell_id}}
+                        cell_triples = self.describe_subject("cell", term)
+                        for (_, p2, o2) in cell_triples:
+                            if p2 == "obo:RO_0001000":
+                                anat = self.iri_to_term(o2)
+                                anat_id = self._term_id(anat)
+                                yield from emit("anatomy", anat_id, {"anatomy_id": anat_id, "anatomy_term": anat})
+                                yield {"kind": "cell_anatomy", "data": {"cellline_id": cell_id, "anatomy_id": anat_id}}
+
+            eps = self.endpoints_for_measuregroup(mg, cap=max_eps)
+            for ep in eps:
+                ep_id = self._term_id(ep)
+                ep_props: Dict[str, Any] = {"endpoint_id": ep_id, "endpoint_term": ep, "mg_id": mg_id}
+                sub_term: Optional[str] = None
+                refs: List[str] = []
+
+                # Only hydrate expensive endpoint metadata if requested.
+                if include_ep_meta or include_ep_refs:
+                    ep_triples = self.describe_subject("endpoint", ep)
+                    for (_, pred, obj) in ep_triples:
+                        if include_ep_meta:
+                            if pred == "sio:SIO_000300":
+                                try:
+                                    ep_props["value"] = float(obj.strip('"'))
+                                except Exception:
+                                    pass
+                            elif pred == "sio:SIO_000221":
+                                ep_props["unit"] = self.iri_to_term(obj)
+                            elif pred == "vocab:hasQualifier":
+                                ep_props["qualifier"] = obj.strip('"')
+                            elif pred == "vocab:PubChemAssayOutcome":
+                                ep_props["outcome"] = self.iri_to_term(obj).split(":")[-1]
+                            elif pred == "rdfs:label":
+                                ep_props["label"] = obj.strip('"')
+                        if pred == "obo:IAO_0000136":
+                            sub_term = self.iri_to_term(obj)
+                        if include_ep_refs and pred == "cito:citesAsDataSource":
+                            refs.append(self.iri_to_term(obj))
+
+                if sub_term is None:
+                    sub_term = self.substance_for_endpoint(ep)
+                if not sub_term:
+                    continue
+
+                cmp_term = self.compound_for_substance(sub_term)
+                if not cmp_term or cmp_term not in compound_terms:
+                    continue
+
+                # Parse CID
+                m2 = re.search(r"CID(\d+)$", cmp_term)
+                cid = int(m2.group(1)) if m2 else None
+
+                # Substance node
+                m = re.search(r"SID(\d+)$", sub_term)
+                sid = int(m.group(1)) if m else None
+                if sid is not None:
+                    sub_props: Dict[str, Any] = {"sid": sid, "substance_term": sub_term, "cid": cid}
+                    sub_triples = self.describe_subject("substance", sub_term)
+                    for (_, pred, obj) in sub_triples:
+                        if pred == "dcterms:source":
+                            sub_props["source_term"] = self.iri_to_term(obj)
+                    yield from emit("substance", str(sid), sub_props)
+                    ep_props["sid"] = sid
+
+                # Compound node (only when actually supported by an endpoint)
+                if cid is not None:
+                    if str(cid) not in seen["compound"]:
+                        cmp_triples = self.describe_subject("compound", cmp_term)
+                        cmp_props: Dict[str, Any] = {"cid": cid, "compound_term": cmp_term}
+                        neighbors: List[str] = []
+                        for (_, pred, obj) in cmp_triples:
+                            if pred == "skos:prefLabel":
+                                cmp_props["name"] = obj.strip('"')
+                            elif pred == "vocab:smiles":
+                                cmp_props["smiles"] = obj.strip('"')
+                            elif pred == "vocab:iupac_inchi":
+                                cmp_props["inchi"] = obj.strip('"')
+                            elif pred == "vocab:inchikey":
+                                cmp_props["inchikey"] = obj.strip('"')
+                            elif pred == "vocab:molecular_formula":
+                                cmp_props["formula"] = obj.strip('"')
+                            elif pred == "vocab:molecular_weight":
+                                try:
+                                    cmp_props["molecular_weight"] = float(obj.strip('"'))
+                                except Exception:
+                                    pass
+                            elif pred == "vocab:xlogp3":
+                                try:
+                                    cmp_props["xlogp3"] = float(obj.strip('"'))
+                                except Exception:
+                                    pass
+                            elif pred == "vocab:tpsa":
+                                try:
+                                    cmp_props["tpsa"] = float(obj.strip('"'))
+                                except Exception:
+                                    pass
+                            elif pred in ("vocab:has_parent", "cheminf:CHEMINF_000455", "cheminf:CHEMINF_000461", "cheminf:CHEMINF_000462", "cheminf:CHEMINF_000480"):
+                                neighbors.append(self.iri_to_term(obj))
+                        if neighbors:
+                            cmp_props["neighbors"] = neighbors[:200]
+                        yield from emit("compound", str(cid), cmp_props)
+
+                # Endpoint type from label
+                lab = (ep_props.get("label") or "").upper()
+                for k in ("IC50", "KI", "KD", "EC50", "AC50"):
+                    if k in lab:
+                        ep_props.setdefault("type", k)
+                        break
+
+                yield from emit("endpoint", ep_id, ep_props)
+
+                # BioAssay provenance
+                assays = self.bioassays_for_measuregroup(mg)
+                if assays:
+                    assay = assays[0]
+                    ma = re.search(r"AID(\d+)$", assay)
+                    if ma:
+                        aid = int(ma.group(1))
+                        if str(aid) not in seen["bioassay"]:
+                            assay_triples = self.describe_subject("bioassay", assay)
+                            aprops: Dict[str, Any] = {"aid": aid, "bioassay_term": assay}
+                            for (_, pred, obj) in assay_triples:
+                                if pred == "dcterms:title":
+                                    aprops["name"] = obj.strip('"')
+                                elif pred == "dcterms:source":
+                                    aprops["source_term"] = self.iri_to_term(obj)
+                            yield from emit("bioassay", str(aid), aprops)
+                        yield {"kind": "mg_bioassay", "data": {"mg_id": mg_id, "aid": aid}}
+
+                # References (optional)
+                if include_ep_refs:
+                    for ref in sorted(set(refs)):
+                        rid = self._term_id(ref)
+                        yield from emit("reference", rid, {"ref_id": rid, "ref_term": ref})
+                        yield {"kind": "ep_reference", "data": {"endpoint_id": ep_id, "ref_id": rid}}
+
+        return iter(())
+
+    def iter_expand_from_targets(self, target_ids: List[str], *, caps: Any, flags: Any) -> Iterator[Dict[str, Any]]:
+        """Case B — Only targets provided.
+
+        We reuse the same pipeline but without compound filtering.
+        Use caps to prevent explosion.
+        """
+        if not target_ids:
+            return iter(())
+        # Target-only expansion remains target-anchored by definition.
+        # We reuse the previous participant-first strategy but without compound filtering.
+        return self._iter_target_anchored_evidence(target_ids, caps=caps, flags=flags)
+
+    def _iter_target_anchored_evidence(self, target_ids: List[str], *, caps: Any, flags: Any) -> Iterator[Dict[str, Any]]:
+        """Target-anchored evidence expansion (used for expand-from-targets).
+
+        This mirrors the older intersection strategy but does not filter by a compound set.
+        """
+        tgt = [self.parse_target_seed(x) for x in target_ids]
+        protein_terms = {t["protein"] for t in tgt if t.get("protein")}
+        gene_terms = {t["gene"] for t in tgt if t.get("gene")}
+        symbols = [t["symbol"] for t in tgt if t.get("symbol")]
+        taxids: Optional[tuple[int, ...]] = getattr(flags, "taxids", None)
+        if symbols:
+            gene_terms.update(self.resolve_symbols_to_genes(symbols, taxids=taxids))
+        if gene_terms:
+            protein_terms.update(self.resolve_genes_to_proteins(sorted(gene_terms), taxids=taxids))
+
+        participants = sorted(set(protein_terms) | set(gene_terms))
+        if not participants:
+            return iter(())
+
+        mg_cap = getattr(caps, "max_measuregroups_per_target", None)
+        max_eps = getattr(caps, "max_endpoints_per_pair", None)
+        include_optional = getattr(flags, "include_optional_context", True)
+        include_ep_meta = getattr(flags, "include_endpoint_metadata", True)
+        include_ep_refs = getattr(flags, "include_endpoint_references", False)
+
+        seen: Dict[str, set[str]] = {
+            "compound": set(),
+            "substance": set(),
+            "protein": set(),
+            "gene": set(),
+            "bioassay": set(),
+            "measuregroup": set(),
+            "endpoint": set(),
+            "reference": set(),
+            "organism": set(),
+            "cellline": set(),
+            "anatomy": set(),
+        }
+
+        def emit(kind: str, key: str, data: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
+            if key in seen[kind]:
+                return
+            seen[kind].add(key)
+            yield {"kind": kind, "data": data}
+
+        # Materialize proteins/genes (same as previous behavior)
         for p in sorted(protein_terms):
             acc = re.sub(r"^protein:ACC", "", p)
             triples = self.describe_subject("protein", p)
@@ -794,7 +1101,6 @@ class PubChemRdfRestExtractor:
                         props["tax_term"] = tax
             yield from emit("protein", acc, props)
 
-        # Genes
         for g in sorted(gene_terms):
             m = re.search(r"GID(\d+)$", g)
             gid = m.group(1) if m else self._term_id(g)
@@ -807,15 +1113,12 @@ class PubChemRdfRestExtractor:
                     props.setdefault("name", obj.strip('"'))
             yield from emit("gene", gid, props)
 
-        # MeasureGroups per participant
         all_mgs: List[str] = []
         for part in participants:
             all_mgs.extend(self.measuregroups_for_participant(part, cap=mg_cap))
         all_mgs = sorted(set(all_mgs))
         if not all_mgs:
             return iter(())
-
-        # Optional taxonomic restriction
         if taxids:
             all_mgs = [mg for mg in all_mgs if self._mg_matches_taxids(mg, taxids)]
             if not all_mgs:
@@ -825,10 +1128,8 @@ class PubChemRdfRestExtractor:
             mg_id = self._term_id(mg)
             yield from emit("measuregroup", mg_id, {"mg_id": mg_id, "mg_term": mg})
 
-            # Participants are core connectivity; always parse them.
             mg_parts = self.objects_for("measuregroup", mg, "obo:RO_0000057", cap=500)
             for term in mg_parts:
-                # Core connectivity: MeasureGroup -> Protein/Gene participants
                 if term.startswith("protein:ACC"):
                     acc = re.sub(r"^protein:ACC", "", term)
                     yield {"kind": "mg_protein", "data": {"mg_id": mg_id, "protein_id": acc}}
@@ -837,8 +1138,7 @@ class PubChemRdfRestExtractor:
                     if mgid:
                         yield {"kind": "mg_gene", "data": {"mg_id": mg_id, "gene_id": mgid.group(1)}}
 
-            # Optional context: organism/cell/anatomy
-            if getattr(flags, "include_optional_context", True):
+            if include_optional:
                 for term in mg_parts:
                     if term.startswith("taxonomy:"):
                         m = re.search(r"TAXID(\d+)$", term)
@@ -861,29 +1161,31 @@ class PubChemRdfRestExtractor:
             eps = self.endpoints_for_measuregroup(mg, cap=max_eps)
             for ep in eps:
                 ep_id = self._term_id(ep)
-                ep_triples = self.describe_subject("endpoint", ep)
                 ep_props: Dict[str, Any] = {"endpoint_id": ep_id, "endpoint_term": ep, "mg_id": mg_id}
                 sub_term: Optional[str] = None
                 refs: List[str] = []
 
-                for (_, pred, obj) in ep_triples:
-                    if pred == "sio:SIO_000300":
-                        try:
-                            ep_props["value"] = float(obj.strip('"'))
-                        except Exception:
-                            pass
-                    elif pred == "sio:SIO_000221":
-                        ep_props["unit"] = self.iri_to_term(obj)
-                    elif pred == "vocab:hasQualifier":
-                        ep_props["qualifier"] = obj.strip('"')
-                    elif pred == "vocab:PubChemAssayOutcome":
-                        ep_props["outcome"] = self.iri_to_term(obj).split(":")[-1]
-                    elif pred == "rdfs:label":
-                        ep_props["label"] = obj.strip('"')
-                    elif pred == "obo:IAO_0000136":
-                        sub_term = self.iri_to_term(obj)
-                    elif pred == "cito:citesAsDataSource":
-                        refs.append(self.iri_to_term(obj))
+                if include_ep_meta or include_ep_refs:
+                    ep_triples = self.describe_subject("endpoint", ep)
+                    for (_, pred, obj) in ep_triples:
+                        if include_ep_meta:
+                            if pred == "sio:SIO_000300":
+                                try:
+                                    ep_props["value"] = float(obj.strip('"'))
+                                except Exception:
+                                    pass
+                            elif pred == "sio:SIO_000221":
+                                ep_props["unit"] = self.iri_to_term(obj)
+                            elif pred == "vocab:hasQualifier":
+                                ep_props["qualifier"] = obj.strip('"')
+                            elif pred == "vocab:PubChemAssayOutcome":
+                                ep_props["outcome"] = self.iri_to_term(obj).split(":")[-1]
+                            elif pred == "rdfs:label":
+                                ep_props["label"] = obj.strip('"')
+                        if pred == "obo:IAO_0000136":
+                            sub_term = self.iri_to_term(obj)
+                        if include_ep_refs and pred == "cito:citesAsDataSource":
+                            refs.append(self.iri_to_term(obj))
 
                 if sub_term is None:
                     sub_term = self.substance_for_endpoint(ep)
@@ -891,65 +1193,29 @@ class PubChemRdfRestExtractor:
                     continue
 
                 cmp_term = self.compound_for_substance(sub_term)
-                if not cmp_term:
-                    continue
-                if compound_terms and cmp_term not in compound_terms:
-                    continue
-
-                # Pre-parse CID (used for Substance -> Compound normalization edge)
-                m2 = re.search(r"CID(\d+)$", cmp_term)
+                m2 = re.search(r"CID(\d+)$", cmp_term or "")
                 cid = int(m2.group(1)) if m2 else None
 
-                # Substance
                 m = re.search(r"SID(\d+)$", sub_term)
                 sid = int(m.group(1)) if m else None
                 if sid is not None:
-                    sub_triples = self.describe_subject("substance", sub_term)
                     sub_props: Dict[str, Any] = {"sid": sid, "substance_term": sub_term, "cid": cid}
+                    sub_triples = self.describe_subject("substance", sub_term)
                     for (_, pred, obj) in sub_triples:
                         if pred == "dcterms:source":
                             sub_props["source_term"] = self.iri_to_term(obj)
                     yield from emit("substance", str(sid), sub_props)
                     ep_props["sid"] = sid
 
-                # Compound + basic features
-                if cid is not None:
-                    cmp_triples = self.describe_subject("compound", cmp_term)
-                    cmp_props: Dict[str, Any] = {"cid": cid, "compound_term": cmp_term}
-                    neighbors: List[str] = []
-                    for (_, pred, obj) in cmp_triples:
-                        if pred == "skos:prefLabel":
-                            cmp_props["name"] = obj.strip('"')
-                        elif pred == "vocab:smiles":
-                            cmp_props["smiles"] = obj.strip('"')
-                        elif pred == "vocab:iupac_inchi":
-                            cmp_props["inchi"] = obj.strip('"')
-                        elif pred == "vocab:inchikey":
-                            cmp_props["inchikey"] = obj.strip('"')
-                        elif pred == "vocab:molecular_formula":
-                            cmp_props["formula"] = obj.strip('"')
-                        elif pred == "vocab:molecular_weight":
-                            try:
-                                cmp_props["molecular_weight"] = float(obj.strip('"'))
-                            except Exception:
-                                pass
-                        elif pred == "vocab:xlogp3":
-                            try:
-                                cmp_props["xlogp3"] = float(obj.strip('"'))
-                            except Exception:
-                                pass
-                        elif pred == "vocab:tpsa":
-                            try:
-                                cmp_props["tpsa"] = float(obj.strip('"'))
-                            except Exception:
-                                pass
-                        elif pred in ("vocab:has_parent", "cheminf:CHEMINF_000455", "cheminf:CHEMINF_000461", "cheminf:CHEMINF_000462", "cheminf:CHEMINF_000480"):
-                            neighbors.append(self.iri_to_term(obj))
-                    if neighbors:
-                        cmp_props["neighbors"] = neighbors[:200]
-                    yield from emit("compound", str(cid), cmp_props)
+                if cid is not None and cmp_term:
+                    if str(cid) not in seen["compound"]:
+                        cmp_triples = self.describe_subject("compound", cmp_term)
+                        cmp_props: Dict[str, Any] = {"cid": cid, "compound_term": cmp_term}
+                        for (_, pred, obj) in cmp_triples:
+                            if pred == "skos:prefLabel":
+                                cmp_props["name"] = obj.strip('"')
+                        yield from emit("compound", str(cid), cmp_props)
 
-                # Endpoint type (best-effort) from label
                 lab = (ep_props.get("label") or "").upper()
                 for k in ("IC50", "KI", "KD", "EC50", "AC50"):
                     if k in lab:
@@ -958,40 +1224,30 @@ class PubChemRdfRestExtractor:
 
                 yield from emit("endpoint", ep_id, ep_props)
 
-                # BioAssay (for provenance)
                 assays = self.bioassays_for_measuregroup(mg)
                 if assays:
                     assay = assays[0]
                     ma = re.search(r"AID(\d+)$", assay)
                     if ma:
                         aid = int(ma.group(1))
-                        assay_triples = self.describe_subject("bioassay", assay)
-                        aprops: Dict[str, Any] = {"aid": aid, "bioassay_term": assay}
-                        for (_, pred, obj) in assay_triples:
-                            if pred == "dcterms:title":
-                                aprops["name"] = obj.strip('"')
-                            elif pred == "dcterms:source":
-                                aprops["source_term"] = self.iri_to_term(obj)
-                        yield from emit("bioassay", str(aid), aprops)
+                        if str(aid) not in seen["bioassay"]:
+                            assay_triples = self.describe_subject("bioassay", assay)
+                            aprops: Dict[str, Any] = {"aid": aid, "bioassay_term": assay}
+                            for (_, pred, obj) in assay_triples:
+                                if pred == "dcterms:title":
+                                    aprops["name"] = obj.strip('"')
+                                elif pred == "dcterms:source":
+                                    aprops["source_term"] = self.iri_to_term(obj)
+                            yield from emit("bioassay", str(aid), aprops)
                         yield {"kind": "mg_bioassay", "data": {"mg_id": mg_id, "aid": aid}}
 
-                # References (endpoint supported by)
-                for ref in sorted(set(refs)):
-                    rid = self._term_id(ref)
-                    yield from emit("reference", rid, {"ref_id": rid, "ref_term": ref})
-                    yield {"kind": "ep_reference", "data": {"endpoint_id": ep_id, "ref_id": rid}}
+                if include_ep_refs:
+                    for ref in sorted(set(refs)):
+                        rid = self._term_id(ref)
+                        yield from emit("reference", rid, {"ref_id": rid, "ref_term": ref})
+                        yield {"kind": "ep_reference", "data": {"endpoint_id": ep_id, "ref_id": rid}}
 
         return iter(())
-
-    def iter_expand_from_targets(self, target_ids: List[str], *, caps: Any, flags: Any) -> Iterator[Dict[str, Any]]:
-        """Case B — Only targets provided.
-
-        We reuse the same pipeline but without compound filtering.
-        Use caps to prevent explosion.
-        """
-        if not target_ids:
-            return iter(())
-        return self.iter_intersection_evidence([], target_ids, caps=caps, flags=flags)
 
     def iter_expand_from_compounds(self, chem_ids: List[str], *, caps: Any, flags: Any) -> Iterator[Dict[str, Any]]:
         """Case C — Only compounds provided.
