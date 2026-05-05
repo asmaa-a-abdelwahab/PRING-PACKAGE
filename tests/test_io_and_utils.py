@@ -13,6 +13,7 @@ from pring.io.ftp_cache import FtpCache
 from pring.io.iri import IRIBuilder
 from pring.io.rdf_stream import stream_ntriples
 from pring.utils.logging_utils import setup_logging
+from pring.utils.run_store import RunStore
 
 
 def test_iribuilder_creates_stable_uri_and_does_not_override_existing_uri():
@@ -64,3 +65,10 @@ def test_setup_logging_creates_rotating_log_file_and_replaces_handlers(tmp_path:
 def test_export_placeholder_writes_readme(tmp_path: Path):
     export_placeholder(tmp_path / "pyg")
     assert "PyG export stub" in (tmp_path / "pyg" / "README.txt").read_text(encoding="utf-8")
+
+
+def test_runstore_can_disable_csv_mirrors_and_enforce_graph_budget(tmp_path: Path):
+    store = RunStore(tmp_path / "run", save_raw=False, save_extracted=True, save_csv_mirrors=False, max_graph_bytes=20)
+    assert not store.rows_csv_dir.exists()
+    with pytest.raises(RuntimeError, match="Graph artifact budget exceeded"):
+        store.save_row("compound", {"cid": 2244, "name": "caffeine"})

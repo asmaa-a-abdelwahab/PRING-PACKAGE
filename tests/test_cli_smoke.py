@@ -80,7 +80,8 @@ def test_cli_demo_without_neo4j_still_saves_demo_artifacts(monkeypatch: pytest.M
 
     run_dir = tmp_path / "runs" / "demo-run"
     assert (run_dir / "graph" / "nodes" / "Compound.jsonl").exists()
-    assert (run_dir / "graph" / "rels" / "has_structure.jsonl").exists()
+    rel_dir = run_dir / "graph" / "rels"
+    assert (rel_dir / "HAS_STRUCTURE.jsonl").exists() or (rel_dir / "has_structure.jsonl").exists()
 
 
 def test_cli_allows_zero_caps_instead_of_falling_back_to_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -110,3 +111,32 @@ def test_cli_allows_zero_caps_instead_of_falling_back_to_defaults(monkeypatch: p
     ])
 
     cli.main()
+
+
+def test_cli_low_resource_profile_disables_raw_cache_and_csv_mirrors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    chem_ids = tmp_path / "chem.txt"
+    chem_ids.write_text("2244\n", encoding="utf-8")
+
+    monkeypatch.setattr(cli.Settings, "from_env", staticmethod(_settings))
+    monkeypatch.setattr(cli, "PubChemRdfRestClient", FakeClient)
+    monkeypatch.setattr(cli, "PubChemRdfRestExtractor", FakeExtractor)
+    monkeypatch.setattr(sys, "argv", [
+        "pring",
+        "--chem-ids", str(chem_ids),
+        "--resource-profile", "low",
+        "--load-neo4j", "false",
+        "--out-dir", str(tmp_path / "runs"),
+        "--run-id", "low-resource",
+        "build",
+    ])
+
+    cli.main()
+
+    run_dir = tmp_path / "runs" / "low-resource"
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["resources"]["profile"] == "low"
+    assert manifest["resources"]["write_csv_mirrors"] is False
+    assert manifest["resources"]["save_raw_http_cache"] is False
+    assert manifest["resources"]["max_http_cache_mb"] == 128
+    assert not (run_dir / "raw" / "http_cache").exists()
+    assert not (run_dir / "graph" / "nodes_csv").exists()

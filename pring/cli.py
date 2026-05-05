@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
@@ -27,6 +28,106 @@ def _parse_int_or_none(v: Optional[str]) -> Optional[int]:
     if v == "" or v.lower() == "none":
         return None
     return int(v)
+
+
+def _flag_present(raw_argv: List[str], flag: str) -> bool:
+    return flag in raw_argv
+
+
+def _mb_to_bytes(v: Optional[int]) -> Optional[int]:
+    return None if v is None else max(0, int(v)) * 1024 * 1024
+
+
+def _min_cap(current: Optional[int], limit: Optional[int]) -> Optional[int]:
+    if limit is None:
+        return current
+    if current is None:
+        return limit
+    return min(current, limit)
+
+
+def _apply_resource_profile(settings: Settings, profile: str, raw_argv: List[str]) -> Settings:
+    profile = (profile or "balanced").strip().lower()
+    if profile not in {"low", "balanced", "high"}:
+        profile = "balanced"
+
+    resources = settings.resources
+    caps = settings.caps
+    rdf_rest = settings.rdf_rest
+    batch_size = settings.batch_size
+    save_raw_http_cache = settings.save_raw_http_cache
+
+    if profile == "low":
+        if not _flag_present(raw_argv, "--batch-size"):
+            batch_size = min(batch_size, 250)
+        if not _flag_present(raw_argv, "--save-raw"):
+            save_raw_http_cache = False
+        if not _flag_present(raw_argv, "--write-csv-mirrors"):
+            resources = resources.__class__(
+                profile=profile,
+                write_csv_mirrors=False,
+                max_http_cache_mb=resources.max_http_cache_mb if resources.max_http_cache_mb is not None else 128,
+                max_graph_artifact_mb=resources.max_graph_artifact_mb if resources.max_graph_artifact_mb is not None else 512,
+            )
+        if not _flag_present(raw_argv, "--rest-min-delay-s"):
+            rdf_rest = rdf_rest.__class__(
+                base_url=rdf_rest.base_url,
+                timeout_s=rdf_rest.timeout_s,
+                max_retries=rdf_rest.max_retries,
+                user_agent=rdf_rest.user_agent,
+                honor_throttling_headers=rdf_rest.honor_throttling_headers,
+                min_delay_s=max(rdf_rest.min_delay_s, 0.5),
+                max_delay_s=rdf_rest.max_delay_s,
+            )
+        caps = caps.__class__(
+            max_compounds_per_target=caps.max_compounds_per_target if _flag_present(raw_argv, "--max-compounds-per-target") else _min_cap(caps.max_compounds_per_target, 100),
+            max_targets_per_compound=caps.max_targets_per_compound if _flag_present(raw_argv, "--max-targets-per-compound") else _min_cap(caps.max_targets_per_compound, 50),
+            max_substances_per_compound=caps.max_substances_per_compound if _flag_present(raw_argv, "--max-substances-per-compound") else _min_cap(caps.max_substances_per_compound, 250),
+            max_measuregroups_per_target=caps.max_measuregroups_per_target if _flag_present(raw_argv, "--max-measuregroups-per-target") else _min_cap(caps.max_measuregroups_per_target, 200),
+            max_measuregroups_per_compound=caps.max_measuregroups_per_compound if _flag_present(raw_argv, "--max-measuregroups-per-compound") else _min_cap(caps.max_measuregroups_per_compound, 200),
+            max_endpoints_per_pair=caps.max_endpoints_per_pair if _flag_present(raw_argv, "--max-endpoints-per-pair") else _min_cap(caps.max_endpoints_per_pair, 25),
+        )
+    elif profile == "high":
+        if not _flag_present(raw_argv, "--batch-size"):
+            batch_size = max(batch_size, 2000)
+        if not _flag_present(raw_argv, "--write-csv-mirrors"):
+            resources = resources.__class__(
+                profile=profile,
+                write_csv_mirrors=True,
+                max_http_cache_mb=resources.max_http_cache_mb,
+                max_graph_artifact_mb=resources.max_graph_artifact_mb,
+            )
+    else:
+        resources = resources.__class__(
+            profile=profile,
+            write_csv_mirrors=resources.write_csv_mirrors,
+            max_http_cache_mb=resources.max_http_cache_mb,
+            max_graph_artifact_mb=resources.max_graph_artifact_mb,
+        )
+
+    return settings.with_overrides(
+        batch_size=batch_size,
+        caps=caps,
+        rdf_rest=rdf_rest,
+        save_raw_http_cache=save_raw_http_cache,
+        resources=resources,
+    )
+
+
+def _make_rdfrest_client(settings: Settings, cache_dir: Optional[Path]):
+    max_cache_bytes = _mb_to_bytes(settings.resources.max_http_cache_mb)
+    try:
+        return PubChemRdfRestClient(settings.rdf_rest, cache_dir=cache_dir, max_cache_bytes=max_cache_bytes)
+    except TypeError:
+        return PubChemRdfRestClient(settings.rdf_rest, cache_dir=cache_dir)
+
+
+def _make_sparql_client(settings: Settings, cache_dir: Optional[Path]):
+    max_cache_bytes = _mb_to_bytes(settings.resources.max_http_cache_mb)
+    try:
+        return SparqlMirrorClient(settings.sparql, cache_dir=cache_dir, max_cache_bytes=max_cache_bytes)
+    except TypeError:
+        return SparqlMirrorClient(settings.sparql, cache_dir=cache_dir)
 
 
 def _fallback_worth_trying(exc: Exception) -> bool:
@@ -136,6 +237,14 @@ def _add_shared_args(parser: argparse.ArgumentParser, *, default_suppress: bool 
     parser.add_argument("--rest-honor-throttling", type=str, choices=["true", "false"], default=default,
                         help="Honor PubChem X-Throttling-Control and Retry-After headers (default: true).")
     parser.add_argument("--batch-size", type=int, default=default, help="Neo4j UNWIND batch size (default from Settings).")
+    parser.add_argument("--resource-profile", type=str, choices=["low", "balanced", "high"], default=default,
+                        help="Convenience preset for local resource usage. low reduces disk/cache/batch sizes; high increases throughput defaults.")
+    parser.add_argument("--max-http-cache-mb", type=int, default=default,
+                        help="Maximum on-disk HTTP cache budget in MB. When reached, new responses are not cached.")
+    parser.add_argument("--max-graph-artifact-mb", type=int, default=default,
+                        help="Maximum graph artifact budget in MB for saved rows/nodes/rels. Exceeding it stops the run early.")
+    parser.add_argument("--write-csv-mirrors", type=str, choices=["true", "false"], default=default,
+                        help="Write thesis-friendly CSV mirrors alongside JSONL graph artifacts (default: true). Disable to reduce disk and I/O.")
     parser.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS if default_suppress else False, help="Plan + fetch (optional), but do not write to Neo4j.")
 
     # Output + logging
@@ -192,8 +301,31 @@ def _demo_rows() -> List[PubChemRow]:
 
 
 def main(argv: Optional[List[str]] = None) -> None:
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
     args = build_argparser().parse_args(argv)
     settings = Settings.from_env()
+
+    profile = getattr(args, "resource_profile", None) or settings.resources.profile
+    settings = _apply_resource_profile(settings, profile, raw_argv)
+
+    if _flag_present(raw_argv, "--save-raw") and args.save_raw is not None:
+        settings = settings.with_overrides(save_raw_http_cache=(args.save_raw == "true"))
+    if _flag_present(raw_argv, "--save-extracted") and args.save_extracted is not None:
+        settings = settings.with_overrides(save_extracted_artifacts=(args.save_extracted == "true"))
+    if _flag_present(raw_argv, "--write-csv-mirrors") and getattr(args, "write_csv_mirrors", None) is not None:
+        settings = settings.with_overrides(resources=settings.resources.__class__(
+            profile=settings.resources.profile,
+            write_csv_mirrors=(args.write_csv_mirrors == "true"),
+            max_http_cache_mb=settings.resources.max_http_cache_mb,
+            max_graph_artifact_mb=settings.resources.max_graph_artifact_mb,
+        ))
+    if _flag_present(raw_argv, "--max-http-cache-mb") or _flag_present(raw_argv, "--max-graph-artifact-mb"):
+        settings = settings.with_overrides(resources=settings.resources.__class__(
+            profile=settings.resources.profile,
+            write_csv_mirrors=settings.resources.write_csv_mirrors,
+            max_http_cache_mb=settings.resources.max_http_cache_mb if getattr(args, "max_http_cache_mb", None) is None else int(args.max_http_cache_mb),
+            max_graph_artifact_mb=settings.resources.max_graph_artifact_mb if getattr(args, "max_graph_artifact_mb", None) is None else int(args.max_graph_artifact_mb),
+        ))
 
     load_neo4j = (args.load_neo4j == "true") and (not args.dry_run)
 
@@ -202,8 +334,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     run_dir = Path(args.out_dir) / run_id
     store = RunStore(
         run_dir=run_dir,
-        save_raw=(args.save_raw == "true"),
-        save_extracted=(args.save_extracted == "true"),
+        save_raw=settings.save_raw_http_cache,
+        save_extracted=settings.save_extracted_artifacts,
+        save_csv_mirrors=settings.resources.write_csv_mirrors,
+        max_graph_bytes=_mb_to_bytes(settings.resources.max_graph_artifact_mb),
     )
     log_path = setup_logging(
         log_dir=store.logs_dir,
@@ -347,6 +481,15 @@ def main(argv: Optional[List[str]] = None) -> None:
             "caps": settings.caps.__dict__,
             "flags": settings.flags.__dict__,
             "plugins": settings.enabled_plugins,
+            "resources": {
+                "profile": settings.resources.profile,
+                "write_csv_mirrors": settings.resources.write_csv_mirrors,
+                "max_http_cache_mb": settings.resources.max_http_cache_mb,
+                "max_graph_artifact_mb": settings.resources.max_graph_artifact_mb,
+                "save_raw_http_cache": settings.save_raw_http_cache,
+                "save_extracted_artifacts": settings.save_extracted_artifacts,
+                "batch_size": settings.batch_size,
+            },
             "neo4j": {
                 "load_enabled": load_neo4j,
                 "uri": settings.neo4j.uri,
@@ -400,6 +543,15 @@ def main(argv: Optional[List[str]] = None) -> None:
         "caps": settings.caps.__dict__,
         "flags": settings.flags.__dict__,
         "plugins": settings.enabled_plugins,
+        "resources": {
+            "profile": settings.resources.profile,
+            "write_csv_mirrors": settings.resources.write_csv_mirrors,
+            "max_http_cache_mb": settings.resources.max_http_cache_mb,
+            "max_graph_artifact_mb": settings.resources.max_graph_artifact_mb,
+            "save_raw_http_cache": settings.save_raw_http_cache,
+            "save_extracted_artifacts": settings.save_extracted_artifacts,
+            "batch_size": settings.batch_size,
+        },
         "neo4j": {
             "load_enabled": load_neo4j,
             "uri": settings.neo4j.uri,
@@ -421,8 +573,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     rel_count = 0
     effective_mode = mode.value
     if mode == Mode.rdf_rest:
-        rdfrest_cache = (settings.cache_dir / "rdfrest") if (args.save_raw == "true") else None
-        client = PubChemRdfRestClient(settings.rdf_rest, cache_dir=rdfrest_cache)
+        rdfrest_cache = (settings.cache_dir / "rdfrest") if settings.save_raw_http_cache else None
+        client = _make_rdfrest_client(settings, rdfrest_cache)
         extractor = PubChemRdfRestExtractor(client)
         rest_error: Optional[Exception] = None
         try:
@@ -450,13 +602,21 @@ def main(argv: Optional[List[str]] = None) -> None:
                 # Avoid mixing partial REST artifacts with fallback artifacts.
                 store.clear_extracted_artifacts()
                 row_count = 0
-                sparql_cache = (settings.cache_dir / "sparql") if (args.save_raw == "true") else None
-                client = SparqlMirrorClient(settings.sparql, cache_dir=sparql_cache)
+                sparql_cache = (settings.cache_dir / "sparql") if settings.save_raw_http_cache else None
+                client = _make_sparql_client(settings, sparql_cache)
                 extractor = PubChemSparqlMirrorExtractor(client)
+                fallback_flags = BuildFlags(
+                    include_textmining=settings.flags.include_textmining,
+                    include_optional_context=settings.flags.include_optional_context,
+                    include_endpoint_metadata=settings.flags.include_endpoint_metadata,
+                    include_endpoint_references=False,
+                    taxids=settings.flags.taxids,
+                )
+                fallback_settings = settings.with_overrides(flags=fallback_flags)
                 try:
                     def _rows2():
                         nonlocal row_count
-                        for r in _iter_rows(extractor, scope, chem_ids, target_ids, settings, store):
+                        for r in _iter_rows(extractor, scope, chem_ids, target_ids, fallback_settings, store):
                             row_count += 1
                             yield r
                     node_count, rel_count = _build_graph_from_rows_stream(_rows2(), store)
@@ -473,8 +633,8 @@ def main(argv: Optional[List[str]] = None) -> None:
             else:
                 raise rest_error
     elif mode == Mode.sparql:
-        sparql_cache = (settings.cache_dir / "sparql") if (args.save_raw == "true") else None
-        client = SparqlMirrorClient(settings.sparql, cache_dir=sparql_cache)
+        sparql_cache = (settings.cache_dir / "sparql") if settings.save_raw_http_cache else None
+        client = _make_sparql_client(settings, sparql_cache)
         extractor = PubChemSparqlMirrorExtractor(client)
         try:
             def _rows3():

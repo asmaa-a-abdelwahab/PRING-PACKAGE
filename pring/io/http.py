@@ -35,10 +35,13 @@ class HttpClient:
     min_delay_s: float = 0.0
     max_delay_s: float = 15.0
     honor_throttling_headers: bool = True
+    max_cache_bytes: Optional[int] = None
 
     _log = logging.getLogger("pring.http")
     _adaptive_delay_s: float = field(default=0.0, init=False)
     _last_request_started_at: Optional[float] = field(default=None, init=False)
+    _cache_bytes_written: int = field(default=0, init=False)
+    _cache_budget_warned: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         if httpx is None:
@@ -46,6 +49,10 @@ class HttpClient:
         self._client = httpx.Client(timeout=self.timeout_s, headers=self.headers)
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                self._cache_bytes_written = sum(p.stat().st_size for p in self.cache_dir.glob("*") if p.is_file())
+            except Exception:
+                self._cache_bytes_written = 0
 
     def close(self) -> None:
         self._client.close()
@@ -60,6 +67,25 @@ class HttpClient:
     def _sleep(self, seconds: float) -> None:
         if seconds > 0:
             time.sleep(seconds)
+
+
+    def _maybe_write_cache(self, path: Optional[Path], payload: str) -> None:
+        if path is None:
+            return
+        payload_bytes = len(payload.encode("utf-8"))
+        if self.max_cache_bytes is not None and (self._cache_bytes_written + payload_bytes) > self.max_cache_bytes:
+            if not self._cache_budget_warned:
+                self._log.warning(
+                    "HTTP cache budget reached (%s bytes). Further responses will not be cached.",
+                    self.max_cache_bytes,
+                )
+                self._cache_budget_warned = True
+            return
+        try:
+            path.write_text(payload, encoding="utf-8")
+            self._cache_bytes_written += payload_bytes
+        except Exception:
+            pass
 
     def _retry_sleep(self, attempt: int, retry_after_s: float = 0.0) -> None:
         # Exponential backoff plus adaptive service feedback.
@@ -167,11 +193,7 @@ class HttpClient:
                     break
                 r.raise_for_status()
                 text = r.text
-                if p is not None:
-                    try:
-                        p.write_text(text, encoding="utf-8")
-                    except Exception:
-                        pass
+                self._maybe_write_cache(p, text)
                 return text
             except Exception as e:
                 last_exc = e
@@ -209,11 +231,8 @@ class HttpClient:
                 r.raise_for_status()
                 data = r.json()
                 if p is not None:
-                    try:
-                        import json
-                        p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-                    except Exception:
-                        pass
+                    import json
+                    self._maybe_write_cache(p, json.dumps(data, ensure_ascii=False))
                 return data
             except Exception as e:
                 last_exc = e
@@ -253,11 +272,8 @@ class HttpClient:
                 r.raise_for_status()
                 out = r.json()
                 if p is not None:
-                    try:
-                        import json
-                        p.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
-                    except Exception:
-                        pass
+                    import json
+                    self._maybe_write_cache(p, json.dumps(out, ensure_ascii=False))
                 return out
             except Exception as e:
                 last_exc = e

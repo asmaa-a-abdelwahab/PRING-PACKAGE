@@ -51,6 +51,11 @@ def test_settings_from_env_reads_overrides(monkeypatch: pytest.MonkeyPatch, tmp_
     monkeypatch.setenv("PRING_INCLUDE_OPTIONAL_CONTEXT", "false")
     monkeypatch.setenv("PRING_TAXID", "9606,TAXID10090")
     monkeypatch.setenv("PRING_MAX_ENDPOINTS_PER_PAIR", "11")
+
+    monkeypatch.setenv("PRING_RESOURCE_PROFILE", "low")
+    monkeypatch.setenv("PRING_WRITE_CSV_MIRRORS", "false")
+    monkeypatch.setenv("PRING_MAX_HTTP_CACHE_MB", "64")
+    monkeypatch.setenv("PRING_MAX_GRAPH_ARTIFACT_MB", "256")
     monkeypatch.setenv("PRING_PLUGINS", "go,uniprot")
     settings = Settings.from_env()
     assert settings.neo4j.uri == "bolt://example:7687"
@@ -60,6 +65,10 @@ def test_settings_from_env_reads_overrides(monkeypatch: pytest.MonkeyPatch, tmp_
     assert settings.flags == BuildFlags(include_textmining=True, include_optional_context=False, taxids=(9606, 10090))
     assert settings.caps.max_endpoints_per_pair == 11
     assert settings.enabled_plugins == ["go", "uniprot"]
+    assert settings.resources.profile == "low"
+    assert settings.resources.write_csv_mirrors is False
+    assert settings.resources.max_http_cache_mb == 64
+    assert settings.resources.max_graph_artifact_mb == 256
 
 
 def test_config_helpers_parse_numbers_and_taxids():

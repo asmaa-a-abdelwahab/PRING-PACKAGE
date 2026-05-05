@@ -29,7 +29,11 @@ def parse_schema_dot(path: Path) -> Tuple[List[str], List[DotEdge]]:
             name = n.get_name().strip('"')
             if name in ("node", "graph", "edge") or name.strip() == "":
                 continue
-            nodes[name] = n.get_attributes()
+            attrs = n.get_attributes() or {}
+            shape = str(attrs.get("shape", "")).strip('"').lower()
+            if shape == "note":
+                continue
+            nodes[name] = attrs
         for sg in dot.get_subgraphs():
             nodes.update(collect_nodes(sg))
         return nodes

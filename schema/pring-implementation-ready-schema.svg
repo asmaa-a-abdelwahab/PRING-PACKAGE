@@ -1,0 +1,674 @@
+<?xml version="1.0" standalone="no"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="4152pt" height="1585pt" viewBox="0.00 0.00 4152.25 1584.60">
+<g id="graph0" class="graph" transform="translate(18,1566.5999755859375) scale(1)" data-name="PRING_Final_ImplementationReady_Thesis">
+
+<polygon fill="white" stroke="none" points="-18,18 -18,-1566.6 4134.25,-1566.6 4134.25,18 -18,18" style=""/>
+<text text-anchor="middle" x="2058.13" y="-1528.4" font-family="Helvetica,sans-Serif" font-size="18.00" style="">PRING — final implementation-ready schema for PubChem-driven compound–protein interaction KG</text>
+<g id="clust1" class="cluster" data-name="cluster_conventions">
+
+<path fill="white" stroke="#b3b3b3" stroke-dasharray="5,2" d="M23.56,-181C23.56,-181 482.76,-181 482.76,-181 488.76,-181 494.76,-187 494.76,-193 494.76,-193 494.76,-479 494.76,-479 494.76,-485 488.76,-491 482.76,-491 482.76,-491 23.56,-491 23.56,-491 17.56,-491 11.56,-485 11.56,-479 11.56,-479 11.56,-193 11.56,-193 11.56,-187 17.56,-181 23.56,-181" style=""/>
+<text text-anchor="middle" x="253.16" y="-470.8" font-family="Helvetica,sans-Serif" font-size="18.00" style="">Conventions</text>
+</g>
+<g id="clust2" class="cluster" data-name="cluster_core">
+
+<path fill="aliceblue" stroke="aliceblue" d="M1677.72,-1201C1677.72,-1201 3371.58,-1201 3371.58,-1201 3377.58,-1201 3383.58,-1207 3383.58,-1213 3383.58,-1213 3383.58,-1363 3383.58,-1363 3383.58,-1369 3377.58,-1375 3371.58,-1375 3371.58,-1375 1677.72,-1375 1677.72,-1375 1671.72,-1375 1665.72,-1369 1665.72,-1363 1665.72,-1363 1665.72,-1213 1665.72,-1213 1665.72,-1207 1671.72,-1201 1677.72,-1201" style=""/>
+<text text-anchor="middle" x="2524.65" y="-1354.8" font-family="Helvetica,sans-Serif" font-size="18.00" style="">A) Core entities</text>
+</g>
+<g id="clust3" class="cluster" data-name="cluster_features">
+
+<path fill="honeydew" stroke="honeydew" d="M2645.08,-839C2645.08,-839 2931.44,-839 2931.44,-839 2937.44,-839 2943.44,-845 2943.44,-851 2943.44,-851 2943.44,-1181 2943.44,-1181 2943.44,-1187 2937.44,-1193 2931.44,-1193 2931.44,-1193 2645.08,-1193 2645.08,-1193 2639.08,-1193 2633.08,-1187 2633.08,-1181 2633.08,-1181 2633.08,-851 2633.08,-851 2633.08,-845 2639.08,-839 2645.08,-839" style=""/>
+<text text-anchor="middle" x="2788.26" y="-1172.8" font-family="Helvetica,sans-Serif" font-size="18.00" style="">B) Chemical features / ML inputs</text>
+</g>
+<g id="clust4" class="cluster" data-name="cluster_evidence">
+
+<path fill="lavender" stroke="lavender" d="M689.8,-1409C689.8,-1409 1886.57,-1409 1886.57,-1409 1892.57,-1409 1898.57,-1415 1898.57,-1421 1898.57,-1421 1898.57,-1499 1898.57,-1499 1898.57,-1505 1892.57,-1511 1886.57,-1511 1886.57,-1511 689.8,-1511 689.8,-1511 683.8,-1511 677.8,-1505 677.8,-1499 677.8,-1499 677.8,-1421 677.8,-1421 677.8,-1415 683.8,-1409 689.8,-1409" style=""/>
+<text text-anchor="middle" x="1288.19" y="-1490.8" font-family="Helvetica,sans-Serif" font-size="18.00" style="">C) Experimental evidence backbone</text>
+</g>
+<g id="clust5" class="cluster" data-name="cluster_prov">
+
+<path fill="oldlace" stroke="oldlace" d="M2102.59,-403C2102.59,-403 2298.37,-403 2298.37,-403 2304.37,-403 2310.37,-409 2310.37,-415 2310.37,-415 2310.37,-565 2310.37,-565 2310.37,-571 2304.37,-577 2298.37,-577 2298.37,-577 2102.59,-577 2102.59,-577 2096.59,-577 2090.59,-571 2090.59,-565 2090.59,-565 2090.59,-415 2090.59,-415 2090.59,-409 2096.59,-403 2102.59,-403" style=""/>
+<text text-anchor="middle" x="2200.48" y="-556.8" font-family="Helvetica,sans-Serif" font-size="18.00" style="">D) Provenance / trust</text>
+</g>
+<g id="clust6" class="cluster" data-name="cluster_context">
+
+<path fill="mistyrose" stroke="mistyrose" d="M3627.07,-8C3627.07,-8 4096.25,-8 4096.25,-8 4102.25,-8 4108.25,-14 4108.25,-20 4108.25,-20 4108.25,-254 4108.25,-254 4108.25,-260 4102.25,-266 4096.25,-266 4096.25,-266 3627.07,-266 3627.07,-266 3621.07,-266 3615.07,-260 3615.07,-254 3615.07,-254 3615.07,-20 3615.07,-20 3615.07,-14 3621.07,-8 3627.07,-8" style=""/>
+<text text-anchor="middle" x="3861.66" y="-245.8" font-family="Helvetica,sans-Serif" font-size="18.00" style="">E) Optional biological context</text>
+</g>
+<g id="clust7" class="cluster" data-name="cluster_textmine">
+
+<path fill="#ebebeb" stroke="#ebebeb" d="M1675.21,-288C1675.21,-288 2266.95,-288 2266.95,-288 2272.95,-288 2278.95,-294 2278.95,-300 2278.95,-300 2278.95,-374 2278.95,-374 2278.95,-380 2272.95,-386 2266.95,-386 2266.95,-386 1675.21,-386 1675.21,-386 1669.21,-386 1663.21,-380 1663.21,-374 1663.21,-374 1663.21,-300 1663.21,-300 1663.21,-294 1669.21,-288 1675.21,-288" style=""/>
+<text text-anchor="middle" x="1971.08" y="-365.8" font-family="Helvetica,sans-Serif" font-size="18.00" style="">F) Text-mined links (kept separate from curated evidence)</text>
+</g>
+<g id="clust8" class="cluster" data-name="cluster_plugins">
+
+<path fill="lightyellow" stroke="lightyellow" d="M3172.47,-347C3172.47,-347 3800.6,-347 3800.6,-347 3806.6,-347 3812.6,-353 3812.6,-359 3812.6,-359 3812.6,-1181 3812.6,-1181 3812.6,-1187 3806.6,-1193 3800.6,-1193 3800.6,-1193 3172.47,-1193 3172.47,-1193 3166.47,-1193 3160.47,-1187 3160.47,-1181 3160.47,-1181 3160.47,-359 3160.47,-359 3160.47,-353 3166.47,-347 3172.47,-347" style=""/>
+<text text-anchor="middle" x="3486.54" y="-1172.8" font-family="Helvetica,sans-Serif" font-size="18.00" style="">G) External enrichment / optional add-ons</text>
+</g>
+<g id="clust9" class="cluster" data-name="cluster_modeling">
+
+<path fill="moccasin" stroke="moccasin" d="M12,-712C12,-712 494.32,-712 494.32,-712 500.32,-712 506.32,-718 506.32,-724 506.32,-724 506.32,-802 506.32,-802 506.32,-808 500.32,-814 494.32,-814 494.32,-814 12,-814 12,-814 6,-814 0,-808 0,-802 0,-802 0,-724 0,-724 0,-718 6,-712 12,-712" style=""/>
+<text text-anchor="middle" x="253.16" y="-793.8" font-family="Helvetica,sans-Serif" font-size="18.00" style="">H) Derived interaction modeling layer (PRING materialization)</text>
+</g>
+<!-- Conv1 -->
+<g id="node1" class="node" pointer-events="visible" data-name="Conv1">
+
+<polygon fill="white" stroke="black" points="372.35,-453 127.97,-453 127.97,-417 378.35,-417 378.35,-447 372.35,-453" style=""/>
+<polyline fill="none" stroke="black" points="372.35,-453 372.35,-447" style=""/>
+<polyline fill="none" stroke="black" points="378.35,-447 372.35,-447" style=""/>
+<text text-anchor="middle" x="253.16" y="-432" font-family="Helvetica,sans-Serif" font-size="10.00" style="">Solid edges = persisted PubChem-derived core graph</text>
+</g>
+<!-- Conv2 -->
+<g id="node2" class="node" pointer-events="visible" data-name="Conv2">
+
+<polygon fill="white" stroke="black" points="397.37,-377 102.95,-377 102.95,-341 403.37,-341 403.37,-371 397.37,-377" style=""/>
+<polyline fill="none" stroke="black" points="397.37,-377 397.37,-371" style=""/>
+<polyline fill="none" stroke="black" points="403.37,-371 397.37,-371" style=""/>
+<text text-anchor="middle" x="253.16" y="-356" font-family="Helvetica,sans-Serif" font-size="10.00" style="">Dashed edges = optional enrichment, text-mined, or derived links</text>
+</g>
+<!-- Conv3 -->
+<g id="node3" class="node" pointer-events="visible" data-name="Conv3">
+
+<polygon fill="white" stroke="black" points="424.92,-301 75.4,-301 75.4,-265 430.92,-265 430.92,-295 424.92,-301" style=""/>
+<polyline fill="none" stroke="black" points="424.92,-301 424.92,-295" style=""/>
+<polyline fill="none" stroke="black" points="430.92,-295 424.92,-295" style=""/>
+<text text-anchor="middle" x="253.16" y="-286" font-family="Helvetica,sans-Serif" font-size="10.00" style="">Red bold self-edge on Compound = explicit compound-to-compound relations</text>
+<text text-anchor="middle" x="253.16" y="-274" font-family="Helvetica,sans-Serif" font-size="10.00" style="">used instead of a vague generic neighbors bucket for production modeling</text>
+</g>
+<!-- Conv4 -->
+<g id="node4" class="node" pointer-events="visible" data-name="Conv4">
+
+<polygon fill="white" stroke="black" points="480.86,-225 19.47,-225 19.47,-189 486.86,-189 486.86,-219 480.86,-225" style=""/>
+<polyline fill="none" stroke="black" points="480.86,-225 480.86,-219" style=""/>
+<polyline fill="none" stroke="black" points="486.86,-219 480.86,-219" style=""/>
+<text text-anchor="middle" x="253.16" y="-210" font-family="Helvetica,sans-Serif" font-size="10.00" style="">Structure / Properties / Synonyms / Neighbors are preserved from the original PRING concept schema,</text>
+<text text-anchor="middle" x="253.16" y="-198" font-family="Helvetica,sans-Serif" font-size="10.00" style="">but PRING may flatten Structure/Properties/Synonyms into Compound properties at load time</text>
+</g>
+<!-- Compound -->
+<g id="node5" class="node" pointer-events="visible" data-name="Compound">
+
+<path fill="white" stroke="black" d="M2298.31,-1253C2298.31,-1253 2102.65,-1253 2102.65,-1253 2096.65,-1253 2090.65,-1247 2090.65,-1241 2090.65,-1241 2090.65,-1221 2090.65,-1221 2090.65,-1215 2096.65,-1209 2102.65,-1209 2102.65,-1209 2298.31,-1209 2298.31,-1209 2304.31,-1209 2310.31,-1215 2310.31,-1221 2310.31,-1221 2310.31,-1241 2310.31,-1241 2310.31,-1247 2304.31,-1253 2298.31,-1253" style=""/>
+<text text-anchor="middle" x="2200.48" y="-1240" font-family="Helvetica,sans-Serif" font-size="10.00" style="">Compound</text>
+<text text-anchor="middle" x="2200.48" y="-1228" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: cid</text>
+<text text-anchor="middle" x="2200.48" y="-1216" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: preferred_name?, pubchem_uri?, term?</text>
+</g>
+<!-- Compound&#45;&gt;Compound -->
+<g id="edge7" class="edge" data-name="Compound-&gt;Compound">
+
+<path fill="none" stroke="#8b1a1a" stroke-width="1.8" d="M2090.4,-1238.33C2069.62,-1238.33 2054.25,-1238.33 2054.25,-1238.33 2054.25,-1238.33 2054.25,-1267.5 2054.25,-1267.5 2054.25,-1267.5 2421.25,-1267.5 2421.25,-1267.5 2421.25,-1267.5 2421.25,-1242 2421.25,-1242 2421.25,-1242 2320.77,-1242 2320.77,-1242" style=""/>
+<polygon fill="#8b1a1a" stroke="#8b1a1a" stroke-width="1.8" points="2320.77,-1239.38 2313.27,-1242 2320.77,-1244.63 2320.77,-1239.38" style=""/>
+</g>
+<!-- Protein -->
+<g id="node7" class="node" pointer-events="visible" data-name="Protein">
+
+<path fill="white" stroke="black" d="M2874.93,-1253C2874.93,-1253 2701.59,-1253 2701.59,-1253 2695.59,-1253 2689.59,-1247 2689.59,-1241 2689.59,-1241 2689.59,-1221 2689.59,-1221 2689.59,-1215 2695.59,-1209 2701.59,-1209 2701.59,-1209 2874.93,-1209 2874.93,-1209 2880.93,-1209 2886.93,-1215 2886.93,-1221 2886.93,-1221 2886.93,-1241 2886.93,-1241 2886.93,-1247 2880.93,-1253 2874.93,-1253" style=""/>
+<text text-anchor="middle" x="2788.26" y="-1240" font-family="Helvetica,sans-Serif" font-size="10.00" style="">Protein</text>
+<text text-anchor="middle" x="2788.26" y="-1228" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: protein_id</text>
+<text text-anchor="middle" x="2788.26" y="-1216" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: name, target_type?, pubchem_uri?</text>
+</g>
+<!-- Compound&#45;&gt;Protein -->
+<g id="edge32" class="edge" data-name="Compound-&gt;Protein">
+
+<path fill="none" stroke="#595959" stroke-width="2" stroke-dasharray="5,2" d="M2310.69,-1231C2310.69,-1231 2678.79,-1231 2678.79,-1231" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="2" points="2678.79,-1233.63 2686.29,-1231 2678.79,-1228.38 2678.79,-1233.63" style=""/>
+<text text-anchor="middle" x="2475.61" y="-1264" font-family="Helvetica,sans-Serif" font-size="10.00" style="">PREDICTED_TO_INTERACT_WITH</text>
+<text text-anchor="middle" x="2475.61" y="-1252" font-family="Helvetica,sans-Serif" font-size="10.00" style="">{score, model_name, model_version, features_used, split?}</text>
+</g>
+<!-- Structure -->
+<g id="node10" class="node" pointer-events="visible" data-name="Structure">
+
+<path fill="white" stroke="black" d="M2845.47,-891C2845.47,-891 2731.05,-891 2731.05,-891 2725.05,-891 2719.05,-885 2719.05,-879 2719.05,-879 2719.05,-859 2719.05,-859 2719.05,-853 2725.05,-847 2731.05,-847 2731.05,-847 2845.47,-847 2845.47,-847 2851.47,-847 2857.47,-853 2857.47,-859 2857.47,-859 2857.47,-879 2857.47,-879 2857.47,-885 2851.47,-891 2845.47,-891" style=""/>
+<text text-anchor="middle" x="2788.26" y="-878" font-family="Helvetica,sans-Serif" font-size="10.00" style="">Structure</text>
+<text text-anchor="middle" x="2788.26" y="-866" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: cid (1:1)</text>
+<text text-anchor="middle" x="2788.26" y="-854" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: smiles, inchi, inchikey</text>
+</g>
+<!-- Compound&#45;&gt;Structure -->
+<g id="edge3" class="edge" data-name="Compound-&gt;Structure">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" d="M2258.25,-1208.63C2258.25,-1129.7 2258.25,-869 2258.25,-869 2258.25,-869 2709.38,-869 2709.38,-869" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="2709.38,-871.63 2716.88,-869 2709.38,-866.38 2709.38,-871.63" style=""/>
+<text text-anchor="middle" x="2475.61" y="-889" font-family="Helvetica,sans-Serif" font-size="10.00" style="">HAS_STRUCTURE</text>
+</g>
+<!-- Properties -->
+<g id="node11" class="node" pointer-events="visible" data-name="Properties">
+
+<path fill="white" stroke="black" d="M2923.63,-1155C2923.63,-1155 2652.89,-1155 2652.89,-1155 2646.89,-1155 2640.89,-1149 2640.89,-1143 2640.89,-1143 2640.89,-1123 2640.89,-1123 2640.89,-1117 2646.89,-1111 2652.89,-1111 2652.89,-1111 2923.63,-1111 2923.63,-1111 2929.63,-1111 2935.63,-1117 2935.63,-1123 2935.63,-1123 2935.63,-1143 2935.63,-1143 2935.63,-1149 2929.63,-1155 2923.63,-1155" style=""/>
+<text text-anchor="middle" x="2788.26" y="-1142" font-family="Helvetica,sans-Serif" font-size="10.00" style="">Properties</text>
+<text text-anchor="middle" x="2788.26" y="-1130" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: cid (1:1)</text>
+<text text-anchor="middle" x="2788.26" y="-1118" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: formula, exact_mass?, molecular_weight, xlogp3?, tpsa?</text>
+</g>
+<!-- Compound&#45;&gt;Properties -->
+<g id="edge4" class="edge" data-name="Compound-&gt;Properties">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" d="M2308.25,-1208.76C2308.25,-1179.85 2308.25,-1133 2308.25,-1133 2308.25,-1133 2631.34,-1133 2631.34,-1133" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="2631.34,-1135.63 2638.84,-1133 2631.34,-1130.38 2631.34,-1135.63" style=""/>
+<text text-anchor="middle" x="2475.61" y="-1109" font-family="Helvetica,sans-Serif" font-size="10.00" style="">HAS_PROPERTIES</text>
+</g>
+<!-- Synonyms -->
+<g id="node12" class="node" pointer-events="visible" data-name="Synonyms">
+
+<path fill="white" stroke="black" d="M2846.04,-1071C2846.04,-1071 2730.48,-1071 2730.48,-1071 2724.48,-1071 2718.48,-1065 2718.48,-1059 2718.48,-1059 2718.48,-1039 2718.48,-1039 2718.48,-1033 2724.48,-1027 2730.48,-1027 2730.48,-1027 2846.04,-1027 2846.04,-1027 2852.04,-1027 2858.04,-1033 2858.04,-1039 2858.04,-1039 2858.04,-1059 2858.04,-1059 2858.04,-1065 2852.04,-1071 2846.04,-1071" style=""/>
+<text text-anchor="middle" x="2788.26" y="-1058" font-family="Helvetica,sans-Serif" font-size="10.00" style="">Synonyms</text>
+<text text-anchor="middle" x="2788.26" y="-1046" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: cid (1:1 or 1:n)</text>
+<text text-anchor="middle" x="2788.26" y="-1034" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: preferred, synonyms[]</text>
+</g>
+<!-- Compound&#45;&gt;Synonyms -->
+<g id="edge5" class="edge" data-name="Compound-&gt;Synonyms">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" d="M2307.25,-1208.68C2307.25,-1160.08 2307.25,-1049 2307.25,-1049 2307.25,-1049 2708.74,-1049 2708.74,-1049" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="2708.74,-1051.63 2716.24,-1049 2708.74,-1046.38 2708.74,-1051.63" style=""/>
+<text text-anchor="middle" x="2475.61" y="-1052" font-family="Helvetica,sans-Serif" font-size="10.00" style="">HAS_SYNONYMS</text>
+</g>
+<!-- Neighbors -->
+<g id="node13" class="node" pointer-events="visible" data-name="Neighbors">
+
+<path fill="white" stroke="black" d="M2871.73,-987C2871.73,-987 2704.79,-987 2704.79,-987 2698.79,-987 2692.79,-981 2692.79,-975 2692.79,-975 2692.79,-943 2692.79,-943 2692.79,-937 2698.79,-931 2704.79,-931 2704.79,-931 2871.73,-931 2871.73,-931 2877.73,-931 2883.73,-937 2883.73,-943 2883.73,-943 2883.73,-975 2883.73,-975 2883.73,-981 2877.73,-987 2871.73,-987" style=""/>
+<text text-anchor="middle" x="2788.26" y="-974" font-family="Helvetica,sans-Serif" font-size="10.00" style="">Neighbors (raw staging)</text>
+<text text-anchor="middle" x="2788.26" y="-962" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: cid</text>
+<text text-anchor="middle" x="2788.26" y="-950" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: raw_neighbors[]</text>
+<text text-anchor="middle" x="2788.26" y="-938" font-family="Helvetica,sans-Serif" font-size="10.00" style="">parents/components/similar as delivered</text>
+</g>
+<!-- Compound&#45;&gt;Neighbors -->
+<g id="edge6" class="edge" data-name="Compound-&gt;Neighbors">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" d="M2305.25,-1208.74C2305.25,-1143.78 2305.25,-959 2305.25,-959 2305.25,-959 2683.23,-959 2683.23,-959" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="2683.23,-961.63 2690.73,-959 2683.23,-956.38 2683.23,-961.63" style=""/>
+<text text-anchor="middle" x="2475.61" y="-979" font-family="Helvetica,sans-Serif" font-size="10.00" style="">HAS_NEIGHBOR_SET</text>
+</g>
+<!-- Pathway -->
+<g id="node19" class="node" pointer-events="visible" data-name="Pathway">
+
+<path fill="white" stroke="black" d="M3783.2,-228C3783.2,-228 3635.02,-228 3635.02,-228 3629.02,-228 3623.02,-222 3623.02,-216 3623.02,-216 3623.02,-196 3623.02,-196 3623.02,-190 3629.02,-184 3635.02,-184 3635.02,-184 3783.2,-184 3783.2,-184 3789.2,-184 3795.2,-190 3795.2,-196 3795.2,-196 3795.2,-216 3795.2,-216 3795.2,-222 3789.2,-228 3783.2,-228" style=""/>
+<text text-anchor="middle" x="3709.11" y="-215" font-family="Helvetica,sans-Serif" font-size="10.00" style="">Pathway / BioSystem</text>
+<text text-anchor="middle" x="3709.11" y="-203" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: pathway_id</text>
+<text text-anchor="middle" x="3709.11" y="-191" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: name, source, pubchem_uri?</text>
+</g>
+<!-- Compound&#45;&gt;Pathway -->
+<g id="edge19" class="edge" data-name="Compound-&gt;Pathway">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" stroke-dasharray="5,2" d="M2094.25,-1208.53C2094.25,-1057.9 2094.25,-201 2094.25,-201 2094.25,-201 3613.26,-201 3613.26,-201" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="3613.26,-203.63 3620.76,-201 3613.26,-198.38 3613.26,-203.63" style=""/>
+<text text-anchor="middle" x="3051.96" y="-351" font-family="Helvetica,sans-Serif" font-size="10.00" style="">ASSOCIATED_WITH_PATHWAY</text>
+</g>
+<!-- ChEMBL -->
+<g id="node29" class="node" pointer-events="visible" data-name="ChEMBL">
+
+<path fill="white" stroke="black" d="M3374.75,-483C3374.75,-483 3202.66,-483 3202.66,-483 3196.66,-483 3190.66,-477 3190.66,-471 3190.66,-471 3190.66,-451 3190.66,-451 3190.66,-445 3196.66,-439 3202.66,-439 3202.66,-439 3374.75,-439 3374.75,-439 3380.75,-439 3386.75,-445 3386.75,-451 3386.75,-451 3386.75,-471 3386.75,-471 3386.75,-477 3380.75,-483 3374.75,-483" style=""/>
+<text text-anchor="middle" x="3288.7" y="-470" font-family="Helvetica,sans-Serif" font-size="10.00" style="">ChEMBLRecord</text>
+<text text-anchor="middle" x="3288.7" y="-458" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: chembl_id</text>
+<text text-anchor="middle" x="3288.7" y="-446" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: entity_type, assay_id?, activity_id?</text>
+</g>
+<!-- Compound&#45;&gt;ChEMBL -->
+<g id="edge42" class="edge" data-name="Compound-&gt;ChEMBL">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" stroke-dasharray="5,2" d="M2097.25,-1208.74C2097.25,-1083.65 2097.25,-473.67 2097.25,-473.67 2097.25,-473.67 3180.87,-473.67 3180.87,-473.67" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="3180.87,-476.29 3188.37,-473.67 3180.87,-471.04 3180.87,-476.29" style=""/>
+<text text-anchor="middle" x="2788.26" y="-614" font-family="Helvetica,sans-Serif" font-size="10.00" style="">HAS_CHEMBL_RECORD</text>
+</g>
+<!-- BindingDB -->
+<g id="node30" class="node" pointer-events="visible" data-name="BindingDB">
+
+<path fill="white" stroke="black" d="M3359.06,-399C3359.06,-399 3218.34,-399 3218.34,-399 3212.34,-399 3206.34,-393 3206.34,-387 3206.34,-387 3206.34,-367 3206.34,-367 3206.34,-361 3212.34,-355 3218.34,-355 3218.34,-355 3359.06,-355 3359.06,-355 3365.06,-355 3371.06,-361 3371.06,-367 3371.06,-367 3371.06,-387 3371.06,-387 3371.06,-393 3365.06,-399 3359.06,-399" style=""/>
+<text text-anchor="middle" x="3288.7" y="-386" font-family="Helvetica,sans-Serif" font-size="10.00" style="">BindingDBRecord</text>
+<text text-anchor="middle" x="3288.7" y="-374" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: bindingdb_id</text>
+<text text-anchor="middle" x="3288.7" y="-362" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: kd?, ki?, ic50?, source_ref?</text>
+</g>
+<!-- Compound&#45;&gt;BindingDB -->
+<g id="edge43" class="edge" data-name="Compound-&gt;BindingDB">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" stroke-dasharray="5,2" d="M2096.25,-1208.55C2096.25,-1075.07 2096.25,-391.67 2096.25,-391.67 2096.25,-391.67 3196.95,-391.67 3196.95,-391.67" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="3196.95,-394.29 3204.45,-391.67 3196.95,-389.04 3196.95,-394.29" style=""/>
+<text text-anchor="middle" x="2788.26" y="-522" font-family="Helvetica,sans-Serif" font-size="10.00" style="">HAS_BINDINGDB_RECORD</text>
+</g>
+<!-- DrugBank -->
+<g id="node31" class="node" pointer-events="visible" data-name="DrugBank">
+
+<path fill="white" stroke="black" d="M3366.51,-651C3366.51,-651 3210.9,-651 3210.9,-651 3204.9,-651 3198.9,-645 3198.9,-639 3198.9,-639 3198.9,-619 3198.9,-619 3198.9,-613 3204.9,-607 3210.9,-607 3210.9,-607 3366.51,-607 3366.51,-607 3372.51,-607 3378.51,-613 3378.51,-619 3378.51,-619 3378.51,-639 3378.51,-639 3378.51,-645 3372.51,-651 3366.51,-651" style=""/>
+<text text-anchor="middle" x="3288.7" y="-638" font-family="Helvetica,sans-Serif" font-size="10.00" style="">DrugBankRecord</text>
+<text text-anchor="middle" x="3288.7" y="-626" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: drugbank_id</text>
+<text text-anchor="middle" x="3288.7" y="-614" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: name, category?, mechanism?</text>
+</g>
+<!-- Compound&#45;&gt;DrugBank -->
+<g id="edge44" class="edge" data-name="Compound-&gt;DrugBank">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" stroke-dasharray="5,2" d="M2220.25,-1208.59C2220.25,-1098.66 2220.25,-621.67 2220.25,-621.67 2220.25,-621.67 3189.21,-621.67 3189.21,-621.67" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="3189.21,-624.29 3196.71,-621.67 3189.21,-619.04 3189.21,-624.29" style=""/>
+<text text-anchor="middle" x="2788.26" y="-798" font-family="Helvetica,sans-Serif" font-size="10.00" style="">HAS_DRUGBANK_RECORD</text>
+</g>
+<!-- MolGraph -->
+<g id="node35" class="node" pointer-events="visible" data-name="MolGraph">
+
+<path fill="white" stroke="black" d="M3397.16,-567C3397.16,-567 3180.24,-567 3180.24,-567 3174.24,-567 3168.24,-561 3168.24,-555 3168.24,-555 3168.24,-535 3168.24,-535 3168.24,-529 3174.24,-523 3180.24,-523 3180.24,-523 3397.16,-523 3397.16,-523 3403.16,-523 3409.16,-529 3409.16,-535 3409.16,-535 3409.16,-555 3409.16,-555 3409.16,-561 3403.16,-567 3397.16,-567" style=""/>
+<text text-anchor="middle" x="3288.7" y="-554" font-family="Helvetica,sans-Serif" font-size="10.00" style="">MolecularRepresentation</text>
+<text text-anchor="middle" x="3288.7" y="-542" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: repr_id</text>
+<text text-anchor="middle" x="3288.7" y="-530" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: method, fp_type?, dim?, storage_uri, version</text>
+</g>
+<!-- Compound&#45;&gt;MolGraph -->
+<g id="edge41" class="edge" data-name="Compound-&gt;MolGraph">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" stroke-dasharray="5,2" d="M2182.25,-1208.83C2182.25,-1091.98 2182.25,-553 2182.25,-553 2182.25,-553 3158.61,-553 3158.61,-553" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="3158.61,-555.63 3166.11,-553 3158.61,-550.38 3158.61,-555.63" style=""/>
+<text text-anchor="middle" x="2788.26" y="-706" font-family="Helvetica,sans-Serif" font-size="10.00" style="">HAS_MOLECULAR_REPRESENTATION</text>
+</g>
+<!-- Substance -->
+<g id="node6" class="node" pointer-events="visible" data-name="Substance">
+
+<path fill="white" stroke="black" d="M1890.08,-1337C1890.08,-1337 1685.6,-1337 1685.6,-1337 1679.6,-1337 1673.6,-1331 1673.6,-1325 1673.6,-1325 1673.6,-1305 1673.6,-1305 1673.6,-1299 1679.6,-1293 1685.6,-1293 1685.6,-1293 1890.08,-1293 1890.08,-1293 1896.08,-1293 1902.08,-1299 1902.08,-1305 1902.08,-1305 1902.08,-1325 1902.08,-1325 1902.08,-1331 1896.08,-1337 1890.08,-1337" style=""/>
+<text text-anchor="middle" x="1787.84" y="-1324" font-family="Helvetica,sans-Serif" font-size="10.00" style="">Substance</text>
+<text text-anchor="middle" x="1787.84" y="-1312" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: sid</text>
+<text text-anchor="middle" x="1787.84" y="-1300" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: pubchem_uri?, record_name?, depositor?</text>
+</g>
+<!-- Substance&#45;&gt;Compound -->
+<g id="edge1" class="edge" data-name="Substance-&gt;Compound">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" d="M1899.25,-1292.89C1899.25,-1265.86 1899.25,-1223.67 1899.25,-1223.67 1899.25,-1223.67 2081.14,-1223.67 2081.14,-1223.67" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="2081.14,-1226.29 2088.64,-1223.67 2081.14,-1221.04 2081.14,-1226.29" style=""/>
+<text text-anchor="middle" x="1997.64" y="-1285" font-family="Helvetica,sans-Serif" font-size="10.00" style="">STANDARDIZED_TO</text>
+</g>
+<!-- Source -->
+<g id="node17" class="node" pointer-events="visible" data-name="Source">
+
+<path fill="white" stroke="black" d="M2284.03,-539C2284.03,-539 2116.93,-539 2116.93,-539 2110.93,-539 2104.93,-533 2104.93,-527 2104.93,-527 2104.93,-507 2104.93,-507 2104.93,-501 2110.93,-495 2116.93,-495 2116.93,-495 2284.03,-495 2284.03,-495 2290.03,-495 2296.03,-501 2296.03,-507 2296.03,-507 2296.03,-527 2296.03,-527 2296.03,-533 2290.03,-539 2284.03,-539" style=""/>
+<text text-anchor="middle" x="2200.48" y="-526" font-family="Helvetica,sans-Serif" font-size="10.00" style="">Source</text>
+<text text-anchor="middle" x="2200.48" y="-514" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: source_id</text>
+<text text-anchor="middle" x="2200.48" y="-502" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: name, depositor?, provider_type?</text>
+</g>
+<!-- Substance&#45;&gt;Source -->
+<g id="edge2" class="edge" data-name="Substance-&gt;Source">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" d="M1891.25,-1292.61C1891.25,-1163.94 1891.25,-524.33 1891.25,-524.33 1891.25,-524.33 2095.44,-524.33 2095.44,-524.33" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="2095.44,-526.96 2102.94,-524.33 2095.44,-521.71 2095.44,-526.96" style=""/>
+<text text-anchor="middle" x="1997.64" y="-1044" font-family="Helvetica,sans-Serif" font-size="10.00" style="">SUBMITTED_BY</text>
+</g>
+<!-- Gene -->
+<g id="node8" class="node" pointer-events="visible" data-name="Gene">
+
+<path fill="white" stroke="black" d="M3363.45,-1282C3363.45,-1282 3213.95,-1282 3213.95,-1282 3207.95,-1282 3201.95,-1276 3201.95,-1270 3201.95,-1270 3201.95,-1250 3201.95,-1250 3201.95,-1244 3207.95,-1238 3213.95,-1238 3213.95,-1238 3363.45,-1238 3363.45,-1238 3369.45,-1238 3375.45,-1244 3375.45,-1250 3375.45,-1250 3375.45,-1270 3375.45,-1270 3375.45,-1276 3369.45,-1282 3363.45,-1282" style=""/>
+<text text-anchor="middle" x="3288.7" y="-1269" font-family="Helvetica,sans-Serif" font-size="10.00" style="">Gene</text>
+<text text-anchor="middle" x="3288.7" y="-1257" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: gene_id</text>
+<text text-anchor="middle" x="3288.7" y="-1245" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: symbol, name, pubchem_uri?</text>
+</g>
+<!-- Protein&#45;&gt;Gene -->
+<g id="edge12" class="edge" data-name="Protein-&gt;Gene">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" d="M2887.13,-1245.5C2887.13,-1245.5 3192.42,-1245.5 3192.42,-1245.5" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="3192.42,-1248.13 3199.92,-1245.5 3192.42,-1242.88 3192.42,-1248.13" style=""/>
+<text text-anchor="middle" x="3051.96" y="-1263" font-family="Helvetica,sans-Serif" font-size="10.00" style="">ENCODED_BY</text>
+</g>
+<!-- Protein&#45;&gt;Pathway -->
+<g id="edge18" class="edge" data-name="Protein-&gt;Pathway">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" stroke-dasharray="5,2" d="M2887.25,-1212.22C2935.07,-1212.22 2982.25,-1212.22 2982.25,-1212.22 2982.25,-1212.22 2982.25,-213 2982.25,-213 2982.25,-213 3613.56,-213 3613.56,-213" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="3613.56,-215.63 3621.06,-213 3613.56,-210.38 3613.56,-215.63" style=""/>
+<text text-anchor="middle" x="3288.7" y="-306" font-family="Helvetica,sans-Serif" font-size="10.00" style="">PARTICIPATES_IN</text>
+</g>
+<!-- UniProt -->
+<g id="node25" class="node" pointer-events="visible" data-name="UniProt">
+
+<path fill="white" stroke="black" d="M3380.92,-903C3380.92,-903 3196.48,-903 3196.48,-903 3190.48,-903 3184.48,-897 3184.48,-891 3184.48,-891 3184.48,-871 3184.48,-871 3184.48,-865 3190.48,-859 3196.48,-859 3196.48,-859 3380.92,-859 3380.92,-859 3386.92,-859 3392.92,-865 3392.92,-871 3392.92,-871 3392.92,-891 3392.92,-891 3392.92,-897 3386.92,-903 3380.92,-903" style=""/>
+<text text-anchor="middle" x="3288.7" y="-890" font-family="Helvetica,sans-Serif" font-size="10.00" style="">UniProtRecord</text>
+<text text-anchor="middle" x="3288.7" y="-878" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: uniprot_acc</text>
+<text text-anchor="middle" x="3288.7" y="-866" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: reviewed?, isoform_count?, function?</text>
+</g>
+<!-- Protein&#45;&gt;UniProt -->
+<g id="edge33" class="edge" data-name="Protein-&gt;UniProt">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" stroke-dasharray="5,2" d="M2887.11,-1221.89C2985.6,-1221.89 3122.25,-1221.89 3122.25,-1221.89 3122.25,-1221.89 3122.25,-897 3122.25,-897 3122.25,-897 3174.92,-897 3174.92,-897" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="3174.92,-899.63 3182.42,-897 3174.92,-894.38 3174.92,-899.63" style=""/>
+<text text-anchor="middle" x="3051.96" y="-1035" font-family="Helvetica,sans-Serif" font-size="10.00" style="">HAS_UNIPROT_RECORD</text>
+</g>
+<!-- GO -->
+<g id="node26" class="node" pointer-events="visible" data-name="GO">
+
+<path fill="white" stroke="black" d="M3327.81,-819C3327.81,-819 3249.6,-819 3249.6,-819 3243.6,-819 3237.6,-813 3237.6,-807 3237.6,-807 3237.6,-787 3237.6,-787 3237.6,-781 3243.6,-775 3249.6,-775 3249.6,-775 3327.81,-775 3327.81,-775 3333.81,-775 3339.81,-781 3339.81,-787 3339.81,-787 3339.81,-807 3339.81,-807 3339.81,-813 3333.81,-819 3327.81,-819" style=""/>
+<text text-anchor="middle" x="3288.7" y="-806" font-family="Helvetica,sans-Serif" font-size="10.00" style="">GOTerm</text>
+<text text-anchor="middle" x="3288.7" y="-794" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: go_id</text>
+<text text-anchor="middle" x="3288.7" y="-782" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: name, aspect</text>
+</g>
+<!-- Protein&#45;&gt;GO -->
+<g id="edge36" class="edge" data-name="Protein-&gt;GO">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" stroke-dasharray="5,2" d="M2887.41,-1225.11C3001.78,-1225.11 3174.25,-1225.11 3174.25,-1225.11 3174.25,-1225.11 3174.25,-797.5 3174.25,-797.5 3174.25,-797.5 3227.85,-797.5 3227.85,-797.5" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="3227.85,-800.13 3235.35,-797.5 3227.85,-794.88 3227.85,-800.13" style=""/>
+<text text-anchor="middle" x="3051.96" y="-978" font-family="Helvetica,sans-Serif" font-size="10.00" style="">HAS_GO_ANNOTATION</text>
+</g>
+<!-- Reactome -->
+<g id="node27" class="node" pointer-events="visible" data-name="Reactome">
+
+<path fill="white" stroke="black" d="M3332.81,-735C3332.81,-735 3244.59,-735 3244.59,-735 3238.59,-735 3232.59,-729 3232.59,-723 3232.59,-723 3232.59,-703 3232.59,-703 3232.59,-697 3238.59,-691 3244.59,-691 3244.59,-691 3332.81,-691 3332.81,-691 3338.81,-691 3344.81,-697 3344.81,-703 3344.81,-703 3344.81,-723 3344.81,-723 3344.81,-729 3338.81,-735 3332.81,-735" style=""/>
+<text text-anchor="middle" x="3288.7" y="-722" font-family="Helvetica,sans-Serif" font-size="10.00" style="">ReactomePathway</text>
+<text text-anchor="middle" x="3288.7" y="-710" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: reactome_id</text>
+<text text-anchor="middle" x="3288.7" y="-698" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: name, species?</text>
+</g>
+<!-- Protein&#45;&gt;Reactome -->
+<g id="edge37" class="edge" data-name="Protein-&gt;Reactome">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" stroke-dasharray="5,2" d="M2887.37,-1218.67C2970.68,-1218.67 3076.25,-1218.67 3076.25,-1218.67 3076.25,-1218.67 3076.25,-730 3076.25,-730 3076.25,-730 3223.01,-730 3223.01,-730" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="3223.01,-732.63 3230.51,-730 3223.01,-727.38 3223.01,-732.63" style=""/>
+<text text-anchor="middle" x="3051.96" y="-921" font-family="Helvetica,sans-Serif" font-size="10.00" style="">MAPS_TO_REACTOME_PATHWAY</text>
+</g>
+<!-- InterPro -->
+<g id="node28" class="node" pointer-events="visible" data-name="InterPro">
+
+<path fill="white" stroke="black" d="M3325.31,-1155C3325.31,-1155 3252.1,-1155 3252.1,-1155 3246.1,-1155 3240.1,-1149 3240.1,-1143 3240.1,-1143 3240.1,-1123 3240.1,-1123 3240.1,-1117 3246.1,-1111 3252.1,-1111 3252.1,-1111 3325.31,-1111 3325.31,-1111 3331.31,-1111 3337.31,-1117 3337.31,-1123 3337.31,-1123 3337.31,-1143 3337.31,-1143 3337.31,-1149 3331.31,-1155 3325.31,-1155" style=""/>
+<text text-anchor="middle" x="3288.7" y="-1142" font-family="Helvetica,sans-Serif" font-size="10.00" style="">InterProDomain</text>
+<text text-anchor="middle" x="3288.7" y="-1130" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: interpro_id</text>
+<text text-anchor="middle" x="3288.7" y="-1118" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: name, type?</text>
+</g>
+<!-- Protein&#45;&gt;InterPro -->
+<g id="edge35" class="edge" data-name="Protein-&gt;InterPro">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" stroke-dasharray="5,2" d="M2887.24,-1234.78C3033.25,-1234.78 3289.25,-1234.78 3289.25,-1234.78 3289.25,-1234.78 3289.25,-1164.65 3289.25,-1164.65" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="3291.88,-1164.65 3289.25,-1157.15 3286.63,-1164.65 3291.88,-1164.65" style=""/>
+<text text-anchor="middle" x="3051.96" y="-1206" font-family="Helvetica,sans-Serif" font-size="10.00" style="">HAS_INTERPRO_DOMAIN</text>
+</g>
+<!-- Protein&#45;&gt;DrugBank -->
+<g id="edge47" class="edge" data-name="Protein-&gt;DrugBank">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" stroke-dasharray="5,2" d="M2887.32,-1215.44C2953.79,-1215.44 3029.25,-1215.44 3029.25,-1215.44 3029.25,-1215.44 3029.25,-636.33 3029.25,-636.33 3029.25,-636.33 3189.37,-636.33 3189.37,-636.33" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="3189.37,-638.96 3196.87,-636.33 3189.37,-633.71 3189.37,-638.96" style=""/>
+<text text-anchor="middle" x="3051.96" y="-864" font-family="Helvetica,sans-Serif" font-size="10.00" style="">HAS_DRUGBANK_ENZYME_LINK</text>
+</g>
+<!-- PDB -->
+<g id="node32" class="node" pointer-events="visible" data-name="PDB">
+
+<path fill="white" stroke="black" d="M3374.71,-1071C3374.71,-1071 3202.7,-1071 3202.7,-1071 3196.7,-1071 3190.7,-1065 3190.7,-1059 3190.7,-1059 3190.7,-1039 3190.7,-1039 3190.7,-1033 3196.7,-1027 3202.7,-1027 3202.7,-1027 3374.71,-1027 3374.71,-1027 3380.71,-1027 3386.71,-1033 3386.71,-1039 3386.71,-1039 3386.71,-1059 3386.71,-1059 3386.71,-1065 3380.71,-1071 3374.71,-1071" style=""/>
+<text text-anchor="middle" x="3288.7" y="-1058" font-family="Helvetica,sans-Serif" font-size="10.00" style="">PDBStructure</text>
+<text text-anchor="middle" x="3288.7" y="-1046" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: pdb_id</text>
+<text text-anchor="middle" x="3288.7" y="-1034" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: method?, resolution?, chain_map?</text>
+</g>
+<!-- Protein&#45;&gt;PDB -->
+<g id="edge39" class="edge" data-name="Protein-&gt;PDB">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" stroke-dasharray="5,2" d="M2887.27,-1231.56C3008.31,-1231.56 3197.25,-1231.56 3197.25,-1231.56 3197.25,-1231.56 3197.25,-1080.7 3197.25,-1080.7" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="3199.88,-1080.7 3197.25,-1073.2 3194.63,-1080.7 3199.88,-1080.7" style=""/>
+<text text-anchor="middle" x="3051.96" y="-1149" font-family="Helvetica,sans-Serif" font-size="10.00" style="">HAS_PDB_STRUCTURE</text>
+</g>
+<!-- AlphaFold -->
+<g id="node33" class="node" pointer-events="visible" data-name="AlphaFold">
+
+<path fill="white" stroke="black" d="M3386.53,-987C3386.53,-987 3190.87,-987 3190.87,-987 3184.87,-987 3178.87,-981 3178.87,-975 3178.87,-975 3178.87,-955 3178.87,-955 3178.87,-949 3184.87,-943 3190.87,-943 3190.87,-943 3386.53,-943 3386.53,-943 3392.53,-943 3398.53,-949 3398.53,-955 3398.53,-955 3398.53,-975 3398.53,-975 3398.53,-981 3392.53,-987 3386.53,-987" style=""/>
+<text text-anchor="middle" x="3288.7" y="-974" font-family="Helvetica,sans-Serif" font-size="10.00" style="">AlphaFoldModel</text>
+<text text-anchor="middle" x="3288.7" y="-962" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: alphafold_id</text>
+<text text-anchor="middle" x="3288.7" y="-950" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: model_version?, confidence_summary?</text>
+</g>
+<!-- Protein&#45;&gt;AlphaFold -->
+<g id="edge40" class="edge" data-name="Protein-&gt;AlphaFold">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" stroke-dasharray="5,2" d="M2887.41,-1228.33C3005,-1228.33 3185.25,-1228.33 3185.25,-1228.33 3185.25,-1228.33 3185.25,-996.77 3185.25,-996.77" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="3187.88,-996.77 3185.25,-989.27 3182.63,-996.77 3187.88,-996.77" style=""/>
+<text text-anchor="middle" x="3051.96" y="-1092" font-family="Helvetica,sans-Serif" font-size="10.00" style="">HAS_ALPHAFOLD_MODEL</text>
+</g>
+<!-- Organism -->
+<g id="node9" class="node" pointer-events="visible" data-name="Organism">
+
+<path fill="white" stroke="black" d="M1871.37,-1253C1871.37,-1253 1704.31,-1253 1704.31,-1253 1698.31,-1253 1692.31,-1247 1692.31,-1241 1692.31,-1241 1692.31,-1221 1692.31,-1221 1692.31,-1215 1698.31,-1209 1704.31,-1209 1704.31,-1209 1871.37,-1209 1871.37,-1209 1877.37,-1209 1883.37,-1215 1883.37,-1221 1883.37,-1221 1883.37,-1241 1883.37,-1241 1883.37,-1247 1877.37,-1253 1871.37,-1253" style=""/>
+<text text-anchor="middle" x="1787.84" y="-1240" font-family="Helvetica,sans-Serif" font-size="10.00" style="">Organism</text>
+<text text-anchor="middle" x="1787.84" y="-1228" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: taxid</text>
+<text text-anchor="middle" x="1787.84" y="-1216" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: scientific_name, common_name?</text>
+</g>
+<!-- BioAssay -->
+<g id="node14" class="node" pointer-events="visible" data-name="BioAssay">
+
+<path fill="white" stroke="black" d="M987.22,-1461C987.22,-1461 697.66,-1461 697.66,-1461 691.66,-1461 685.66,-1455 685.66,-1449 685.66,-1449 685.66,-1429 685.66,-1429 685.66,-1423 691.66,-1417 697.66,-1417 697.66,-1417 987.22,-1417 987.22,-1417 993.22,-1417 999.22,-1423 999.22,-1429 999.22,-1429 999.22,-1449 999.22,-1449 999.22,-1455 993.22,-1461 987.22,-1461" style=""/>
+<text text-anchor="middle" x="842.44" y="-1448" font-family="Helvetica,sans-Serif" font-size="10.00" style="">BioAssay</text>
+<text text-anchor="middle" x="842.44" y="-1436" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: aid</text>
+<text text-anchor="middle" x="842.44" y="-1424" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: title, assay_type?, activity_outcome_method?, pubchem_uri?</text>
+</g>
+<!-- MeasureGrp -->
+<g id="node15" class="node" pointer-events="visible" data-name="MeasureGrp">
+
+<path fill="white" stroke="black" d="M1498.4,-1461C1498.4,-1461 1217.46,-1461 1217.46,-1461 1211.46,-1461 1205.46,-1455 1205.46,-1449 1205.46,-1449 1205.46,-1429 1205.46,-1429 1205.46,-1423 1211.46,-1417 1217.46,-1417 1217.46,-1417 1498.4,-1417 1498.4,-1417 1504.4,-1417 1510.4,-1423 1510.4,-1429 1510.4,-1429 1510.4,-1449 1510.4,-1449 1510.4,-1455 1504.4,-1461 1498.4,-1461" style=""/>
+<text text-anchor="middle" x="1357.93" y="-1448" font-family="Helvetica,sans-Serif" font-size="10.00" style="">MeasureGroup</text>
+<text text-anchor="middle" x="1357.93" y="-1436" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: measuregroup_id</text>
+<text text-anchor="middle" x="1357.93" y="-1424" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: panel_row?, assay_context?, target_panel?, pubchem_uri?</text>
+</g>
+<!-- BioAssay&#45;&gt;MeasureGrp -->
+<g id="edge8" class="edge" data-name="BioAssay-&gt;MeasureGrp">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" d="M999.56,-1439C999.56,-1439 1195.89,-1439 1195.89,-1439" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="1195.89,-1441.63 1203.39,-1439 1195.89,-1436.38 1195.89,-1441.63" style=""/>
+<text text-anchor="middle" x="1102.26" y="-1460" font-family="Helvetica,sans-Serif" font-size="10.00" style="">HAS_MEASURE_GROUP</text>
+</g>
+<!-- BioAssay&#45;&gt;Source -->
+<g id="edge15" class="edge" data-name="BioAssay-&gt;Source">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" d="M895.25,-1416.94C895.25,-1276.21 895.25,-509.67 895.25,-509.67 895.25,-509.67 2095.19,-509.67 2095.19,-509.67" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="2095.19,-512.29 2102.69,-509.67 2095.19,-507.04 2095.19,-512.29" style=""/>
+<text text-anchor="middle" x="1590.81" y="-917" font-family="Helvetica,sans-Serif" font-size="10.00" style="">HAS_SOURCE</text>
+</g>
+<!-- Reference -->
+<g id="node18" class="node" pointer-events="visible" data-name="Reference">
+
+<path fill="white" stroke="black" d="M2290.27,-455C2290.27,-455 2110.69,-455 2110.69,-455 2104.69,-455 2098.69,-449 2098.69,-443 2098.69,-443 2098.69,-423 2098.69,-423 2098.69,-417 2104.69,-411 2110.69,-411 2110.69,-411 2290.27,-411 2290.27,-411 2296.27,-411 2302.27,-417 2302.27,-423 2302.27,-423 2302.27,-443 2302.27,-443 2302.27,-449 2296.27,-455 2290.27,-455" style=""/>
+<text text-anchor="middle" x="2200.48" y="-442" font-family="Helvetica,sans-Serif" font-size="10.00" style="">Reference</text>
+<text text-anchor="middle" x="2200.48" y="-430" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: reference_id</text>
+<text text-anchor="middle" x="2200.48" y="-418" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: title?, doi?, pmid?, patent_id?, year?</text>
+</g>
+<!-- BioAssay&#45;&gt;Reference -->
+<g id="edge17" class="edge" data-name="BioAssay-&gt;Reference">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" d="M790.25,-1416.7C790.25,-1269.1 790.25,-438.6 790.25,-438.6 790.25,-438.6 2088.89,-438.6 2088.89,-438.6" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="2088.89,-441.23 2096.39,-438.6 2088.89,-435.98 2088.89,-441.23" style=""/>
+<text text-anchor="middle" x="1590.81" y="-859" font-family="Helvetica,sans-Serif" font-size="10.00" style="">DESCRIBED_BY</text>
+</g>
+<!-- MeasureGrp&#45;&gt;Protein -->
+<g id="edge11" class="edge" data-name="MeasureGrp-&gt;Protein">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" d="M1358.25,-1416.62C1358.25,-1398.86 1358.25,-1377 1358.25,-1377 1358.25,-1377 2789.25,-1377 2789.25,-1377 2789.25,-1377 2789.25,-1262.81 2789.25,-1262.81" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="2791.88,-1262.81 2789.25,-1255.31 2786.63,-1262.81 2791.88,-1262.81" style=""/>
+<text text-anchor="middle" x="1997.64" y="-987" font-family="Helvetica,sans-Serif" font-size="10.00" style="">TESTED_ON</text>
+</g>
+<!-- MeasureGrp&#45;&gt;Organism -->
+<g id="edge13" class="edge" data-name="MeasureGrp-&gt;Organism">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" d="M1434.25,-1416.74C1434.25,-1363.08 1434.25,-1231 1434.25,-1231 1434.25,-1231 1682.84,-1231 1682.84,-1231" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="1682.84,-1233.63 1690.34,-1231 1682.84,-1228.38 1682.84,-1233.63" style=""/>
+<text text-anchor="middle" x="1590.81" y="-1104" font-family="Helvetica,sans-Serif" font-size="10.00" style="">IN_ORGANISM</text>
+</g>
+<!-- Endpoint -->
+<g id="node16" class="node" pointer-events="visible" data-name="Endpoint">
+
+<path fill="white" stroke="black" d="M1878.8,-1473C1878.8,-1473 1696.88,-1473 1696.88,-1473 1690.88,-1473 1684.88,-1467 1684.88,-1461 1684.88,-1461 1684.88,-1429 1684.88,-1429 1684.88,-1423 1690.88,-1417 1696.88,-1417 1696.88,-1417 1878.8,-1417 1878.8,-1417 1884.8,-1417 1890.8,-1423 1890.8,-1429 1890.8,-1429 1890.8,-1461 1890.8,-1461 1890.8,-1467 1884.8,-1473 1878.8,-1473" style=""/>
+<text text-anchor="middle" x="1787.84" y="-1460" font-family="Helvetica,sans-Serif" font-size="10.00" style="">Endpoint</text>
+<text text-anchor="middle" x="1787.84" y="-1448" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: endpoint_id</text>
+<text text-anchor="middle" x="1787.84" y="-1436" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: endpoint_type, value, unit, qualifier?,</text>
+<text text-anchor="middle" x="1787.84" y="-1424" font-family="Helvetica,sans-Serif" font-size="10.00" style="">outcome_label?, activity_flag?, score?</text>
+</g>
+<!-- MeasureGrp&#45;&gt;Endpoint -->
+<g id="edge9" class="edge" data-name="MeasureGrp-&gt;Endpoint">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" d="M1510.71,-1439C1510.71,-1439 1675.37,-1439 1675.37,-1439" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="1675.37,-1441.63 1682.87,-1439 1675.37,-1436.38 1675.37,-1441.63" style=""/>
+<text text-anchor="middle" x="1590.81" y="-1460" font-family="Helvetica,sans-Serif" font-size="10.00" style="">HAS_ENDPOINT</text>
+</g>
+<!-- CellLine -->
+<g id="node20" class="node" pointer-events="visible" data-name="CellLine">
+
+<path fill="white" stroke="black" d="M3765.13,-144C3765.13,-144 3653.09,-144 3653.09,-144 3647.09,-144 3641.09,-138 3641.09,-132 3641.09,-132 3641.09,-112 3641.09,-112 3641.09,-106 3647.09,-100 3653.09,-100 3653.09,-100 3765.13,-100 3765.13,-100 3771.13,-100 3777.13,-106 3777.13,-112 3777.13,-112 3777.13,-132 3777.13,-132 3777.13,-138 3771.13,-144 3765.13,-144" style=""/>
+<text text-anchor="middle" x="3709.11" y="-131" font-family="Helvetica,sans-Serif" font-size="10.00" style="">CellLine</text>
+<text text-anchor="middle" x="3709.11" y="-119" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: cellline_id</text>
+<text text-anchor="middle" x="3709.11" y="-107" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: name, pubchem_uri?</text>
+</g>
+<!-- MeasureGrp&#45;&gt;CellLine -->
+<g id="edge14" class="edge" data-name="MeasureGrp-&gt;CellLine">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" stroke-dasharray="5,2" d="M1282.25,-1416.69C1282.25,-1243.63 1282.25,-122 1282.25,-122 1282.25,-122 3631.4,-122 3631.4,-122" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="3631.4,-124.63 3638.9,-122 3631.4,-119.38 3631.4,-124.63" style=""/>
+<text text-anchor="middle" x="2475.61" y="-321" font-family="Helvetica,sans-Serif" font-size="10.00" style="">IN_CELL_LINE</text>
+</g>
+<!-- Endpoint&#45;&gt;Substance -->
+<g id="edge10" class="edge" data-name="Endpoint-&gt;Substance">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" d="M1788.25,-1416.79C1788.25,-1416.79 1788.25,-1346.44 1788.25,-1346.44" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="1790.88,-1346.44 1788.25,-1338.94 1785.63,-1346.44 1790.88,-1346.44" style=""/>
+</g>
+<!-- Endpoint&#45;&gt;Reference -->
+<g id="edge16" class="edge" data-name="Endpoint-&gt;Reference">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" d="M1891.11,-1445C1936.31,-1445 1979.25,-1445 1979.25,-1445 1979.25,-1445 1979.25,-445.8 1979.25,-445.8 1979.25,-445.8 2088.97,-445.8 2088.97,-445.8" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="2088.97,-448.43 2096.47,-445.8 2088.97,-443.18 2088.97,-448.43" style=""/>
+<text text-anchor="middle" x="1997.64" y="-1426" font-family="Helvetica,sans-Serif" font-size="10.00" style="">SUPPORTED_BY</text>
+</g>
+<!-- Endpoint&#45;&gt;ChEMBL -->
+<g id="edge45" class="edge" data-name="Endpoint-&gt;ChEMBL">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" stroke-dasharray="5,2" d="M1891.14,-1459C1952.03,-1459 2017.25,-1459 2017.25,-1459 2017.25,-1459 2017.25,-464.33 2017.25,-464.33 2017.25,-464.33 3180.94,-464.33 3180.94,-464.33" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="3180.94,-466.96 3188.44,-464.33 3180.94,-461.71 3180.94,-466.96" style=""/>
+<text text-anchor="middle" x="2475.61" y="-482" font-family="Helvetica,sans-Serif" font-size="10.00" style="">HARMONIZED_TO_CHEMBL</text>
+</g>
+<!-- Endpoint&#45;&gt;BindingDB -->
+<g id="edge46" class="edge" data-name="Endpoint-&gt;BindingDB">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" stroke-dasharray="5,2" d="M1891.26,-1431C1919.39,-1431 1942.25,-1431 1942.25,-1431 1942.25,-1431 1942.25,-384.33 1942.25,-384.33 1942.25,-384.33 3196.68,-384.33 3196.68,-384.33" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="3196.68,-386.96 3204.18,-384.33 3196.68,-381.71 3196.68,-386.96" style=""/>
+<text text-anchor="middle" x="2475.61" y="-425" font-family="Helvetica,sans-Serif" font-size="10.00" style="">VALIDATED_BY_BINDINGDB</text>
+</g>
+<!-- Anatomy -->
+<g id="node21" class="node" pointer-events="visible" data-name="Anatomy">
+
+<path fill="white" stroke="black" d="M4088.35,-144C4088.35,-144 3963.95,-144 3963.95,-144 3957.95,-144 3951.95,-138 3951.95,-132 3951.95,-132 3951.95,-112 3951.95,-112 3951.95,-106 3957.95,-100 3963.95,-100 3963.95,-100 4088.35,-100 4088.35,-100 4094.35,-100 4100.35,-106 4100.35,-112 4100.35,-112 4100.35,-132 4100.35,-132 4100.35,-138 4094.35,-144 4088.35,-144" style=""/>
+<text text-anchor="middle" x="4026.15" y="-131" font-family="Helvetica,sans-Serif" font-size="10.00" style="">Anatomy</text>
+<text text-anchor="middle" x="4026.15" y="-119" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: anatomy_id</text>
+<text text-anchor="middle" x="4026.15" y="-107" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: label, ontology_source?</text>
+</g>
+<!-- CellLine&#45;&gt;Anatomy -->
+<g id="edge20" class="edge" data-name="CellLine-&gt;Anatomy">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" stroke-dasharray="5,2" d="M3777.52,-122C3777.52,-122 3942.19,-122 3942.19,-122" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="3942.19,-124.63 3949.69,-122 3942.19,-119.38 3942.19,-124.63" style=""/>
+<text text-anchor="middle" x="3878.33" y="-125" font-family="Helvetica,sans-Serif" font-size="10.00" style="">DERIVED_FROM</text>
+</g>
+<!-- Disease -->
+<g id="node22" class="node" pointer-events="visible" data-name="Disease">
+
+<path fill="white" stroke="black" d="M3783.2,-60C3783.2,-60 3635.02,-60 3635.02,-60 3629.02,-60 3623.02,-54 3623.02,-48 3623.02,-48 3623.02,-28 3623.02,-28 3623.02,-22 3629.02,-16 3635.02,-16 3635.02,-16 3783.2,-16 3783.2,-16 3789.2,-16 3795.2,-22 3795.2,-28 3795.2,-28 3795.2,-48 3795.2,-48 3795.2,-54 3789.2,-60 3783.2,-60" style=""/>
+<text text-anchor="middle" x="3709.11" y="-47" font-family="Helvetica,sans-Serif" font-size="10.00" style="">Disease</text>
+<text text-anchor="middle" x="3709.11" y="-35" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: disease_id</text>
+<text text-anchor="middle" x="3709.11" y="-23" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: name, source, pubchem_uri?</text>
+</g>
+<!-- Cooc -->
+<g id="node23" class="node" pointer-events="visible" data-name="Cooc">
+
+<path fill="white" stroke="black" d="M1892.59,-348C1892.59,-348 1683.09,-348 1683.09,-348 1677.09,-348 1671.09,-342 1671.09,-336 1671.09,-336 1671.09,-316 1671.09,-316 1671.09,-310 1677.09,-304 1683.09,-304 1683.09,-304 1892.59,-304 1892.59,-304 1898.59,-304 1904.59,-310 1904.59,-316 1904.59,-316 1904.59,-336 1904.59,-336 1904.59,-342 1898.59,-348 1892.59,-348" style=""/>
+<text text-anchor="middle" x="1787.84" y="-335" font-family="Helvetica,sans-Serif" font-size="10.00" style="">Cooccurrence</text>
+<text text-anchor="middle" x="1787.84" y="-323" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: cooc_id</text>
+<text text-anchor="middle" x="1787.84" y="-311" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: score, sentence_count?, mention_context?</text>
+</g>
+<!-- Cooc&#45;&gt;Compound -->
+<g id="edge21" class="edge" data-name="Cooc-&gt;Compound">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" stroke-dasharray="5,2" d="M1905.05,-333.33C1991.18,-333.33 2093.25,-333.33 2093.25,-333.33 2093.25,-333.33 2093.25,-1199.49 2093.25,-1199.49" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="2090.63,-1199.49 2093.25,-1206.99 2095.88,-1199.49 2090.63,-1199.49" style=""/>
+<text text-anchor="middle" x="1997.64" y="-715" font-family="Helvetica,sans-Serif" font-size="10.00" style="">MENTIONS_COMPOUND</text>
+</g>
+<!-- Cooc&#45;&gt;Protein -->
+<g id="edge22" class="edge" data-name="Cooc-&gt;Protein">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" stroke-dasharray="5,2" d="M1888.25,-348.46C1888.25,-483.51 1888.25,-1182 1888.25,-1182 1888.25,-1182 2789.25,-1182 2789.25,-1182 2789.25,-1182 2789.25,-1199.19 2789.25,-1199.19" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="2786.63,-1199.19 2789.25,-1206.69 2791.88,-1199.19 2786.63,-1199.19" style=""/>
+<text text-anchor="middle" x="2200.48" y="-255" font-family="Helvetica,sans-Serif" font-size="10.00" style="">MENTIONS_PROTEIN</text>
+</g>
+<!-- Cooc&#45;&gt;Reference -->
+<g id="edge24" class="edge" data-name="Cooc-&gt;Reference">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" stroke-dasharray="5,2" d="M1895.25,-348.28C1895.25,-377.26 1895.25,-424.2 1895.25,-424.2 1895.25,-424.2 2089.1,-424.2 2089.1,-424.2" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="2089.1,-426.83 2096.6,-424.2 2089.1,-421.58 2089.1,-426.83" style=""/>
+<text text-anchor="middle" x="1997.64" y="-397" font-family="Helvetica,sans-Serif" font-size="10.00" style="">FOUND_IN_REFERENCE</text>
+</g>
+<!-- Cooc&#45;&gt;Disease -->
+<g id="edge23" class="edge" data-name="Cooc-&gt;Disease">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" stroke-dasharray="5,2" d="M1788.25,-303.88C1788.25,-236.44 1788.25,-38 1788.25,-38 1788.25,-38 3613.21,-38 3613.21,-38" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="3613.21,-40.63 3620.71,-38 3613.21,-35.38 3613.21,-40.63" style=""/>
+<text text-anchor="middle" x="2788.26" y="-41" font-family="Helvetica,sans-Serif" font-size="10.00" style="">MENTIONS_DISEASE</text>
+</g>
+<!-- TextMine -->
+<g id="node24" class="node" pointer-events="visible" data-name="TextMine">
+
+<path fill="white" stroke="black" d="M2258.93,-348C2258.93,-348 2142.03,-348 2142.03,-348 2136.03,-348 2130.03,-342 2130.03,-336 2130.03,-336 2130.03,-316 2130.03,-316 2130.03,-310 2136.03,-304 2142.03,-304 2142.03,-304 2258.93,-304 2258.93,-304 2264.93,-304 2270.93,-310 2270.93,-316 2270.93,-316 2270.93,-336 2270.93,-336 2270.93,-342 2264.93,-348 2258.93,-348" style=""/>
+<text text-anchor="middle" x="2200.48" y="-335" font-family="Helvetica,sans-Serif" font-size="10.00" style="">TextMiningMethod</text>
+<text text-anchor="middle" x="2200.48" y="-323" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: method_id</text>
+<text text-anchor="middle" x="2200.48" y="-311" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: name, version, source</text>
+</g>
+<!-- Cooc&#45;&gt;TextMine -->
+<g id="edge25" class="edge" data-name="Cooc-&gt;TextMine">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" stroke-dasharray="5,2" d="M1904.98,-318.67C1904.98,-318.67 2120.34,-318.67 2120.34,-318.67" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="2120.34,-321.29 2127.84,-318.67 2120.34,-316.04 2120.34,-321.29" style=""/>
+<text text-anchor="middle" x="1997.64" y="-339" font-family="Helvetica,sans-Serif" font-size="10.00" style="">EXTRACTED_BY</text>
+</g>
+<!-- ProtEmbed -->
+<g id="node34" class="node" pointer-events="visible" data-name="ProtEmbed">
+
+<path fill="white" stroke="black" d="M3792.59,-903C3792.59,-903 3625.64,-903 3625.64,-903 3619.64,-903 3613.64,-897 3613.64,-891 3613.64,-891 3613.64,-871 3613.64,-871 3613.64,-865 3619.64,-859 3625.64,-859 3625.64,-859 3792.59,-859 3792.59,-859 3798.59,-859 3804.59,-865 3804.59,-871 3804.59,-871 3804.59,-891 3804.59,-891 3804.59,-897 3798.59,-903 3792.59,-903" style=""/>
+<text text-anchor="middle" x="3709.11" y="-890" font-family="Helvetica,sans-Serif" font-size="10.00" style="">ProteinEmbedding</text>
+<text text-anchor="middle" x="3709.11" y="-878" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: embedding_id</text>
+<text text-anchor="middle" x="3709.11" y="-866" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: method, dim, storage_uri, version</text>
+</g>
+<!-- UniProt&#45;&gt;ProtEmbed -->
+<g id="edge34" class="edge" data-name="UniProt-&gt;ProtEmbed">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" stroke-dasharray="5,2" d="M3393.16,-881C3393.16,-881 3604.14,-881 3604.14,-881" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="3604.14,-883.63 3611.64,-881 3604.14,-878.38 3604.14,-883.63" style=""/>
+<text text-anchor="middle" x="3511.28" y="-884" font-family="Helvetica,sans-Serif" font-size="10.00" style="">HAS_PROTEIN_EMBEDDING</text>
+</g>
+<!-- Reactome&#45;&gt;Pathway -->
+<g id="edge38" class="edge" data-name="Reactome-&gt;Pathway">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" stroke-dasharray="5,2" d="M3344.98,-713C3459.58,-713 3709.25,-713 3709.25,-713 3709.25,-713 3709.25,-237.76 3709.25,-237.76" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="3711.88,-237.76 3709.25,-230.26 3706.63,-237.76 3711.88,-237.76" style=""/>
+<text text-anchor="middle" x="3511.28" y="-544" font-family="Helvetica,sans-Serif" font-size="10.00" style="">ALIGNS_TO_PATHWAY</text>
+</g>
+<!-- Interaction -->
+<g id="node36" class="node" pointer-events="visible" data-name="Interaction">
+
+<path fill="white" stroke="black" d="M347.48,-776C347.48,-776 158.84,-776 158.84,-776 152.84,-776 146.84,-770 146.84,-764 146.84,-764 146.84,-732 146.84,-732 146.84,-726 152.84,-720 158.84,-720 158.84,-720 347.48,-720 347.48,-720 353.48,-720 359.48,-726 359.48,-732 359.48,-732 359.48,-764 359.48,-764 359.48,-770 353.48,-776 347.48,-776" style=""/>
+<text text-anchor="middle" x="253.16" y="-763" font-family="Helvetica,sans-Serif" font-size="10.00" style="">InteractionAssertion</text>
+<text text-anchor="middle" x="253.16" y="-751" font-family="Helvetica,sans-Serif" font-size="10.00" style="">key: interaction_id</text>
+<text text-anchor="middle" x="253.16" y="-739" font-family="Helvetica,sans-Serif" font-size="10.00" style="">props: label, confidence, evidence_count,</text>
+<text text-anchor="middle" x="253.16" y="-727" font-family="Helvetica,sans-Serif" font-size="10.00" style="">aggregation_rule, split?, created_by='PRING'</text>
+</g>
+<!-- Interaction&#45;&gt;Compound -->
+<g id="edge26" class="edge" data-name="Interaction-&gt;Compound">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" d="M359.85,-755C759.24,-755 2143.25,-755 2143.25,-755 2143.25,-755 2143.25,-1199.36 2143.25,-1199.36" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="2140.63,-1199.36 2143.25,-1206.86 2145.88,-1199.36 2140.63,-1199.36" style=""/>
+<text text-anchor="middle" x="1357.93" y="-710" font-family="Helvetica,sans-Serif" font-size="10.00" style="">ASSERTS_CHEMICAL</text>
+</g>
+<!-- Interaction&#45;&gt;Protein -->
+<g id="edge27" class="edge" data-name="Interaction-&gt;Protein">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" d="M359.98,-745C810.37,-745 2531.25,-745 2531.25,-745 2531.25,-745 2531.25,-1220 2531.25,-1220 2531.25,-1220 2679.95,-1220 2679.95,-1220" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="2679.95,-1222.63 2687.45,-1220 2679.95,-1217.38 2679.95,-1222.63" style=""/>
+<text text-anchor="middle" x="1590.81" y="-609" font-family="Helvetica,sans-Serif" font-size="10.00" style="">ASSERTS_TARGET</text>
+</g>
+<!-- Interaction&#45;&gt;Organism -->
+<g id="edge31" class="edge" data-name="Interaction-&gt;Organism">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" stroke-dasharray="5,2" d="M359.89,-765C708.01,-765 1788.25,-765 1788.25,-765 1788.25,-765 1788.25,-1199.21 1788.25,-1199.21" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="1785.63,-1199.21 1788.25,-1206.71 1790.88,-1199.21 1785.63,-1199.21" style=""/>
+<text text-anchor="middle" x="1102.26" y="-792" font-family="Helvetica,sans-Serif" font-size="10.00" style="">SCOPED_TO_ORGANISM</text>
+</g>
+<!-- Interaction&#45;&gt;BioAssay -->
+<g id="edge29" class="edge" data-name="Interaction-&gt;BioAssay">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" stroke-dasharray="5,2" d="M289.25,-776.38C289.25,-906.4 289.25,-1439 289.25,-1439 289.25,-1439 676.08,-1439 676.08,-1439" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="676.08,-1441.63 683.58,-1439 676.08,-1436.38 676.08,-1441.63" style=""/>
+<text text-anchor="middle" x="591.78" y="-1191" font-family="Helvetica,sans-Serif" font-size="10.00" style="">SUPPORTED_BY_ASSAY</text>
+</g>
+<!-- Interaction&#45;&gt;Endpoint -->
+<g id="edge28" class="edge" data-name="Interaction-&gt;Endpoint">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" d="M218.25,-776.19C218.25,-909.12 218.25,-1467 218.25,-1467 218.25,-1467 1675.23,-1467 1675.23,-1467" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="1675.23,-1469.63 1682.73,-1467 1675.23,-1464.38 1675.23,-1469.63" style=""/>
+<text text-anchor="middle" x="1102.26" y="-874" font-family="Helvetica,sans-Serif" font-size="10.00" style="">SUPPORTED_BY_ENDPOINT</text>
+</g>
+<!-- Interaction&#45;&gt;Reference -->
+<g id="edge30" class="edge" data-name="Interaction-&gt;Reference">
+
+<path fill="none" stroke="#595959" stroke-width="1.2" stroke-dasharray="5,2" d="M359.92,-725C378.1,-725 391.25,-725 391.25,-725 391.25,-725 391.25,-431.4 391.25,-431.4 391.25,-431.4 2089.04,-431.4 2089.04,-431.4" style=""/>
+<polygon fill="#595959" stroke="#595959" stroke-width="1.2" points="2089.04,-434.03 2096.54,-431.4 2089.04,-428.78 2089.04,-434.03" style=""/>
+<text text-anchor="middle" x="1357.93" y="-481" font-family="Helvetica,sans-Serif" font-size="10.00" style="">SUPPORTED_BY_REFERENCE</text>
+</g>
+</g>
+</svg>

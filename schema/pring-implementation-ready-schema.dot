@@ -1,0 +1,253 @@
+digraph PRING_Final_ImplementationReady_Thesis {
+  graph [
+    rankdir=LR,
+    splines=ortho,
+    overlap=false,
+    fontname="Helvetica",
+    fontsize=18,
+    labelloc="t",
+    label="PRING — final implementation-ready schema for PubChem-driven compound–protein interaction KG",
+    pad=0.25,
+    nodesep=0.55,
+    ranksep=0.95,
+    bgcolor="white"
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    fillcolor="white",
+    fontname="Helvetica",
+    fontsize=10,
+    margin="0.08,0.05"
+  ];
+
+  edge [
+    fontname="Helvetica",
+    fontsize=10,
+    color="gray35",
+    arrowsize=0.75,
+    penwidth=1.2
+  ];
+
+  // --------------------------------------------------------------------------
+  // Conventions
+  // --------------------------------------------------------------------------
+  subgraph cluster_conventions {
+    label="Conventions";
+    style="rounded,dashed";
+    color="gray70";
+
+    Conv1 [shape=note, fillcolor="white", label="Solid edges = persisted PubChem-derived core graph"];
+    Conv2 [shape=note, fillcolor="white", label="Dashed edges = optional enrichment, text-mined, or derived links"];
+    Conv3 [shape=note, fillcolor="white", label="Red bold self-edge on Compound = explicit compound-to-compound relations\nused instead of a vague generic neighbors bucket for production modeling"];
+    Conv4 [shape=note, fillcolor="white", label="Structure / Properties / Synonyms / Neighbors are preserved from the original PRING concept schema,\nbut PRING may flatten Structure/Properties/Synonyms into Compound properties at load time"];
+  }
+
+  // --------------------------------------------------------------------------
+  // A. Core entities
+  // --------------------------------------------------------------------------
+  subgraph cluster_core {
+    label="A) Core entities";
+    style="rounded,filled";
+    color="aliceblue";
+
+    Compound  [label="Compound\nkey: cid\nprops: preferred_name?, pubchem_uri?, term?"];
+    Substance [label="Substance\nkey: sid\nprops: pubchem_uri?, record_name?, depositor?"];
+    Protein   [label="Protein\nkey: protein_id\nprops: name, target_type?, pubchem_uri?"];
+    Gene      [label="Gene\nkey: gene_id\nprops: symbol, name, pubchem_uri?"];
+    Organism  [label="Organism\nkey: taxid\nprops: scientific_name, common_name?"];
+  }
+
+  // --------------------------------------------------------------------------
+  // B. Chemical features / ML inputs
+  // --------------------------------------------------------------------------
+  subgraph cluster_features {
+    label="B) Chemical features / ML inputs";
+    style="rounded,filled";
+    color="honeydew";
+
+    Structure  [label="Structure\nkey: cid (1:1)\nprops: smiles, inchi, inchikey"];
+    Properties [label="Properties\nkey: cid (1:1)\nprops: formula, exact_mass?, molecular_weight, xlogp3?, tpsa?"];
+    Synonyms   [label="Synonyms\nkey: cid (1:1 or 1:n)\nprops: preferred, synonyms[]"];
+    Neighbors  [label="Neighbors (raw staging)\nkey: cid\nprops: raw_neighbors[]\nparents/components/similar as delivered"];
+  }
+
+  // --------------------------------------------------------------------------
+  // C. Experimental evidence backbone
+  // --------------------------------------------------------------------------
+  subgraph cluster_evidence {
+    label="C) Experimental evidence backbone";
+    style="rounded,filled";
+    color="lavender";
+
+    BioAssay   [label="BioAssay\nkey: aid\nprops: title, assay_type?, activity_outcome_method?, pubchem_uri?"];
+    MeasureGrp [label="MeasureGroup\nkey: measuregroup_id\nprops: panel_row?, assay_context?, target_panel?, pubchem_uri?"];
+    Endpoint   [label="Endpoint\nkey: endpoint_id\nprops: endpoint_type, value, unit, qualifier?,\noutcome_label?, activity_flag?, score?"];
+  }
+
+  // --------------------------------------------------------------------------
+  // D. Provenance / trust
+  // --------------------------------------------------------------------------
+  subgraph cluster_prov {
+    label="D) Provenance / trust";
+    style="rounded,filled";
+    color="oldlace";
+
+    Source    [label="Source\nkey: source_id\nprops: name, depositor?, provider_type?"];
+    Reference [label="Reference\nkey: reference_id\nprops: title?, doi?, pmid?, patent_id?, year?"];
+  }
+
+  // --------------------------------------------------------------------------
+  // E. Optional biological context
+  // --------------------------------------------------------------------------
+  subgraph cluster_context {
+    label="E) Optional biological context";
+    style="rounded,filled";
+    color="mistyrose";
+
+    Pathway  [label="Pathway / BioSystem\nkey: pathway_id\nprops: name, source, pubchem_uri?"];
+    CellLine [label="CellLine\nkey: cellline_id\nprops: name, pubchem_uri?"];
+    Anatomy  [label="Anatomy\nkey: anatomy_id\nprops: label, ontology_source?"];
+    Disease  [label="Disease\nkey: disease_id\nprops: name, source, pubchem_uri?"];
+  }
+
+  // --------------------------------------------------------------------------
+  // F. Text-mined associations
+  // --------------------------------------------------------------------------
+  subgraph cluster_textmine {
+    label="F) Text-mined links (kept separate from curated evidence)";
+    style="rounded,filled";
+    color="gray92";
+
+    Cooc     [label="Cooccurrence\nkey: cooc_id\nprops: score, sentence_count?, mention_context?"];
+    TextMine [label="TextMiningMethod\nkey: method_id\nprops: name, version, source"];
+  }
+
+  // --------------------------------------------------------------------------
+  // G. External enrichment / cross-reference layer
+  // --------------------------------------------------------------------------
+  subgraph cluster_plugins {
+    label="G) External enrichment / optional add-ons";
+    style="rounded,filled";
+    color="lightyellow";
+
+    UniProt   [label="UniProtRecord\nkey: uniprot_acc\nprops: reviewed?, isoform_count?, function?"];
+    GO        [label="GOTerm\nkey: go_id\nprops: name, aspect"];
+    Reactome  [label="ReactomePathway\nkey: reactome_id\nprops: name, species?"];
+    InterPro  [label="InterProDomain\nkey: interpro_id\nprops: name, type?"];
+
+    ChEMBL    [label="ChEMBLRecord\nkey: chembl_id\nprops: entity_type, assay_id?, activity_id?"];
+    BindingDB [label="BindingDBRecord\nkey: bindingdb_id\nprops: kd?, ki?, ic50?, source_ref?"];
+    DrugBank  [label="DrugBankRecord\nkey: drugbank_id\nprops: name, category?, mechanism?"];
+
+    PDB       [label="PDBStructure\nkey: pdb_id\nprops: method?, resolution?, chain_map?"];
+    AlphaFold [label="AlphaFoldModel\nkey: alphafold_id\nprops: model_version?, confidence_summary?"];
+
+    ProtEmbed [label="ProteinEmbedding\nkey: embedding_id\nprops: method, dim, storage_uri, version"];
+    MolGraph  [label="MolecularRepresentation\nkey: repr_id\nprops: method, fp_type?, dim?, storage_uri, version"];
+  }
+
+  // --------------------------------------------------------------------------
+  // H. Derived modeling layer used by PRING for interaction prediction
+  // --------------------------------------------------------------------------
+  subgraph cluster_modeling {
+    label="H) Derived interaction modeling layer (PRING materialization)";
+    style="rounded,filled";
+    color="moccasin";
+
+    Interaction [label="InteractionAssertion\nkey: interaction_id\nprops: label, confidence, evidence_count,\naggregation_rule, split?, created_by='PRING'"];
+  }
+
+  // =========================
+  // Core normalization & provenance
+  // =========================
+  Substance -> Compound [label="STANDARDIZED_TO"];
+  Substance -> Source   [label="SUBMITTED_BY"];
+
+  // =========================
+  // Chemical feature sidecars (preserved from original schema)
+  // =========================
+  Compound -> Structure  [label="HAS_STRUCTURE"];
+  Compound -> Properties [label="HAS_PROPERTIES"];
+  Compound -> Synonyms   [label="HAS_SYNONYMS"];
+  Compound -> Neighbors  [label="HAS_NEIGHBOR_SET"];
+
+  // Explicit production-ready compound-to-compound relationships
+  Compound -> Compound [
+    color="firebrick4",
+    fontcolor="firebrick4",
+    penwidth=1.8,
+    minlen=2,
+    label="SIMILAR_TO | HAS_PARENT_COMPOUND | HAS_COMPONENT_COMPOUND\n{score?, method?, relation_source?, threshold?}"
+  ];
+
+  // =========================
+  // Evidence backbone
+  // =========================
+  BioAssay   -> MeasureGrp [label="HAS_MEASURE_GROUP"];
+  MeasureGrp -> Endpoint   [label="HAS_ENDPOINT"];
+  Endpoint   -> Substance  [label="ABOUT_SUBSTANCE"];
+
+  // Who / what is being tested
+  MeasureGrp -> Protein    [label="TESTED_ON"];
+  Protein    -> Gene       [label="ENCODED_BY"];
+  MeasureGrp -> Organism   [label="IN_ORGANISM"];
+  MeasureGrp -> CellLine   [label="IN_CELL_LINE", style=dashed];
+
+  // Evidence provenance
+  BioAssay  -> Source     [label="HAS_SOURCE"];
+  Endpoint  -> Reference  [label="SUPPORTED_BY"];
+  BioAssay  -> Reference  [label="DESCRIBED_BY"];
+
+  // Optional biological context
+  Protein  -> Pathway [label="PARTICIPATES_IN", style=dashed];
+  Compound -> Pathway [label="ASSOCIATED_WITH_PATHWAY", style=dashed];
+  CellLine -> Anatomy [label="DERIVED_FROM", style=dashed];
+
+  // Text-mined layer (kept distinct from curated evidence)
+  Cooc -> Compound  [label="MENTIONS_COMPOUND", style=dashed];
+  Cooc -> Protein   [label="MENTIONS_PROTEIN", style=dashed];
+  Cooc -> Disease   [label="MENTIONS_DISEASE", style=dashed];
+  Cooc -> Reference [label="FOUND_IN_REFERENCE", style=dashed];
+  Cooc -> TextMine  [label="EXTRACTED_BY", style=dashed];
+
+  // =========================
+  // Derived interaction modeling layer
+  // =========================
+  Interaction -> Compound [label="ASSERTS_CHEMICAL"];
+  Interaction -> Protein  [label="ASSERTS_TARGET"];
+  Interaction -> Endpoint [label="SUPPORTED_BY_ENDPOINT"];
+  Interaction -> BioAssay [label="SUPPORTED_BY_ASSAY", style=dashed];
+  Interaction -> Reference [label="SUPPORTED_BY_REFERENCE", style=dashed];
+  Interaction -> Organism [label="SCOPED_TO_ORGANISM", style=dashed];
+
+  Compound -> Protein [
+    style=dashed,
+    penwidth=2,
+    label="PREDICTED_TO_INTERACT_WITH\n{score, model_name, model_version, features_used, split?}"
+  ];
+
+  // =========================
+  // External enrichment / cross-reference layer
+  // =========================
+  Protein -> UniProt   [style=dashed, label="HAS_UNIPROT_RECORD"];
+  UniProt -> ProtEmbed [style=dashed, label="HAS_PROTEIN_EMBEDDING"];
+
+  Protein -> InterPro  [style=dashed, label="HAS_INTERPRO_DOMAIN"];
+  Protein -> GO        [style=dashed, label="HAS_GO_ANNOTATION"];
+  Protein -> Reactome  [style=dashed, label="MAPS_TO_REACTOME_PATHWAY"];
+  Reactome -> Pathway  [style=dashed, label="ALIGNS_TO_PATHWAY"];
+
+  Protein -> PDB       [style=dashed, label="HAS_PDB_STRUCTURE"];
+  Protein -> AlphaFold [style=dashed, label="HAS_ALPHAFOLD_MODEL"];
+
+  Compound -> MolGraph  [style=dashed, label="HAS_MOLECULAR_REPRESENTATION"];
+  Compound -> ChEMBL    [style=dashed, label="HAS_CHEMBL_RECORD"];
+  Compound -> BindingDB [style=dashed, label="HAS_BINDINGDB_RECORD"];
+  Compound -> DrugBank  [style=dashed, label="HAS_DRUGBANK_RECORD"];
+
+  Endpoint -> ChEMBL    [style=dashed, label="HARMONIZED_TO_CHEMBL"];
+  Endpoint -> BindingDB [style=dashed, label="VALIDATED_BY_BINDINGDB"];
+  Protein  -> DrugBank  [style=dashed, label="HAS_DRUGBANK_ENZYME_LINK"];
+}

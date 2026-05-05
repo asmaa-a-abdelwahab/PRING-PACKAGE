@@ -96,13 +96,14 @@ PREFIX genesymbol: <http://rdf.ncbi.nlm.nih.gov/pubchem/genesymbol/>
 class SparqlMirrorClient:
     cfg: SparqlConfig
     cache_dir: Optional[Path] = None
+    max_cache_bytes: Optional[int] = None
 
     def __post_init__(self) -> None:
         headers = {
             "User-Agent": self.cfg.user_agent,
             "Accept": "application/sparql-results+json",
         }
-        self.http = HttpClient(timeout_s=self.cfg.timeout_s, max_retries=self.cfg.max_retries, headers=headers, cache_dir=self.cache_dir)
+        self.http = HttpClient(timeout_s=self.cfg.timeout_s, max_retries=self.cfg.max_retries, headers=headers, cache_dir=self.cache_dir, max_cache_bytes=self.max_cache_bytes)
 
     def close(self) -> None:
         self.http.close()

@@ -62,7 +62,7 @@ Create a tiny seed file first.
 Then run:
 
 ```powershell
-python -m pring --chem-ids chem_ids.txt --load-neo4j false --out-dir runs --run-id build-chem-smoke build
+python -m pring --chem-ids chem_ids.txt --load-neo4j false --out-dir runs --run-id build-chem-smoke build --resource-profile low
 ```
 
 What this proves:
@@ -370,3 +370,4 @@ python -m pytest -q tests/live/test_live_smoke.py -m neo4j -rs
 ```
 
 If you want, I can turn this into a polished **“Real Testing Guide” README section** you can paste directly into your repository.
++41797552340

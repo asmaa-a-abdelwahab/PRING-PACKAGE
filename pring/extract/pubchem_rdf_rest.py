@@ -147,6 +147,7 @@ def parse_sparql_json_to_rows(data: Dict[str, Any]) -> List[Dict[str, str]]:
 class PubChemRdfRestClient:
     cfg: RdfRestConfig
     cache_dir: Optional[Path] = None
+    max_cache_bytes: Optional[int] = None
 
     def __post_init__(self) -> None:
         headers = {
@@ -162,11 +163,34 @@ class PubChemRdfRestClient:
             max_delay_s=self.cfg.max_delay_s,
             honor_throttling_headers=self.cfg.honor_throttling_headers,
         )
+        self._cache_bytes_written = 0
+        self._cache_budget_warned = False
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                self._cache_bytes_written = sum(p.stat().st_size for p in self.cache_dir.glob("*") if p.is_file())
+            except Exception:
+                self._cache_bytes_written = 0
 
     def close(self) -> None:
         self.http.close()
+
+
+    def _maybe_write_cache(self, path: Path, payload: str) -> None:
+        payload_bytes = len(payload.encode("utf-8"))
+        if self.max_cache_bytes is not None and (self._cache_bytes_written + payload_bytes) > self.max_cache_bytes:
+            if not self._cache_budget_warned:
+                log.warning(
+                    "RDF REST cache budget reached (%s bytes). Further RDF REST responses will not be cached.",
+                    self.max_cache_bytes,
+                )
+                self._cache_budget_warned = True
+            return
+        try:
+            path.write_text(payload, encoding="utf-8")
+            self._cache_bytes_written += payload_bytes
+        except Exception:
+            pass
 
     def _cache_key(self, url: str, params: Dict[str, Any]) -> str:
         raw = (url + "|" + json.dumps(params, sort_keys=True, ensure_ascii=True)).encode("utf-8")
@@ -281,10 +305,7 @@ class PubChemRdfRestClient:
         rows = to_triple_rows(rows)
 
         if self.cache_dir is not None:
-            try:
-                p.write_text(text, encoding="utf-8")
-            except Exception:
-                pass
+            self._maybe_write_cache(p, text)
 
         return rows
 
@@ -301,10 +322,11 @@ class PubChemPugClient:
     cache_dir: Optional[Path] = None
     timeout_s: float = 60.0
     max_retries: int = 3
+    max_cache_bytes: Optional[int] = None
 
     def __post_init__(self) -> None:
         headers = {"User-Agent": "pring/0.1 (+https://example.org)", "Accept": "application/json"}
-        self.http = HttpClient(timeout_s=self.timeout_s, max_retries=self.max_retries, headers=headers, cache_dir=self.cache_dir)
+        self.http = HttpClient(timeout_s=self.timeout_s, max_retries=self.max_retries, headers=headers, cache_dir=self.cache_dir, max_cache_bytes=self.max_cache_bytes)
 
     def close(self) -> None:
         self.http.close()
@@ -361,7 +383,7 @@ class PubChemRdfRestExtractor:
             except Exception:
                 base_cache = None
         pug_cache = (base_cache / "pugrest") if base_cache is not None else None
-        self.pug = PubChemPugClient(cache_dir=pug_cache)
+        self.pug = PubChemPugClient(cache_dir=pug_cache, max_cache_bytes=getattr(self.client, "max_cache_bytes", None))
 
     def close(self) -> None:
         try:
@@ -530,14 +552,16 @@ class PubChemRdfRestExtractor:
         return int(mt.group(1)) if mt else None
 
     def _mg_matches_taxids(self, mg_term: str, taxids: tuple[int, ...]) -> bool:
-        # Check if measuregroup participants include a matching taxonomy term.
+        # Only filter out a measuregroup when taxonomy participants are present and none match.
         parts = self.objects_for("measuregroup", mg_term, "obo:RO_0000057", cap=500)
+        saw_taxonomy = False
         for t in parts:
             if t.startswith("taxonomy:"):
+                saw_taxonomy = True
                 tid = self._extract_taxid(t)
                 if tid is not None and tid in taxids:
                     return True
-        return False
+        return not saw_taxonomy
 
     def normalize_chemical_seeds(self, chem_ids: List[str]) -> List[Dict[str, Any]]:
         """Parse and resolve chemical seed IDs into CID/SID/terms.
@@ -1382,7 +1406,7 @@ class PubChemRdfRestExtractor:
                 if taxids:
                     mg_parts_for_tax = self.objects_for("measuregroup", mg, "obo:RO_0000057", cap=500)
                     mg_tax = [t for t in mg_parts_for_tax if t.startswith("taxonomy:")]
-                    if not any((self._extract_taxid(t) in taxids) for t in mg_tax if self._extract_taxid(t) is not None):
+                    if mg_tax and not any((self._extract_taxid(t) in taxids) for t in mg_tax if self._extract_taxid(t) is not None):
                         continue
 
                 mg_id = self._term_id(mg)

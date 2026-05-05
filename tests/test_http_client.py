@@ -100,3 +100,12 @@ def test_get_text_raises_after_retries(monkeypatch: pytest.MonkeyPatch):
     client = HttpClient(max_retries=1)
     with pytest.raises(RuntimeError, match="HTTP GET failed after retries"):
         client.get_text("https://example.org")
+
+
+def test_get_json_skips_cache_write_when_budget_exceeded(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    monkeypatch.setattr(http_mod, "httpx", FakeHttpxModule([FakeResponse(status_code=200, json_data={"ok": True})]))
+    client = HttpClient(max_retries=0, cache_dir=tmp_path, max_cache_bytes=1)
+    result = client.get_json("https://example.org/api")
+    assert result == {"ok": True}
+    cache_path = client._cache_path("https://example.org/api", None, "json")
+    assert not cache_path.exists()
