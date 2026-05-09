@@ -721,6 +721,9 @@ def main(argv: Optional[List[str]] = None) -> None:
             store.save_row(row.kind, row.data)
         store.save_nodes(nodes)
         store.save_relationships(rels)
+        derived_summary = store.materialize_schema_derived_graph()
+        if derived_summary.get("enabled"):
+            log.info("Schema-derived graph additions: nodes=%d rels=%d", derived_summary.get("added_nodes", 0), derived_summary.get("added_relationships", 0))
         csv_summary = store.materialize_csv_mirrors()
         if csv_summary.get("enabled"):
             log.info("Readable CSV/Neo4j/ML mirrors written under %s", store.graph_dir)
@@ -730,8 +733,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         with Neo4jDriver(settings.neo4j) as driver:
             loader = Neo4jLoader(settings=settings, driver=driver)
             loader.ensure_schema()
-            loader.upsert_nodes(nodes)
-            loader.upsert_relationships(rels)
+            for node_file in sorted(store.nodes_dir.glob("*.jsonl")):
+                loader.upsert_nodes_iter(_iter_jsonl(node_file))
+            for rel_file in sorted(store.rels_dir.glob("*.jsonl")):
+                loader.upsert_relationships_iter(_iter_jsonl(rel_file))
         log.info("✅ Demo graph loaded.")
         return
 
@@ -948,6 +953,10 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     if settings.enabled_plugins:
         log.info("Plugin additions: nodes=%d rels=%d", plugin_node_count, plugin_rel_count)
+
+    derived_summary = store.materialize_schema_derived_graph()
+    if derived_summary.get("enabled"):
+        log.info("Schema-derived graph additions: nodes=%d rels=%d", derived_summary.get("added_nodes", 0), derived_summary.get("added_relationships", 0))
 
     csv_summary = store.materialize_csv_mirrors()
     if csv_summary.get("enabled"):

@@ -45,10 +45,10 @@ def test_to_graph_records_schema_aligned_backbone():
 
     rel_labels = {r.get("type") or r["schema_label"] for r in rels}
     assert {
-        "HAS_STRUCTURE", "HAS_PROPERTIES", "HAS_SYNONYM_SET", "HAS_NEIGHBOR_SET",
+        "HAS_STRUCTURE", "HAS_PROPERTIES", "HAS_SYNONYMS", "HAS_NEIGHBOR_SET",
         "SIMILAR_TO", "STANDARDIZED_TO", "SUBMITTED_BY", "ENCODED_BY",
-        "HAS_SOURCE", "HAS_MEASUREGROUP", "HAS_PARTICIPANT", "IN_ORGANISM",
-        "HAS_OUTPUT", "IS_ABOUT", "SUPPORTED_BY"
+        "HAS_SOURCE", "HAS_MEASURE_GROUP", "TESTED_ON", "IN_ORGANISM",
+        "HAS_ENDPOINT", "ABOUT_SUBSTANCE", "SUPPORTED_BY"
     } <= rel_labels
 
 

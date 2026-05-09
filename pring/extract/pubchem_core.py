@@ -108,7 +108,7 @@ def iter_graph_records(rows: Iterable[PubChemRow]) -> Iterator[Tuple[str, Dict]]
             }
             if _has_non_key_payload(synonym_props, "cid"):
                 node("Synonyms", {"cid": cid}, synonym_props)
-                rel("HAS_SYNONYM_SET", compound_key, {"label": "Synonyms", "key": {"cid": cid}})
+                rel("HAS_SYNONYMS", compound_key, {"label": "Synonyms", "key": {"cid": cid}})
 
             similar = _listify(d.get("similar_compounds"))
             parents = _listify(d.get("parent_compounds"))
@@ -267,11 +267,11 @@ def iter_graph_records(rows: Iterable[PubChemRow]) -> Iterator[Tuple[str, Dict]]
             })
             sid = _as_int(d.get("sid"))
             if sid is not None:
-                rel("IS_ABOUT", {"label": "Endpoint", "key": {"endpoint_id": endpoint_id}}, {"label": "Substance", "key": {"sid": sid}})
+                rel("ABOUT_SUBSTANCE", {"label": "Endpoint", "key": {"endpoint_id": endpoint_id}}, {"label": "Substance", "key": {"sid": sid}})
 
             mg_id = _as_text(d.get("mg_id"))
             if mg_id:
-                rel("HAS_OUTPUT", {"label": "MeasureGrp", "key": {"mg_id": mg_id}}, {"label": "Endpoint", "key": {"endpoint_id": endpoint_id}})
+                rel("HAS_ENDPOINT", {"label": "MeasureGrp", "key": {"mg_id": mg_id}}, {"label": "Endpoint", "key": {"endpoint_id": endpoint_id}})
 
         elif r.kind == "reference":
             reference_id, ref_props = _reference_identity(d)
@@ -327,19 +327,19 @@ def iter_graph_records(rows: Iterable[PubChemRow]) -> Iterator[Tuple[str, Dict]]
             mg_id = _as_text(d.get("mg_id"))
             aid = _as_int(d.get("aid"))
             if mg_id and aid is not None:
-                rel("HAS_MEASUREGROUP", {"label": "BioAssay", "key": {"aid": aid}}, {"label": "MeasureGrp", "key": {"mg_id": mg_id}})
+                rel("HAS_MEASURE_GROUP", {"label": "BioAssay", "key": {"aid": aid}}, {"label": "MeasureGrp", "key": {"mg_id": mg_id}})
 
         elif r.kind == "mg_protein":
             mg_id = _as_text(d.get("mg_id"))
             pid = _as_text(d.get("protein_id"))
             if mg_id and pid:
-                rel("HAS_PARTICIPANT", {"label": "MeasureGrp", "key": {"mg_id": mg_id}}, {"label": "Protein", "key": {"protein_id": pid}})
+                rel("TESTED_ON", {"label": "MeasureGrp", "key": {"mg_id": mg_id}}, {"label": "Protein", "key": {"protein_id": pid}})
 
         elif r.kind == "mg_gene":
             mg_id = _as_text(d.get("mg_id"))
             gid = _as_text(d.get("gene_id"))
             if mg_id and gid:
-                rel("HAS_PARTICIPANT", {"label": "MeasureGrp", "key": {"mg_id": mg_id}}, {"label": "Gene", "key": {"gene_id": gid}})
+                rel("TESTED_ON", {"label": "MeasureGrp", "key": {"mg_id": mg_id}}, {"label": "Gene", "key": {"gene_id": gid}})
 
         elif r.kind == "mg_organism":
             mg_id = _as_text(d.get("mg_id"))
@@ -432,6 +432,219 @@ def iter_graph_records(rows: Iterable[PubChemRow]) -> Iterator[Tuple[str, Dict]]
             textmine_id = _as_text(_first_nonempty(d, "textmine_id", "method_id"))
             if cooc_id and textmine_id:
                 rel("EXTRACTED_BY", {"label": "Cooc", "key": {"cooc_id": cooc_id}}, {"label": "TextMine", "key": {"textmine_id": textmine_id}})
+
+
+
+        elif r.kind == "uniprot":
+            acc = _as_text(_first_nonempty(d, "uniprot_acc", "accession", "acc"))
+            if not acc:
+                continue
+            node("UniProt", {"uniprot_acc": acc}, _with_raw_fields({
+                "uniprot_acc": acc,
+                "reviewed": d.get("reviewed"),
+                "isoform_count": _as_int(d.get("isoform_count")),
+                "function": d.get("function"),
+                "protein_name": _first_nonempty(d, "protein_name", "name"),
+                "organism": d.get("organism"),
+                "sequence_length": _as_int(d.get("sequence_length")),
+            }, d))
+            protein_id = _as_text(d.get("protein_id"))
+            if protein_id:
+                rel("HAS_UNIPROT_RECORD", {"label": "Protein", "key": {"protein_id": protein_id}}, {"label": "UniProt", "key": {"uniprot_acc": acc}})
+
+        elif r.kind == "go":
+            go_id = _as_text(_first_nonempty(d, "go_id", "id"))
+            if not go_id:
+                continue
+            node("GO", {"go_id": go_id}, _with_raw_fields({
+                "go_id": go_id,
+                "name": _first_nonempty(d, "name", "label"),
+                "aspect": d.get("aspect"),
+                "evidence_code": d.get("evidence_code"),
+            }, d))
+            protein_id = _as_text(d.get("protein_id"))
+            if protein_id:
+                rel("HAS_GO_ANNOTATION", {"label": "Protein", "key": {"protein_id": protein_id}}, {"label": "GO", "key": {"go_id": go_id}})
+
+        elif r.kind == "reactome":
+            reactome_id = _as_text(_first_nonempty(d, "reactome_id", "pathway_id", "id"))
+            if not reactome_id:
+                continue
+            node("Reactome", {"reactome_id": reactome_id}, _with_raw_fields({
+                "reactome_id": reactome_id,
+                "name": _first_nonempty(d, "name", "title", "label"),
+                "species": d.get("species"),
+            }, d))
+            protein_id = _as_text(d.get("protein_id"))
+            if protein_id:
+                rel("MAPS_TO_REACTOME_PATHWAY", {"label": "Protein", "key": {"protein_id": protein_id}}, {"label": "Reactome", "key": {"reactome_id": reactome_id}})
+            pathway_id = _as_text(d.get("pathway_id"))
+            if pathway_id:
+                rel("ALIGNS_TO_PATHWAY", {"label": "Reactome", "key": {"reactome_id": reactome_id}}, {"label": "Pathway", "key": {"pathway_id": pathway_id}})
+
+        elif r.kind == "interpro":
+            interpro_id = _as_text(_first_nonempty(d, "interpro_id", "id"))
+            if not interpro_id:
+                continue
+            node("InterPro", {"interpro_id": interpro_id}, _with_raw_fields({
+                "interpro_id": interpro_id,
+                "name": _first_nonempty(d, "name", "label"),
+                "type": d.get("type"),
+            }, d))
+            protein_id = _as_text(d.get("protein_id"))
+            if protein_id:
+                rel("HAS_INTERPRO_DOMAIN", {"label": "Protein", "key": {"protein_id": protein_id}}, {"label": "InterPro", "key": {"interpro_id": interpro_id}})
+
+        elif r.kind == "pdb":
+            pdb_id = _as_text(_first_nonempty(d, "pdb_id", "id"))
+            if not pdb_id:
+                continue
+            pdb_id = pdb_id.upper()
+            node("PDB", {"pdb_id": pdb_id}, _with_raw_fields({
+                "pdb_id": pdb_id,
+                "method": d.get("method"),
+                "resolution": d.get("resolution"),
+                "chain_map": d.get("chain_map"),
+            }, d))
+            protein_id = _as_text(d.get("protein_id"))
+            if protein_id:
+                rel("HAS_PDB_STRUCTURE", {"label": "Protein", "key": {"protein_id": protein_id}}, {"label": "PDB", "key": {"pdb_id": pdb_id}})
+
+        elif r.kind == "alphafold":
+            alphafold_id = _as_text(_first_nonempty(d, "alphafold_id", "id", "model_id"))
+            if not alphafold_id:
+                continue
+            node("AlphaFold", {"alphafold_id": alphafold_id}, _with_raw_fields({
+                "alphafold_id": alphafold_id,
+                "model_version": d.get("model_version"),
+                "confidence_summary": _first_nonempty(d, "confidence_summary", "plddt_summary"),
+                "storage_uri": d.get("storage_uri"),
+            }, d))
+            protein_id = _as_text(d.get("protein_id"))
+            if protein_id:
+                rel("HAS_ALPHAFOLD_MODEL", {"label": "Protein", "key": {"protein_id": protein_id}}, {"label": "AlphaFold", "key": {"alphafold_id": alphafold_id}})
+
+        elif r.kind in {"protembed", "protein_embedding"}:
+            embedding_id = _as_text(_first_nonempty(d, "embedding_id", "id"))
+            if not embedding_id:
+                continue
+            node("ProtEmbed", {"embedding_id": embedding_id}, _with_raw_fields({
+                "embedding_id": embedding_id,
+                "method": d.get("method"),
+                "dim": _as_int(d.get("dim")),
+                "storage_uri": d.get("storage_uri"),
+                "version": d.get("version"),
+            }, d))
+            uniprot_acc = _as_text(d.get("uniprot_acc"))
+            if uniprot_acc:
+                rel("HAS_PROTEIN_EMBEDDING", {"label": "UniProt", "key": {"uniprot_acc": uniprot_acc}}, {"label": "ProtEmbed", "key": {"embedding_id": embedding_id}})
+
+        elif r.kind in {"molgraph", "molecular_representation"}:
+            repr_id = _as_text(_first_nonempty(d, "repr_id", "id"))
+            cid = _as_int(d.get("cid"))
+            if not repr_id and cid is not None:
+                repr_id = f"molgraph:CID{cid}:pubchem_features_v1"
+            if not repr_id:
+                continue
+            node("MolGraph", {"repr_id": repr_id}, _with_raw_fields({
+                "repr_id": repr_id,
+                "method": d.get("method") or "pubchem_features_v1",
+                "fp_type": d.get("fp_type"),
+                "dim": _as_int(d.get("dim")),
+                "storage_uri": d.get("storage_uri"),
+                "version": d.get("version"),
+            }, d))
+            if cid is not None:
+                rel("HAS_MOLECULAR_REPRESENTATION", {"label": "Compound", "key": {"cid": cid}}, {"label": "MolGraph", "key": {"repr_id": repr_id}})
+
+        elif r.kind == "chembl":
+            chembl_id = _as_text(_first_nonempty(d, "chembl_id", "id"))
+            if not chembl_id:
+                continue
+            node("ChEMBL", {"chembl_id": chembl_id}, _with_raw_fields({
+                "chembl_id": chembl_id,
+                "entity_type": d.get("entity_type"),
+                "assay_id": d.get("assay_id"),
+                "activity_id": d.get("activity_id"),
+            }, d))
+            cid = _as_int(d.get("cid"))
+            endpoint_id = _as_text(d.get("endpoint_id"))
+            if cid is not None:
+                rel("HAS_CHEMBL_RECORD", {"label": "Compound", "key": {"cid": cid}}, {"label": "ChEMBL", "key": {"chembl_id": chembl_id}})
+            if endpoint_id:
+                rel("HARMONIZED_TO_CHEMBL", {"label": "Endpoint", "key": {"endpoint_id": endpoint_id}}, {"label": "ChEMBL", "key": {"chembl_id": chembl_id}})
+
+        elif r.kind == "bindingdb":
+            bindingdb_id = _as_text(_first_nonempty(d, "bindingdb_id", "id"))
+            if not bindingdb_id:
+                continue
+            node("BindingDB", {"bindingdb_id": bindingdb_id}, _with_raw_fields({
+                "bindingdb_id": bindingdb_id,
+                "kd": d.get("kd"),
+                "ki": d.get("ki"),
+                "ic50": d.get("ic50"),
+                "source_ref": d.get("source_ref"),
+            }, d))
+            cid = _as_int(d.get("cid"))
+            endpoint_id = _as_text(d.get("endpoint_id"))
+            if cid is not None:
+                rel("HAS_BINDINGDB_RECORD", {"label": "Compound", "key": {"cid": cid}}, {"label": "BindingDB", "key": {"bindingdb_id": bindingdb_id}})
+            if endpoint_id:
+                rel("VALIDATED_BY_BINDINGDB", {"label": "Endpoint", "key": {"endpoint_id": endpoint_id}}, {"label": "BindingDB", "key": {"bindingdb_id": bindingdb_id}})
+
+        elif r.kind == "drugbank":
+            drugbank_id = _as_text(_first_nonempty(d, "drugbank_id", "id"))
+            if not drugbank_id:
+                continue
+            node("DrugBank", {"drugbank_id": drugbank_id}, _with_raw_fields({
+                "drugbank_id": drugbank_id,
+                "name": _first_nonempty(d, "name", "label"),
+                "category": d.get("category"),
+                "mechanism": d.get("mechanism"),
+            }, d))
+            cid = _as_int(d.get("cid"))
+            protein_id = _as_text(d.get("protein_id"))
+            if cid is not None:
+                rel("HAS_DRUGBANK_RECORD", {"label": "Compound", "key": {"cid": cid}}, {"label": "DrugBank", "key": {"drugbank_id": drugbank_id}})
+            if protein_id:
+                rel("HAS_DRUGBANK_ENZYME_LINK", {"label": "Protein", "key": {"protein_id": protein_id}}, {"label": "DrugBank", "key": {"drugbank_id": drugbank_id}})
+
+        elif r.kind == "interaction":
+            interaction_id = _as_text(d.get("interaction_id"))
+            if not interaction_id:
+                cid = _as_int(d.get("cid"))
+                protein_id = _as_text(d.get("protein_id"))
+                if cid is not None and protein_id:
+                    interaction_id = make_stable_id(f"CID{cid}|{protein_id}", "interaction")
+            if not interaction_id:
+                continue
+            node("Interaction", {"interaction_id": interaction_id}, _with_raw_fields({
+                "interaction_id": interaction_id,
+                "label": d.get("label"),
+                "confidence": d.get("confidence"),
+                "evidence_count": _as_int(d.get("evidence_count")),
+                "aggregation_rule": d.get("aggregation_rule"),
+                "split": d.get("split"),
+                "created_by": d.get("created_by") or "PRING",
+            }, d))
+            cid = _as_int(d.get("cid"))
+            protein_id = _as_text(d.get("protein_id"))
+            endpoint_id = _as_text(d.get("endpoint_id"))
+            aid = _as_int(d.get("aid"))
+            reference_id = _as_text(d.get("reference_id"))
+            taxid = _as_int(d.get("taxid"))
+            if cid is not None:
+                rel("ASSERTS_CHEMICAL", {"label": "Interaction", "key": {"interaction_id": interaction_id}}, {"label": "Compound", "key": {"cid": cid}})
+            if protein_id:
+                rel("ASSERTS_TARGET", {"label": "Interaction", "key": {"interaction_id": interaction_id}}, {"label": "Protein", "key": {"protein_id": protein_id}})
+            if endpoint_id:
+                rel("SUPPORTED_BY_ENDPOINT", {"label": "Interaction", "key": {"interaction_id": interaction_id}}, {"label": "Endpoint", "key": {"endpoint_id": endpoint_id}})
+            if aid is not None:
+                rel("SUPPORTED_BY_ASSAY", {"label": "Interaction", "key": {"interaction_id": interaction_id}}, {"label": "BioAssay", "key": {"aid": aid}})
+            if reference_id:
+                rel("SUPPORTED_BY_REFERENCE", {"label": "Interaction", "key": {"interaction_id": interaction_id}}, {"label": "Reference", "key": {"reference_id": reference_id}})
+            if taxid is not None:
+                rel("SCOPED_TO_ORGANISM", {"label": "Interaction", "key": {"interaction_id": interaction_id}}, {"label": "Organism", "key": {"taxid": taxid}})
 
         while q:
             yield q.popleft()
@@ -561,3 +774,25 @@ def _compound_neighbor_target(payload: Any) -> tuple[int | None, Dict[str, Any]]
         return int(txt), _drop_none(rel_props)
     except ValueError:
         return None, _drop_none(rel_props)
+
+# NOTE: kept at end to avoid changing extraction logic. This helper is used by
+# optional/enrichment row materializers to carry through additional parsed source
+# fields as flat, Neo4j-safe properties instead of dropping them silently.
+def _with_raw_fields(props: Dict[str, Any], source: Dict[str, Any], *, prefix: str = "raw_") -> Dict[str, Any]:
+    out = dict(props or {})
+    for key, value in (source or {}).items():
+        if value is None:
+            continue
+        safe_key = re.sub(r"[^0-9A-Za-z_]+", "_", str(key)).strip("_") or "value"
+        if safe_key in out or f"{prefix}{safe_key}" in out:
+            continue
+        if isinstance(value, (dict, list, tuple, set)):
+            # Keep Neo4j properties scalar/list-of-scalars safe; nested values are
+            # still preserved losslessly in graph/rows/*.jsonl.
+            if isinstance(value, (list, tuple, set)) and all(not isinstance(x, (dict, list, tuple, set)) for x in value):
+                out[f"{prefix}{safe_key}"] = list(value)
+            else:
+                out[f"{prefix}{safe_key}"] = str(value)
+        else:
+            out[f"{prefix}{safe_key}"] = value
+    return _drop_none(out)

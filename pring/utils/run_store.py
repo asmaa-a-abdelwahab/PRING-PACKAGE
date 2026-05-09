@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
+import random
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Iterator
@@ -145,6 +147,170 @@ class RunStore:
         self._ensure_graph_budget(self._estimate_jsonl_size(r), f"relationship:{schema_label}")
         self.append_jsonl(self.rels_dir / f"{safe}.jsonl", r)
 
+    def materialize_schema_derived_graph(self, *, generate_interactions: bool = True) -> Dict[str, Any]:
+        """Add schema-required derived relationships without changing extraction.
+
+        This reads the canonical graph JSONL already produced by the extractors,
+        derives only deterministic relationships that are implied by the existing
+        evidence backbone, and appends them as normal graph artifacts before CSV
+        mirrors/Neo4j loading.
+        """
+        if not self.save_extracted:
+            return {"enabled": False}
+
+        existing_rel_keys: set[tuple[str, str, str, str]] = set()
+        mg_to_aids: dict[str, set[str]] = {}
+        mg_to_endpoints: dict[str, set[str]] = {}
+        endpoint_to_mgs: dict[str, set[str]] = {}
+        endpoint_to_substances: dict[str, set[str]] = {}
+        substance_to_compounds: dict[str, set[str]] = {}
+        mg_to_proteins: dict[str, set[str]] = {}
+        mg_to_organisms: dict[str, set[str]] = {}
+        endpoint_to_refs: dict[str, set[str]] = {}
+        compounds: set[str] = set()
+
+        for path in sorted(self.nodes_dir.glob("*.jsonl")):
+            for rec in _read_jsonl(path):
+                if (rec.get("label") or path.stem) == "Compound":
+                    compounds.add(_node_ref("Compound", rec.get("key") or {}))
+
+        for path in sorted(self.rels_dir.glob("*.jsonl")):
+            for rec in _read_jsonl(path):
+                schema_label = str(rec.get("schema_label") or rec.get("type") or path.stem)
+                start = rec.get("start") or {}
+                end = rec.get("end") or {}
+                start_ref = _node_ref(start.get("label"), start.get("key") or {})
+                end_ref = _node_ref(end.get("label"), end.get("key") or {})
+                existing_rel_keys.add((schema_label, start_ref, end_ref, _props_fingerprint(rec.get("props") or {})))
+
+                sl = str(start.get("label") or "")
+                el = str(end.get("label") or "")
+                if schema_label in {"HAS_MEASURE_GROUP", "HAS_MEASUREGROUP"} and sl == "BioAssay" and el == "MeasureGrp":
+                    mg_to_aids.setdefault(end_ref, set()).add(start_ref)
+                elif schema_label in {"HAS_ENDPOINT", "HAS_OUTPUT"} and sl == "MeasureGrp" and el == "Endpoint":
+                    mg_to_endpoints.setdefault(start_ref, set()).add(end_ref)
+                    endpoint_to_mgs.setdefault(end_ref, set()).add(start_ref)
+                elif schema_label in {"ABOUT_SUBSTANCE", "IS_ABOUT"} and sl == "Endpoint" and el == "Substance":
+                    endpoint_to_substances.setdefault(start_ref, set()).add(end_ref)
+                elif schema_label == "STANDARDIZED_TO" and sl == "Substance" and el == "Compound":
+                    substance_to_compounds.setdefault(start_ref, set()).add(end_ref)
+                elif schema_label in {"TESTED_ON", "HAS_PARTICIPANT"} and sl == "MeasureGrp" and el == "Protein":
+                    mg_to_proteins.setdefault(start_ref, set()).add(end_ref)
+                elif schema_label == "IN_ORGANISM" and sl == "MeasureGrp" and el == "Organism":
+                    mg_to_organisms.setdefault(start_ref, set()).add(end_ref)
+                elif schema_label == "SUPPORTED_BY" and sl == "Endpoint" and el == "Reference":
+                    endpoint_to_refs.setdefault(start_ref, set()).add(end_ref)
+
+        added_nodes = 0
+        added_rels = 0
+
+        def add_rel(schema_label: str, start_ref: str, end_ref: str, props: Optional[dict[str, Any]] = None) -> bool:
+            nonlocal added_rels
+            props = props or {}
+            key = (schema_label, start_ref, end_ref, _props_fingerprint(props))
+            if key in existing_rel_keys:
+                return False
+            start_label, start_key = _parse_node_ref(start_ref)
+            end_label, end_key = _parse_node_ref(end_ref)
+            self.save_relationship({
+                "schema_label": schema_label,
+                "type": schema_label,
+                "start": {"label": start_label, "key": start_key},
+                "end": {"label": end_label, "key": end_key},
+                "props": props,
+            })
+            existing_rel_keys.add(key)
+            added_rels += 1
+            return True
+
+        # BioAssay -> Reference is implied by BioAssay -> MeasureGrp -> Endpoint -> Reference.
+        for endpoint_ref, ref_refs in endpoint_to_refs.items():
+            for mg_ref in endpoint_to_mgs.get(endpoint_ref, set()):
+                for assay_ref in mg_to_aids.get(mg_ref, set()):
+                    for ref_ref in ref_refs:
+                        add_rel("DESCRIBED_BY", assay_ref, ref_ref, {"derived_by": "PRING", "source_path": "BioAssay-MeasureGrp-Endpoint-Reference"})
+
+        # Optional MolGraph feature nodes for every compound. These are lightweight
+        # modeling placeholders over parsed PubChem features and can be replaced by
+        # RDKit/fingerprint exporters later without changing the schema.
+        existing_nodes = {_node_ref((rec.get("label") or path.stem), rec.get("key") or {})
+                          for path in sorted(self.nodes_dir.glob("*.jsonl"))
+                          for rec in _read_jsonl(path)}
+        for compound_ref in sorted(compounds):
+            _, key = _parse_node_ref(compound_ref)
+            cid = key.get("cid")
+            if cid in (None, ""):
+                continue
+            repr_id = f"molgraph:CID{cid}:pubchem_features_v1"
+            mol_ref = _node_ref("MolGraph", {"repr_id": repr_id})
+            if mol_ref not in existing_nodes:
+                self.save_node({
+                    "label": "MolGraph",
+                    "key": {"repr_id": repr_id},
+                    "props": {
+                        "repr_id": repr_id,
+                        "method": "pubchem_features_v1",
+                        "version": "1",
+                        "storage_uri": "graph/ml/node_features_compound.csv",
+                    },
+                })
+                existing_nodes.add(mol_ref)
+                added_nodes += 1
+            add_rel("HAS_MOLECULAR_REPRESENTATION", compound_ref, mol_ref, {"derived_by": "PRING", "method": "pubchem_features_v1"})
+
+        if generate_interactions:
+            interaction_refs: set[str] = set()
+            for mg_ref, endpoint_refs in mg_to_endpoints.items():
+                for endpoint_ref in endpoint_refs:
+                    compound_refs = set()
+                    for substance_ref in endpoint_to_substances.get(endpoint_ref, set()):
+                        compound_refs.update(substance_to_compounds.get(substance_ref, set()))
+                    if not compound_refs:
+                        continue
+                    protein_refs = mg_to_proteins.get(mg_ref, set())
+                    if not protein_refs:
+                        continue
+                    assay_refs = mg_to_aids.get(mg_ref, set())
+                    ref_refs = endpoint_to_refs.get(endpoint_ref, set())
+                    organism_refs = mg_to_organisms.get(mg_ref, set())
+                    for compound_ref in compound_refs:
+                        for protein_ref in protein_refs:
+                            interaction_id = _stable_id(f"{compound_ref}|{protein_ref}", prefix="interaction")
+                            interaction_ref = _node_ref("Interaction", {"interaction_id": interaction_id})
+                            if interaction_ref not in interaction_refs and interaction_ref not in existing_nodes:
+                                self.save_node({
+                                    "label": "Interaction",
+                                    "key": {"interaction_id": interaction_id},
+                                    "props": {
+                                        "interaction_id": interaction_id,
+                                        "label": "curated_positive",
+                                        "confidence": 1.0,
+                                        "aggregation_rule": "PubChem evidence path: Compound<-Substance<-Endpoint<-MeasureGrp->Protein",
+                                        "created_by": "PRING",
+                                    },
+                                })
+                                existing_nodes.add(interaction_ref)
+                                added_nodes += 1
+                            interaction_refs.add(interaction_ref)
+                            add_rel("ASSERTS_CHEMICAL", interaction_ref, compound_ref)
+                            add_rel("ASSERTS_TARGET", interaction_ref, protein_ref)
+                            add_rel("SUPPORTED_BY_ENDPOINT", interaction_ref, endpoint_ref)
+                            for assay_ref in assay_refs:
+                                add_rel("SUPPORTED_BY_ASSAY", interaction_ref, assay_ref)
+                            for ref_ref in ref_refs:
+                                add_rel("SUPPORTED_BY_REFERENCE", interaction_ref, ref_ref)
+                            for organism_ref in organism_refs:
+                                add_rel("SCOPED_TO_ORGANISM", interaction_ref, organism_ref)
+
+        return {
+            "enabled": True,
+            "added_nodes": added_nodes,
+            "added_relationships": added_rels,
+            "derived_described_by": (self.rels_dir / "DESCRIBED_BY.jsonl").exists(),
+            "derived_interactions": (self.nodes_dir / "Interaction.jsonl").exists(),
+            "derived_molgraph": (self.nodes_dir / "MolGraph.jsonl").exists(),
+        }
+
     def materialize_csv_mirrors(self) -> Dict[str, Any]:
         """Create readable CSV mirrors, Neo4j import CSVs, and ML/GCN tables.
 
@@ -175,6 +341,7 @@ class RunStore:
         all_nodes: list[dict[str, Any]] = []
         node_id_by_ref: dict[str, int] = {}
         node_ref_by_key: dict[str, str] = {}
+        node_records_by_ref: dict[str, dict[str, str]] = {}
         next_node_id = 0
         for path in sorted(self.nodes_dir.glob("*.jsonl")):
             label_rows: list[dict[str, Any]] = []
@@ -199,6 +366,7 @@ class RunStore:
                 neo_rows.append(_stringify_row(neo))
 
                 node_ref_by_key[ref] = label
+                node_records_by_ref[ref] = dict(flat)
                 all_nodes.append({"node_id": node_id_by_ref[ref], "node_ref": ref, "label": label, **flat})
 
             out = self.nodes_csv_dir / f"{path.stem}.csv"
@@ -213,6 +381,7 @@ class RunStore:
         substance_to_compound: dict[str, str] = {}
         mg_to_endpoints: dict[str, set[str]] = {}
         mg_to_proteins: dict[str, set[str]] = {}
+        seen_edge_keys: set[tuple[str, str, str, str]] = set()
 
         for path in sorted(self.rels_dir.glob("*.jsonl")):
             rel_rows: list[dict[str, Any]] = []
@@ -225,6 +394,10 @@ class RunStore:
                 props = rec.get("props") or {}
                 start_ref = _node_ref(start.get("label"), start.get("key") or {})
                 end_ref = _node_ref(end.get("label"), end.get("key") or {})
+                edge_sig = (schema_label, start_ref, end_ref, _props_fingerprint(props))
+                if edge_sig in seen_edge_keys:
+                    continue
+                seen_edge_keys.add(edge_sig)
                 flat = {
                     "edge_id": len(edge_rows),
                     "schema_label": schema_label,
@@ -289,26 +462,84 @@ class RunStore:
             {"node_id": node_id, "node_ref": ref, "label": node_ref_by_key.get(ref, "")}
             for ref, node_id in sorted(node_id_by_ref.items(), key=lambda kv: kv[1])
         ]
-        _write_rows_csv(self.ml_dir / "node_mapping.csv", node_mapping_rows)
-        _write_rows_csv(self.ml_dir / "edge_index.csv", edge_rows)
+
+        relation_types = sorted({r.get("type", "") for r in edge_rows if r.get("type")})
+        relation_id_by_type = {rtype: i for i, rtype in enumerate(relation_types)}
+        for row in edge_rows:
+            row["relation_id"] = str(relation_id_by_type.get(row.get("type", ""), ""))
+            row["edge_weight"] = row.get("props_score") or row.get("props_confidence") or "1.0"
+            row["is_directed"] = "true"
+
+        relation_mapping_rows = [
+            {"relation_id": idx, "type": rtype}
+            for rtype, idx in sorted(relation_id_by_type.items(), key=lambda kv: kv[1])
+        ]
+
         pair_rows = []
+        positive_pair_keys: set[tuple[str, str]] = set()
         for (_, _), rec in sorted(positive_pairs.items()):
+            positive_pair_keys.add((rec["compound_node_ref"], rec["protein_node_ref"]))
+            split = _deterministic_split(rec["compound_node_ref"] + "|" + rec["protein_node_ref"])
             pair_rows.append({
                 "compound_node_id": rec["compound_node_id"],
                 "protein_node_id": rec["protein_node_id"],
                 "compound_node_ref": rec["compound_node_ref"],
                 "protein_node_ref": rec["protein_node_ref"],
                 "label": 1,
+                "split": split,
                 "evidence_measuregroups": " | ".join(sorted(rec["evidence_measuregroups"])),
                 "evidence_endpoints": " | ".join(sorted(rec["evidence_endpoints"])),
                 "evidence_count": len(rec["evidence_endpoints"]),
             })
+
+        compound_refs = sorted(ref for ref, lab in node_ref_by_key.items() if lab == "Compound")
+        protein_refs = sorted(ref for ref, lab in node_ref_by_key.items() if lab == "Protein")
+        negative_candidates = [
+            (c, p) for c in compound_refs for p in protein_refs
+            if (c, p) not in positive_pair_keys
+        ]
+        rng = random.Random(13)
+        rng.shuffle(negative_candidates)
+        negative_limit = len(pair_rows) if pair_rows else min(len(negative_candidates), 1000)
+        negative_rows = []
+        for compound_ref, protein_ref in negative_candidates[:negative_limit]:
+            split = _deterministic_split(compound_ref + "|" + protein_ref)
+            negative_rows.append({
+                "compound_node_id": node_id_by_ref.get(compound_ref, ""),
+                "protein_node_id": node_id_by_ref.get(protein_ref, ""),
+                "compound_node_ref": compound_ref,
+                "protein_node_ref": protein_ref,
+                "label": 0,
+                "split": split,
+                "negative_sampling_method": "unobserved_within_extracted_scope",
+                "evidence_count": 0,
+            })
+        training_pair_rows = pair_rows + negative_rows
+
+        compound_feature_rows = _build_compound_feature_rows(node_records_by_ref, node_id_by_ref)
+        protein_feature_rows = _build_protein_feature_rows(node_records_by_ref, node_id_by_ref)
+        endpoint_feature_rows = _build_endpoint_feature_rows(node_records_by_ref, node_id_by_ref)
+
+        _write_rows_csv(self.ml_dir / "node_mapping.csv", node_mapping_rows)
+        _write_rows_csv(self.ml_dir / "relation_mapping.csv", relation_mapping_rows)
+        _write_rows_csv(self.ml_dir / "edge_index.csv", edge_rows)
+        _write_rows_csv(self.ml_dir / "node_features_compound.csv", compound_feature_rows)
+        _write_rows_csv(self.ml_dir / "node_features_protein.csv", protein_feature_rows)
+        _write_rows_csv(self.ml_dir / "node_features_endpoint.csv", endpoint_feature_rows)
         _write_rows_csv(self.ml_dir / "positive_compound_target_pairs.csv", pair_rows)
+        _write_rows_csv(self.ml_dir / "negative_compound_target_pairs.csv", negative_rows)
+        _write_rows_csv(self.ml_dir / "compound_target_training_pairs.csv", training_pair_rows)
 
         summary["ml"] = {
             "node_mapping_records": len(node_mapping_rows),
+            "relation_mapping_records": len(relation_mapping_rows),
             "edge_index_records": len(edge_rows),
+            "compound_feature_records": len(compound_feature_rows),
+            "protein_feature_records": len(protein_feature_rows),
+            "endpoint_feature_records": len(endpoint_feature_rows),
             "positive_compound_target_pairs": len(pair_rows),
+            "negative_compound_target_pairs": len(negative_rows),
+            "training_pair_records": len(training_pair_rows),
         }
         summary_path = self.graph_dir / "csv_export_summary.json"
         summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -468,13 +699,13 @@ def _collect_interaction_paths(
     mg_to_endpoints: dict[str, set[str]],
     mg_to_proteins: dict[str, set[str]],
 ) -> None:
-    if schema_label == "IS_ABOUT" and start_label == "Endpoint" and end_label == "Substance":
+    if schema_label in {"ABOUT_SUBSTANCE", "IS_ABOUT"} and start_label == "Endpoint" and end_label == "Substance":
         endpoint_to_substance[start_ref] = end_ref
     elif schema_label == "STANDARDIZED_TO" and start_label == "Substance" and end_label == "Compound":
         substance_to_compound[start_ref] = end_ref
-    elif schema_label == "HAS_OUTPUT" and start_label == "MeasureGrp" and end_label == "Endpoint":
+    elif schema_label in {"HAS_ENDPOINT", "HAS_OUTPUT"} and start_label == "MeasureGrp" and end_label == "Endpoint":
         mg_to_endpoints.setdefault(start_ref, set()).add(end_ref)
-    elif schema_label == "HAS_PARTICIPANT" and start_label == "MeasureGrp" and end_label == "Protein":
+    elif schema_label in {"TESTED_ON", "HAS_PARTICIPANT"} and start_label == "MeasureGrp" and end_label == "Protein":
         mg_to_proteins.setdefault(start_ref, set()).add(end_ref)
 
 
@@ -484,3 +715,107 @@ def _sanitize_filename(s: str) -> str:
     s = s.replace(":", "-").replace("*", "-").replace("?", "-")
     s = s.replace('"', "-").replace("<", "-").replace(">", "-").replace("|", "-")
     return "_".join(s.split())[:120]
+
+
+def _deterministic_split(seed: str) -> str:
+    bucket = int(hashlib.sha1(str(seed).encode("utf-8")).hexdigest()[:8], 16) % 10
+    if bucket < 7:
+        return "train"
+    if bucket < 9:
+        return "val"
+    return "test"
+
+
+def _build_compound_feature_rows(node_records_by_ref: dict[str, dict[str, str]], node_id_by_ref: dict[str, int]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for ref, rec in sorted(node_records_by_ref.items()):
+        if rec.get("label") != "Compound":
+            continue
+        _, key = _parse_node_ref(ref)
+        cid = str(key.get("cid", ""))
+        out: dict[str, Any] = {
+            "node_id": node_id_by_ref.get(ref, ""),
+            "node_ref": ref,
+            "cid": cid,
+            "preferred_name": rec.get("props_preferred_name", ""),
+        }
+        for side_label in ["Properties", "Structure", "Synonyms", "MolGraph"]:
+            if side_label == "MolGraph":
+                side_ref = _node_ref("MolGraph", {"repr_id": f"molgraph:CID{cid}:pubchem_features_v1"})
+            else:
+                side_ref = _node_ref(side_label, {"cid": key.get("cid")})
+            side = node_records_by_ref.get(side_ref, {})
+            for k, v in side.items():
+                if k.startswith("props_") and k not in {"props_synonyms", "props_raw_neighbors"}:
+                    out[f"{side_label.lower()}_{k[6:]}"] = v
+        rows.append(out)
+    return rows
+
+
+def _build_protein_feature_rows(node_records_by_ref: dict[str, dict[str, str]], node_id_by_ref: dict[str, int]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for ref, rec in sorted(node_records_by_ref.items()):
+        if rec.get("label") != "Protein":
+            continue
+        _, key = _parse_node_ref(ref)
+        seq = rec.get("props_sequence", "") or ""
+        rows.append({
+            "node_id": node_id_by_ref.get(ref, ""),
+            "node_ref": ref,
+            "protein_id": key.get("protein_id", ""),
+            "name": rec.get("props_name", ""),
+            "taxid": rec.get("props_taxid", ""),
+            "sequence_length": len(seq),
+            "has_sequence": "true" if seq else "false",
+            "protein_type": rec.get("props_protein_type", ""),
+        })
+    return rows
+
+
+def _build_endpoint_feature_rows(node_records_by_ref: dict[str, dict[str, str]], node_id_by_ref: dict[str, int]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for ref, rec in sorted(node_records_by_ref.items()):
+        if rec.get("label") != "Endpoint":
+            continue
+        _, key = _parse_node_ref(ref)
+        rows.append({
+            "node_id": node_id_by_ref.get(ref, ""),
+            "node_ref": ref,
+            "endpoint_id": key.get("endpoint_id", ""),
+            "endpoint_type": rec.get("props_endpoint_type", ""),
+            "value": rec.get("props_value", ""),
+            "unit": rec.get("props_unit", ""),
+            "qualifier": rec.get("props_qualifier", ""),
+            "outcome_label": rec.get("props_outcome_label", ""),
+            "score": rec.get("props_score", ""),
+        })
+    return rows
+
+
+def _parse_node_ref(ref: str) -> tuple[str, dict[str, Any]]:
+    parts = str(ref or "Unknown|unknown").split("|")
+    label = parts[0] if parts else "Unknown"
+    key: dict[str, Any] = {}
+    for part in parts[1:]:
+        if "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        if v.isdigit():
+            try:
+                key[k] = int(v)
+                continue
+            except Exception:
+                pass
+        key[k] = v
+    return label or "Unknown", key
+
+
+def _props_fingerprint(props: dict[str, Any]) -> str:
+    if not props:
+        return ""
+    return json.dumps(props, sort_keys=True, ensure_ascii=False, default=str)
+
+
+def _stable_id(seed: str, prefix: str) -> str:
+    digest = hashlib.sha1(str(seed).encode("utf-8")).hexdigest()[:16]
+    return f"{prefix}:{digest}"
