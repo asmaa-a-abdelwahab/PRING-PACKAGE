@@ -721,6 +721,9 @@ def main(argv: Optional[List[str]] = None) -> None:
             store.save_row(row.kind, row.data)
         store.save_nodes(nodes)
         store.save_relationships(rels)
+        csv_summary = store.materialize_csv_mirrors()
+        if csv_summary.get("enabled"):
+            log.info("Readable CSV/Neo4j/ML mirrors written under %s", store.graph_dir)
         if not load_neo4j:
             log.info("Neo4j disabled: demo extracted (%d nodes, %d relationships) and artifacts saved in %s.", len(nodes), len(rels), run_dir)
             return
@@ -945,6 +948,16 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     if settings.enabled_plugins:
         log.info("Plugin additions: nodes=%d rels=%d", plugin_node_count, plugin_rel_count)
+
+    csv_summary = store.materialize_csv_mirrors()
+    if csv_summary.get("enabled"):
+        log.info(
+            "Readable CSV mirrors written: rows=%d node_labels=%d rel_types=%d; ML pairs=%d",
+            len(csv_summary.get("rows", {})),
+            len(csv_summary.get("nodes", {})),
+            len(csv_summary.get("relationships", {})),
+            (csv_summary.get("ml", {}) or {}).get("positive_compound_target_pairs", 0),
+        )
 
     if not load_neo4j:
         log.info("✅ Neo4j disabled: extraction artifacts saved in %s", run_dir)
