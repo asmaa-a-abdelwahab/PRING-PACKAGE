@@ -211,6 +211,115 @@ def _iter_jsonl(path: Path) -> Iterator[dict]:
             yield json.loads(line)
 
 
+def _count_jsonl_files(folder: Path) -> int:
+    total = 0
+    if not folder.exists():
+        return 0
+    for path in folder.glob("*.jsonl"):
+        with path.open("r", encoding="utf-8") as f:
+            total += sum(1 for line in f if line.strip())
+    return total
+
+
+def _validate_existing_run_dir(run_dir: Path) -> None:
+    if not run_dir.exists():
+        raise FileNotFoundError(f"Run directory does not exist: {run_dir}")
+    graph_dir = run_dir / "graph"
+    nodes_dir = graph_dir / "nodes"
+    rels_dir = graph_dir / "rels"
+    if not graph_dir.exists():
+        raise FileNotFoundError(f"Existing run has no graph/ directory: {graph_dir}")
+    if not nodes_dir.exists() or not any(nodes_dir.glob("*.jsonl")):
+        raise FileNotFoundError(f"Existing run has no node JSONL artifacts: {nodes_dir}")
+    if not rels_dir.exists() or not any(rels_dir.glob("*.jsonl")):
+        raise FileNotFoundError(f"Existing run has no relationship JSONL artifacts: {rels_dir}")
+
+
+def _load_existing_run_to_neo4j(
+    *,
+    source_run_dir: Path,
+    store: RunStore,
+    settings: Settings,
+    load_neo4j: bool,
+    rematerialize_schema: bool,
+    rematerialize_csv: bool,
+    ensure_schema: bool,
+    validate_schema: bool,
+    guard: Optional[ResourceGuard] = None,
+) -> None:
+    """Build/load Neo4j graph from an existing run folder without PubChem re-querying."""
+    _validate_existing_run_dir(source_run_dir)
+    log.info("📦 Existing run mode: source_run_dir=%s", source_run_dir)
+    log.info("No PubChem extraction will be executed; loading canonical JSONL graph artifacts from disk.")
+
+    node_count_before = _count_jsonl_files(store.nodes_dir)
+    rel_count_before = _count_jsonl_files(store.rels_dir)
+    log.info("Existing artifacts: nodes=%d relationships=%d", node_count_before, rel_count_before)
+
+    if guard is not None:
+        guard.checkpoint("load-run:start")
+
+    if rematerialize_schema:
+        derived_summary = store.materialize_schema_derived_graph()
+        if derived_summary.get("enabled"):
+            log.info(
+                "Schema-derived graph checked/materialized: added_nodes=%d added_relationships=%d",
+                derived_summary.get("added_nodes", 0),
+                derived_summary.get("added_relationships", 0),
+            )
+        if guard is not None:
+            guard.checkpoint("load-run:derived-schema")
+
+    if rematerialize_csv:
+        csv_summary = store.materialize_csv_mirrors()
+        if csv_summary.get("enabled"):
+            log.info(
+                "Readable CSV/Neo4j/ML mirrors refreshed: node_labels=%d rel_types=%d ML_training_pairs=%d",
+                len(csv_summary.get("nodes", {})),
+                len(csv_summary.get("relationships", {})),
+                (csv_summary.get("ml", {}) or {}).get("training_pair_records", 0),
+            )
+        if guard is not None:
+            guard.checkpoint("load-run:csv-ml")
+
+    node_count = _count_jsonl_files(store.nodes_dir)
+    rel_count = _count_jsonl_files(store.rels_dir)
+
+    if not load_neo4j:
+        log.info("✅ Neo4j disabled: existing run artifacts were checked/refreshed in %s", source_run_dir)
+        log.info("Final artifacts: nodes=%d relationships=%d", node_count, rel_count)
+        return
+
+    with Neo4jDriver(settings.neo4j) as driver:
+        loader = Neo4jLoader(settings=settings, driver=driver)
+        if validate_schema:
+            loader.validate_against_dot_schema()
+        if ensure_schema:
+            loader.ensure_schema()
+
+        loaded_node_files = 0
+        loaded_rel_files = 0
+        for node_file in sorted(store.nodes_dir.glob("*.jsonl")):
+            if guard is not None:
+                guard.checkpoint(f"load-run:nodes:{node_file.stem}")
+            loader.upsert_nodes_iter(_iter_jsonl(node_file))
+            loaded_node_files += 1
+        for rel_file in sorted(store.rels_dir.glob("*.jsonl")):
+            if guard is not None:
+                guard.checkpoint(f"load-run:rels:{rel_file.stem}")
+            loader.upsert_relationships_iter(_iter_jsonl(rel_file))
+            loaded_rel_files += 1
+
+    log.info(
+        "✅ Loaded existing run into Neo4j: source_run_dir=%s nodes=%d relationships=%d node_files=%d relationship_files=%d",
+        source_run_dir,
+        node_count,
+        rel_count,
+        loaded_node_files,
+        loaded_rel_files,
+    )
+
+
 
 def _append_layer_rows(rows: Iterable[PubChemRow], store: RunStore, guard: Optional[ResourceGuard] = None) -> Tuple[int, int, int]:
     row_count = 0
@@ -414,6 +523,22 @@ def build_argparser() -> argparse.ArgumentParser:
         description="Create Neo4j constraints for node keys.",
     )
     _add_shared_args(schema, default_suppress=True)
+
+    load_run = sub.add_parser(
+        "load-run",
+        help="Build/load Neo4j KG from an existing PRING run data folder without re-querying PubChem.",
+        description="Read graph/nodes/*.jsonl and graph/rels/*.jsonl from an existing run folder, optionally refresh derived schema/CSV/ML artifacts, then stream-load Neo4j.",
+    )
+    _add_shared_args(load_run, default_suppress=True)
+    load_run.add_argument("--run-dir", required=True, help="Existing PRING run directory, e.g. runs/20260509_205307.")
+    load_run.add_argument("--rematerialize-schema", type=str, choices=["true", "false"], default="true",
+                          help="Re-check/add deterministic schema-derived nodes/relationships before loading. Default: true.")
+    load_run.add_argument("--rematerialize-csv", type=str, choices=["true", "false"], default="true",
+                          help="Refresh readable CSV, Neo4j CSV, and ML/GCN exports before loading. Default: true.")
+    load_run.add_argument("--ensure-neo4j-schema", type=str, choices=["true", "false"], default="true",
+                          help="Create/ensure Neo4j uniqueness constraints before loading. Default: true.")
+    load_run.add_argument("--validate-dot-schema", type=str, choices=["true", "false"], default="true",
+                          help="Validate Settings node keys against --schema-dot when provided. Default: true.")
     return ap
 
 
@@ -476,14 +601,20 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     load_neo4j = (args.load_neo4j == "true") and (not args.dry_run)
 
-    # Run folder + logging (early)
+    # Run folder + logging (early). For load-run, reuse the existing run folder.
     run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = Path(args.out_dir) / run_id
+    if getattr(args, "cmd", None) == "load-run":
+        run_dir = Path(args.run_dir)
+        # load-run should be able to refresh CSV/ML mirrors even under resource-profile low.
+        save_csv_mirrors = (getattr(args, "rematerialize_csv", "true") == "true") or settings.resources.write_csv_mirrors
+    else:
+        run_dir = Path(args.out_dir) / run_id
+        save_csv_mirrors = settings.resources.write_csv_mirrors
     store = RunStore(
         run_dir=run_dir,
         save_raw=settings.save_raw_http_cache,
         save_extracted=settings.save_extracted_artifacts,
-        save_csv_mirrors=settings.resources.write_csv_mirrors,
+        save_csv_mirrors=save_csv_mirrors,
         max_graph_bytes=_mb_to_bytes(settings.resources.max_graph_artifact_mb),
     )
     log_path = setup_logging(
@@ -693,6 +824,21 @@ def main(argv: Optional[List[str]] = None) -> None:
     if getattr(args, "drugbank_file", None):
         enrichment_overrides["drugbank_file"] = Path(args.drugbank_file)
     settings = settings.with_overrides(**enrichment_overrides)
+
+    if args.cmd == "load-run":
+        guard = ResourceGuard.from_settings(settings)
+        _load_existing_run_to_neo4j(
+            source_run_dir=Path(args.run_dir),
+            store=store,
+            settings=settings,
+            load_neo4j=load_neo4j,
+            rematerialize_schema=(args.rematerialize_schema == "true"),
+            rematerialize_csv=(args.rematerialize_csv == "true"),
+            ensure_schema=(args.ensure_neo4j_schema == "true"),
+            validate_schema=(args.validate_dot_schema == "true"),
+            guard=guard,
+        )
+        return
 
     if args.cmd == "schema":
         if not load_neo4j:

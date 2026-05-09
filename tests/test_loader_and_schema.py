@@ -132,3 +132,44 @@ def test_loader_upsert_relationships_requires_known_endpoint_keys():
             "end": {"label": "Structure", "key": {"cid": 1}},
             "props": {},
         }])
+
+
+def test_loader_serializes_nested_properties_for_neo4j():
+    driver = RecordingDriver()
+    loader = Neo4jLoader(settings=_settings(batch_size=1), driver=driver)
+    loader.upsert_nodes([
+        {
+            "label": "Compound",
+            "key": {"cid": 1},
+            "props": {
+                "name": "demo",
+                "similar_compounds": [
+                    {"cid": 2, "threshold": 90, "method": "fastsimilarity_2d"}
+                ],
+                "synonyms": ["a", "b"],
+                "drop_null": None,
+            },
+        }
+    ])
+    row = driver.executed[0][1]["rows"][0]
+    assert isinstance(row["props"]["similar_compounds"], str)
+    assert "fastsimilarity_2d" in row["props"]["similar_compounds"]
+    assert row["props"]["synonyms"] == ["a", "b"]
+    assert "drop_null" not in row["props"]
+
+
+def test_loader_serializes_nested_relationship_properties_for_neo4j():
+    driver = RecordingDriver()
+    loader = Neo4jLoader(settings=_settings(batch_size=1), driver=driver)
+    loader.upsert_relationships([
+        {
+            "type": "SIMILAR_TO",
+            "start": {"label": "Compound", "key": {"cid": 1}, "props": {"meta": {"source": "x"}}},
+            "end": {"label": "Compound", "key": {"cid": 2}, "props": {}},
+            "props": {"details": {"threshold": 90, "method": "fastsimilarity_2d"}},
+        }
+    ])
+    row = driver.executed[0][1]["rows"][0]
+    assert isinstance(row["start"]["props"]["meta"], str)
+    assert isinstance(row["props"]["details"], str)
+    assert "threshold" in row["props"]["details"]

@@ -19,6 +19,95 @@ def _merge_map_expr(keys: Tuple[str, ...], row_access: str) -> str:
     return "{" + parts + "}"
 
 
+def _neo4j_safe_scalar(value: Any) -> Any:
+    """Return a Neo4j-property-safe representation of a scalar-like value.
+
+    Neo4j properties may only be primitive values or arrays of primitive values.
+    The graph artifacts intentionally keep richer Python/JSON objects for lossless
+    exports, but those objects must be serialized before being sent to Neo4j.
+    """
+    import json
+
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (dict, tuple, list, set)):
+        try:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        except TypeError:
+            return json.dumps(str(value), ensure_ascii=False)
+    return str(value)
+
+
+def _neo4j_safe_list(values: list[Any]) -> Any:
+    """Return a Neo4j-safe list or a JSON string when the list is nested/mixed."""
+    import json
+
+    cleaned = [v for v in values if v is not None]
+    if not cleaned:
+        return []
+    if all(isinstance(v, (str, int, float, bool)) for v in cleaned):
+        # Neo4j is safest with homogeneous arrays. Permit numeric int/float mixes,
+        # otherwise serialize mixed primitive lists to retain content safely.
+        kinds = {bool if isinstance(v, bool) else float if isinstance(v, float) else int if isinstance(v, int) else str for v in cleaned}
+        numeric = kinds.issubset({int, float})
+        if len(kinds) == 1 or numeric:
+            return cleaned
+    try:
+        return json.dumps(values, ensure_ascii=False, sort_keys=True, default=str)
+    except TypeError:
+        return json.dumps([str(v) for v in values], ensure_ascii=False)
+
+
+def _neo4j_safe_value(value: Any) -> Any:
+    """Convert any artifact value into a Neo4j property-safe value.
+
+    Primitive values are kept. Primitive homogeneous lists are kept. Nested dicts,
+    lists of dicts, and mixed/nested arrays are serialized to JSON strings so no
+    retrieved data is silently lost during Neo4j loading.
+    """
+    if isinstance(value, list):
+        return _neo4j_safe_list(value)
+    return _neo4j_safe_scalar(value)
+
+
+def _sanitize_property_map(props: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Drop nulls and convert nested values to Neo4j-safe property values."""
+    out: Dict[str, Any] = {}
+    for k, v in (props or {}).items():
+        safe = _neo4j_safe_value(v)
+        # Neo4j does not store null properties. Keeping null inside SET += can
+        # remove properties, so skip nulls explicitly.
+        if safe is None:
+            continue
+        out[str(k)] = safe
+    return out
+
+
+def _sanitize_node_record(node: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        **node,
+        "key": _sanitize_property_map(node.get("key") or {}),
+        "props": _sanitize_property_map(node.get("props") or {}),
+    }
+
+
+def _sanitize_relationship_record(rel: Dict[str, Any]) -> Dict[str, Any]:
+    start = dict(rel.get("start") or {})
+    end = dict(rel.get("end") or {})
+    start["key"] = _sanitize_property_map(start.get("key") or {})
+    start["props"] = _sanitize_property_map(start.get("props") or {})
+    end["key"] = _sanitize_property_map(end.get("key") or {})
+    end["props"] = _sanitize_property_map(end.get("props") or {})
+    return {
+        **rel,
+        "start": start,
+        "end": end,
+        "props": _sanitize_property_map(rel.get("props") or {}),
+    }
+
+
 @dataclass
 class Neo4jLoader:
     settings: Settings
@@ -80,7 +169,8 @@ SET n += row.props
             label = n.get("label")
             if not label:
                 continue
-            buffers.setdefault(label, []).append(n)
+            safe_n = _sanitize_node_record(n)
+            buffers.setdefault(label, []).append(safe_n)
             if len(buffers[label]) >= self.settings.batch_size:
                 flush(label)
 
@@ -129,7 +219,8 @@ SET r += coalesce(row.props, {{}})
             if not (sl and el):
                 continue
             key = (rtype, sl, el)
-            buffers.setdefault(key, []).append(r)
+            safe_r = _sanitize_relationship_record(r)
+            buffers.setdefault(key, []).append(safe_r)
             if len(buffers[key]) >= self.settings.batch_size:
                 flush(key)
 
