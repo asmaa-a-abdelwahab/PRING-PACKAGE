@@ -17,7 +17,9 @@ PLUGIN_ALIASES: Dict[str, str] = {
     "pdb": "pring.plugins.pdb:get_plugin",
     "alphafold": "pring.plugins.alphafold:get_plugin",
     "embeddings": "pring.plugins.embeddings:get_plugin",
+    "protembed": "pring.plugins.embeddings:get_plugin",
     "molgraph": "pring.plugins.molgraph:get_plugin",
+    "all": "pring.plugins.external:make_all_plugin",
 }
 
 

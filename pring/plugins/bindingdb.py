@@ -1,17 +1,5 @@
 from __future__ import annotations
+from .external import make_plugin
 
-from typing import Any, Iterator
-
-from .base import BasePlugin, GraphDelta
-
-
-class BindingDBPlugin(BasePlugin):
-    name = "bindingdb"
-
-    def run(self, settings: Any) -> Iterator[GraphDelta]:
-        # TODO: implement enrichment and yield GraphDelta(nodes=[...], rels=[...])
-        return iter(())
-
-
-def get_plugin() -> BasePlugin:
-    return BindingDBPlugin()
+def get_plugin():
+    return make_plugin("bindingdb", name="bindingdb")

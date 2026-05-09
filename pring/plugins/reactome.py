@@ -1,17 +1,5 @@
 from __future__ import annotations
+from .external import make_plugin
 
-from typing import Any, Iterator
-
-from .base import BasePlugin, GraphDelta
-
-
-class ReactomePlugin(BasePlugin):
-    name = "reactome"
-
-    def run(self, settings: Any) -> Iterator[GraphDelta]:
-        # TODO: implement enrichment and yield GraphDelta(nodes=[...], rels=[...])
-        return iter(())
-
-
-def get_plugin() -> BasePlugin:
-    return ReactomePlugin()
+def get_plugin():
+    return make_plugin("reactome", name="reactome")

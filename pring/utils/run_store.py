@@ -741,10 +741,17 @@ def _build_compound_feature_rows(node_records_by_ref: dict[str, dict[str, str]],
         }
         for side_label in ["Properties", "Structure", "Synonyms", "MolGraph"]:
             if side_label == "MolGraph":
-                side_ref = _node_ref("MolGraph", {"repr_id": f"molgraph:CID{cid}:pubchem_features_v1"})
+                side_ref_candidates = [
+                    _node_ref("MolGraph", {"repr_id": f"molgraph:CID{cid}:pubchem_descriptors_v1"}),
+                    _node_ref("MolGraph", {"repr_id": f"molgraph:CID{cid}:pubchem_features_v1"}),
+                ]
             else:
-                side_ref = _node_ref(side_label, {"cid": key.get("cid")})
-            side = node_records_by_ref.get(side_ref, {})
+                side_ref_candidates = [_node_ref(side_label, {"cid": key.get("cid")})]
+            side = {}
+            for side_ref in side_ref_candidates:
+                side = node_records_by_ref.get(side_ref, {})
+                if side:
+                    break
             for k, v in side.items():
                 if k.startswith("props_") and k not in {"props_synonyms", "props_raw_neighbors"}:
                     out[f"{side_label.lower()}_{k[6:]}"] = v
@@ -758,18 +765,37 @@ def _build_protein_feature_rows(node_records_by_ref: dict[str, dict[str, str]], 
         if rec.get("label") != "Protein":
             continue
         _, key = _parse_node_ref(ref)
+        protein_id = str(key.get("protein_id", ""))
         seq = rec.get("props_sequence", "") or ""
-        rows.append({
+        acc = _uniprot_acc_from_protein_id(protein_id)
+        uniprot = node_records_by_ref.get(_node_ref("UniProt", {"uniprot_acc": acc}), {}) if acc else {}
+        embed = node_records_by_ref.get(_node_ref("ProtEmbed", {"embedding_id": f"protembed:{acc}:aa_composition_v1"}), {}) if acc else {}
+        out = {
             "node_id": node_id_by_ref.get(ref, ""),
             "node_ref": ref,
-            "protein_id": key.get("protein_id", ""),
-            "name": rec.get("props_name", ""),
-            "taxid": rec.get("props_taxid", ""),
-            "sequence_length": len(seq),
+            "protein_id": protein_id,
+            "name": rec.get("props_name", "") or uniprot.get("props_protein_name", ""),
+            "taxid": rec.get("props_taxid", "") or uniprot.get("props_taxid", ""),
+            "uniprot_acc": acc or "",
+            "uniprot_reviewed": uniprot.get("props_reviewed", ""),
+            "uniprot_sequence_length": uniprot.get("props_sequence_length", ""),
+            "sequence_length": len(seq) if seq else uniprot.get("props_sequence_length", ""),
             "has_sequence": "true" if seq else "false",
             "protein_type": rec.get("props_protein_type", ""),
-        })
+        }
+        for source_name, side in [("uniprot", uniprot), ("protembed", embed)]:
+            for k, v in side.items():
+                if k.startswith("props_") and k not in {"props_function", "props_raw"}:
+                    out[f"{source_name}_{k[6:]}"] = v
+        rows.append(out)
     return rows
+
+
+def _uniprot_acc_from_protein_id(protein_id: str) -> str:
+    text = str(protein_id or "").strip().upper()
+    if text.startswith("ACC"):
+        return text[3:]
+    return text
 
 
 def _build_endpoint_feature_rows(node_records_by_ref: dict[str, dict[str, str]], node_id_by_ref: dict[str, int]) -> list[dict[str, Any]]:

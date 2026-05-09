@@ -372,9 +372,21 @@ def _add_shared_args(parser: argparse.ArgumentParser, *, default_suppress: bool 
     parser.add_argument("--console-log-level", type=str, default=argparse.SUPPRESS if default_suppress else "INFO", help="Console log level (INFO/WARNING/ERROR).")
     parser.add_argument("--file-log-level", type=str, default=argparse.SUPPRESS if default_suppress else "DEBUG", help="Log file level (DEBUG/INFO/WARNING/ERROR).")
 
-    # Plugins
+    # Plugins / external enrichment
     parser.add_argument("--plugins", nargs="*", default=default,
-                        help="Plugin names (e.g., molgraph embeddings uniprot) or full paths (module:callable).")
+                        help="Plugin names (e.g., uniprot go reactome interpro pdb alphafold embeddings molgraph chembl bindingdb drugbank, or all) or full paths (module:callable).")
+    parser.add_argument("--enrichment-timeout-s", type=float, default=default,
+                        help="HTTP timeout seconds for external enrichment plugins. Default: 45.")
+    parser.add_argument("--enrichment-max-retries", type=int, default=default,
+                        help="Retry count for external enrichment HTTP requests. Default: 1.")
+    parser.add_argument("--enrichment-min-delay-s", type=float, default=default,
+                        help="Minimum delay between external enrichment HTTP requests. Default: 0.25.")
+    parser.add_argument("--max-enrichment-records-per-entity", type=str, default=default,
+                        help="Maximum external records to add per compound/protein for each layer; use none for unbounded. Default: 50.")
+    parser.add_argument("--bindingdb-file", type=str, default=default,
+                        help="Optional local BindingDB CSV/TSV mapping file for BindingDB enrichment.")
+    parser.add_argument("--drugbank-file", type=str, default=default,
+                        help="Optional local DrugBank CSV/TSV mapping file. DrugBank online API requires licensed/authenticated access, so PRING imports local mappings.")
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -664,10 +676,23 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     settings = settings.with_overrides(flags=flags, caps=caps, textmining_file=textmining_file, compound_similarity_method=similarity_method, compound_similarity_threshold=similarity_threshold)
 
-    # Plugins
+    # Plugins / external enrichment
     plugin_args = args.plugins or []
     plugin_paths = normalize_plugin_list(plugin_args)
-    settings = settings.with_overrides(enabled_plugins=plugin_paths)
+    enrichment_overrides = {"enabled_plugins": plugin_paths}
+    if getattr(args, "enrichment_timeout_s", None) is not None:
+        enrichment_overrides["enrichment_timeout_s"] = float(args.enrichment_timeout_s)
+    if getattr(args, "enrichment_max_retries", None) is not None:
+        enrichment_overrides["enrichment_max_retries"] = int(args.enrichment_max_retries)
+    if getattr(args, "enrichment_min_delay_s", None) is not None:
+        enrichment_overrides["enrichment_min_delay_s"] = float(args.enrichment_min_delay_s)
+    if getattr(args, "max_enrichment_records_per_entity", None) is not None:
+        enrichment_overrides["max_enrichment_records_per_entity"] = _parse_int_or_none(args.max_enrichment_records_per_entity)
+    if getattr(args, "bindingdb_file", None):
+        enrichment_overrides["bindingdb_file"] = Path(args.bindingdb_file)
+    if getattr(args, "drugbank_file", None):
+        enrichment_overrides["drugbank_file"] = Path(args.drugbank_file)
+    settings = settings.with_overrides(**enrichment_overrides)
 
     if args.cmd == "schema":
         if not load_neo4j:
@@ -715,6 +740,8 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "log_file": str(log_path),
                 "cache_dir": str(settings.cache_dir),
                 "textmining_file": str(settings.textmining_file) if settings.textmining_file else None,
+                "bindingdb_file": str(settings.bindingdb_file) if getattr(settings, "bindingdb_file", None) else None,
+                "drugbank_file": str(settings.drugbank_file) if getattr(settings, "drugbank_file", None) else None,
             },
         })
         for row in rows:
@@ -790,6 +817,8 @@ def main(argv: Optional[List[str]] = None) -> None:
             "log_file": str(log_path),
             "cache_dir": str(settings.cache_dir),
             "textmining_file": str(settings.textmining_file) if settings.textmining_file else None,
+            "bindingdb_file": str(settings.bindingdb_file) if getattr(settings, "bindingdb_file", None) else None,
+            "drugbank_file": str(settings.drugbank_file) if getattr(settings, "drugbank_file", None) else None,
         },
     })
     log.info("Run dir: %s", run_dir)
@@ -940,19 +969,33 @@ def main(argv: Optional[List[str]] = None) -> None:
             row_count += sim_rows
             log.info("Compound similarity layer: source_compounds=%d rows=%d nodes=%d rels=%d", len(cids), sim_rows, sim_nodes, sim_rels)
 
+    plugin_row_count = 0
     plugin_node_count = 0
     plugin_rel_count = 0
     for plugin in load_plugins(settings.enabled_plugins):
         if not plugin.enabled(settings):
             continue
+        iter_rows = getattr(plugin, "iter_rows", None)
+        if callable(iter_rows):
+            r_count, n_count, rel_count_plugin = _append_layer_rows(iter_rows(settings, store), store, guard)
+            plugin_row_count += r_count
+            plugin_node_count += n_count
+            plugin_rel_count += rel_count_plugin
+            row_count += r_count
+            node_count += n_count
+            rel_count += rel_count_plugin
+            log.info("Plugin layer %s: rows=%d nodes=%d rels=%d", getattr(plugin, "name", "plugin"), r_count, n_count, rel_count_plugin)
+            continue
         for delta in plugin.run(settings):
             plugin_node_count += len(delta.nodes)
             plugin_rel_count += len(delta.rels)
+            node_count += len(delta.nodes)
+            rel_count += len(delta.rels)
             store.save_nodes(delta.nodes)
             store.save_relationships(delta.rels)
 
     if settings.enabled_plugins:
-        log.info("Plugin additions: nodes=%d rels=%d", plugin_node_count, plugin_rel_count)
+        log.info("Plugin additions: rows=%d nodes=%d rels=%d", plugin_row_count, plugin_node_count, plugin_rel_count)
 
     derived_summary = store.materialize_schema_derived_graph()
     if derived_summary.get("enabled"):

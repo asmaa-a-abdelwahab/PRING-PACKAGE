@@ -150,6 +150,12 @@ class Settings:
     textmining_file: Optional[Path] = None
     compound_similarity_method: str = "2d"
     compound_similarity_threshold: int = 90
+    enrichment_timeout_s: float = 45.0
+    enrichment_max_retries: int = 1
+    enrichment_min_delay_s: float = 0.25
+    max_enrichment_records_per_entity: Optional[int] = 50
+    bindingdb_file: Optional[Path] = None
+    drugbank_file: Optional[Path] = None
 
     def with_overrides(self, **kwargs: Any) -> "Settings":
         return replace(self, **kwargs)
@@ -224,6 +230,8 @@ class Settings:
             max_workers=int(os.getenv("PRING_MAX_WORKERS", "1")),
         )
         textmining_file = os.getenv("PRING_TEXTMINING_FILE")
+        bindingdb_file = os.getenv("PRING_BINDINGDB_FILE")
+        drugbank_file = os.getenv("PRING_DRUGBANK_FILE")
 
         return Settings(
             neo4j=neo,
@@ -244,6 +252,12 @@ class Settings:
             textmining_file=Path(textmining_file) if textmining_file else None,
             compound_similarity_method=os.getenv("PRING_COMPOUND_SIMILARITY_METHOD", "2d"),
             compound_similarity_threshold=int(os.getenv("PRING_COMPOUND_SIMILARITY_THRESHOLD", "90")),
+            enrichment_timeout_s=float(os.getenv("PRING_ENRICHMENT_TIMEOUT_S", "45.0")),
+            enrichment_max_retries=int(os.getenv("PRING_ENRICHMENT_MAX_RETRIES", "1")),
+            enrichment_min_delay_s=float(os.getenv("PRING_ENRICHMENT_MIN_DELAY_S", "0.25")),
+            max_enrichment_records_per_entity=_int_or_none(os.getenv("PRING_MAX_ENRICHMENT_RECORDS_PER_ENTITY"), 50),
+            bindingdb_file=Path(bindingdb_file) if bindingdb_file else None,
+            drugbank_file=Path(drugbank_file) if drugbank_file else None,
         )
 
 
