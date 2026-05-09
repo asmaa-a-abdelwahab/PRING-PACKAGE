@@ -108,9 +108,32 @@ class SparqlMirrorClient:
     def close(self) -> None:
         self.http.close()
 
-    def select(self, query: str) -> List[Dict[str, Any]]:
+    def select(
+        self,
+        query: str,
+        *,
+        timeout_s: Optional[float] = None,
+        max_retries: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
         """Run SELECT query and return SPARQL JSON bindings."""
-        data = self.http.post_json(self.cfg.endpoint_url, data={"query": query}, headers={"Accept": "application/sparql-results+json"})
+        try:
+            data = self.http.post_json(
+                self.cfg.endpoint_url,
+                data={"query": query},
+                headers={"Accept": "application/sparql-results+json"},
+                timeout_s=timeout_s,
+                max_retries=max_retries,
+            )
+        except TypeError as type_error:
+            # Keep compatibility with tests or external callers that monkeypatch
+            # HttpClient with a minimal post_json(url, data, headers) object.
+            if "timeout_s" not in str(type_error) and "max_retries" not in str(type_error):
+                raise
+            data = self.http.post_json(
+                self.cfg.endpoint_url,
+                data={"query": query},
+                headers={"Accept": "application/sparql-results+json"},
+            )
         return ((data.get("results") or {}).get("bindings") or [])
 
 
@@ -122,7 +145,7 @@ class PubChemSparqlMirrorExtractor:
     """
 
     client: SparqlMirrorClient
-    page_size: int = 200
+    page_size: int = 25
 
     def close(self) -> None:
         return
@@ -366,26 +389,53 @@ SELECT DISTINCT ?protein ?gene WHERE {{
     def _select_evidence_rows_for_measuregroups(self, mgs: List[str], caps: BuildCaps, flags: BuildFlags,
                                                 restrict_compounds: Optional[Set[str]] = None,
                                                 restrict_proteins: Optional[Set[str]] = None) -> List[Dict[str, Any]]:
-        """Return denormalized evidence rows for a chunk of measuregroups.
+        """Return denormalized evidence rows for one measuregroup chunk.
 
-        - MeasureGroup participants may include a Protein OR a Gene.
-        - If only a Gene is present, map it to Protein via up:encodedBy.
-        - Taxonomy filtering applies to the resolved protein's up:organism.
+        This intentionally keeps the original/legacy PRING SPARQL evidence
+        shape instead of using a nested subquery.  The nested subquery version
+        reduced local row volume but proved slower on the IDSM public mirror for
+        some PubChem measuregroups because the server could not stream results
+        early enough.  Resource controls are therefore applied around the
+        original evidence query shape, while optional blocks are included only
+        when requested by flags.
         """
-        out: List[Dict[str, Any]] = []
         if not mgs:
-            return out
+            return []
 
         mg_values = " ".join(mgs)
 
         compound_filter = ""
-        protein_filter = ""
         if restrict_compounds:
             comp_vals = " ".join(sorted(restrict_compounds))
-            compound_filter = f"\n  VALUES ?compound {{ {comp_vals} }}"
+            compound_filter = f"\n            VALUES ?compound {{ {comp_vals} }}"
+
+        # Keep the participant pattern bounded. The older query used an
+        # OPTIONAL protein-from-gene join where ?geneTarget could be unbound,
+        # which can explode on public SPARQL engines.
         if restrict_proteins:
             prot_vals = " ".join(sorted(restrict_proteins))
-            protein_filter = f"\n  VALUES ?protein {{ {prot_vals} }}"
+            participant_clause = f"""
+            VALUES ?protein {{ {prot_vals} }}
+            ?mg obo:RO_0000057 ?protein .
+            OPTIONAL {{ ?protein up:encodedBy ?gene }}
+            OPTIONAL {{
+                ?mg obo:RO_0000057 ?geneTarget .
+                FILTER(STRSTARTS(STR(?geneTarget), STR(gene:)))
+            }}"""
+        else:
+            participant_clause = """
+            {
+                ?mg obo:RO_0000057 ?protein .
+                FILTER(STRSTARTS(STR(?protein), STR(protein:)))
+                OPTIONAL { ?protein up:encodedBy ?gene }
+            }
+            UNION
+            {
+                ?mg obo:RO_0000057 ?geneTarget .
+                FILTER(STRSTARTS(STR(?geneTarget), STR(gene:)))
+                ?protein up:encodedBy ?geneTarget .
+                OPTIONAL { ?protein up:encodedBy ?gene }
+            }"""
 
         tax_clause = self._tax_filter_on_var("?protein", "?pTax", flags)
 
@@ -393,11 +443,55 @@ SELECT DISTINCT ?protein ?gene WHERE {{
         if caps.max_endpoints_per_pair:
             row_limit = int(caps.max_endpoints_per_pair) * max(1, len(mgs))
 
+        select_gene = "\n                ?geneTarget ?gname ?gsNode ?gsym"
+        # Keep dependent OPTIONAL patterns nested under the pattern that binds
+        # their variable.  Separate OPTIONALs on an unbound variable can become
+        # broad graph scans on public SPARQL endpoints.
+        gene_clauses = """
+            OPTIONAL {
+                ?mg obo:RO_0000057 ?geneTarget .
+                FILTER(STRSTARTS(STR(?geneTarget), STR(gene:)))
+                OPTIONAL { ?geneTarget skos:prefLabel ?gname }
+                OPTIONAL { ?geneTarget rdfs:label ?gname }
+                OPTIONAL {
+                    ?geneTarget bao:BAO_0002870 ?gsNode .
+                    OPTIONAL { ?gsNode skos:prefLabel ?gsym }
+                }
+            }"""
+
+        select_context = ""
+        context_clauses = ""
+        if getattr(flags, "include_optional_context", True):
+            select_context = "\n                ?cell ?anat"
+            context_clauses = """
+            OPTIONAL {
+                ?mg obo:RO_0000057 ?cell .
+                FILTER(STRSTARTS(STR(?cell), STR(cell:)))
+                OPTIONAL { ?cell obo:RO_0001000 ?anat }
+            }"""
+
+        select_metadata = ""
+        metadata_clauses = ""
+        if getattr(flags, "include_endpoint_metadata", True):
+            select_metadata = "\n                ?value ?unit ?qual ?outcome ?eplabel"
+            metadata_clauses = """
+            OPTIONAL { ?endpoint sio:SIO_000300 ?value }
+            OPTIONAL { ?endpoint sio:SIO_000221 ?unit }
+            OPTIONAL { ?endpoint vocab:hasQualifier ?qual }
+            OPTIONAL { ?endpoint vocab:PubChemAssayOutcome ?outcome }
+            OPTIONAL { ?endpoint rdfs:label ?eplabel }"""
+
+        select_ref = ""
+        ref_clause = ""
+        if getattr(flags, "include_endpoint_references", False):
+            select_ref = " ?ref"
+            ref_clause = "\n            OPTIONAL { ?endpoint cito:citesAsDataSource ?ref }"
+
+        limit_clause = f"\nLIMIT {row_limit}" if row_limit else ""
+
         q = f"""{SPARQL_PREFIXES}
             SELECT ?mg ?bioassay ?baname ?endpoint ?sub ?compound ?protein ?tax
-                ?geneTarget ?gname ?gsNode ?gsym
-                ?cell ?anat
-                ?value ?unit ?qual ?outcome ?eplabel ?ref
+                {select_gene}{select_context}{select_metadata}{select_ref}
                 ?pname ?seq ?gene
                 ?cname ?smiles ?inchikey ?inchi ?formula ?mw ?xlogp3 ?tpsa
                 ?source
@@ -408,39 +502,19 @@ SELECT DISTINCT ?protein ?gene WHERE {{
             ?sub sio:CHEMINF_000477 ?compound .
             {compound_filter}
 
-            OPTIONAL {{
-                ?mg obo:RO_0000057 ?proteinDirect .
-                FILTER(STRSTARTS(STR(?proteinDirect), STR(protein:)))
-            }}
-            OPTIONAL {{
-                ?mg obo:RO_0000057 ?geneTarget .
-                FILTER(STRSTARTS(STR(?geneTarget), STR(gene:)))
-            }}
-            OPTIONAL {{ ?proteinFromGene up:encodedBy ?geneTarget . }}
-            BIND(COALESCE(?proteinDirect, ?proteinFromGene) AS ?protein)
-            FILTER(BOUND(?protein))
-            {protein_filter}
+            {participant_clause}
             {tax_clause}
 
             OPTIONAL {{ ?mg obo:RO_0000057 ?tax . FILTER(STRSTARTS(STR(?tax), STR(taxonomy:))) }}
-            OPTIONAL {{ ?bioassay bao:BAO_0000209 ?mg }}
-            OPTIONAL {{ ?bioassay skos:prefLabel ?baname }}
-            OPTIONAL {{ ?bioassay rdfs:label ?baname }}
-
-            OPTIONAL {{ ?geneTarget skos:prefLabel ?gname }}
-            OPTIONAL {{ ?geneTarget rdfs:label ?gname }}
-            OPTIONAL {{ ?geneTarget bao:BAO_0002870 ?gsNode }}
-            OPTIONAL {{ ?gsNode skos:prefLabel ?gsym }}
-
-            OPTIONAL {{ ?mg obo:RO_0000057 ?cell . FILTER(STRSTARTS(STR(?cell), STR(cell:))) }}
-            OPTIONAL {{ ?cell obo:RO_0001000 ?anat }}
-
-            OPTIONAL {{ ?endpoint sio:SIO_000300 ?value }}
-            OPTIONAL {{ ?endpoint sio:SIO_000221 ?unit }}
-            OPTIONAL {{ ?endpoint vocab:hasQualifier ?qual }}
-            OPTIONAL {{ ?endpoint vocab:PubChemAssayOutcome ?outcome }}
-            OPTIONAL {{ ?endpoint rdfs:label ?eplabel }}
-            OPTIONAL {{ ?endpoint cito:citesAsDataSource ?ref }}
+            OPTIONAL {{
+                ?bioassay bao:BAO_0000209 ?mg .
+                OPTIONAL {{ ?bioassay skos:prefLabel ?baname }}
+                OPTIONAL {{ ?bioassay rdfs:label ?baname }}
+            }}
+            {gene_clauses}
+            {context_clauses}
+            {metadata_clauses}
+            {ref_clause}
             OPTIONAL {{ ?sub dcterms:source ?source }}
 
             OPTIONAL {{ ?protein skos:prefLabel ?pname }}
@@ -455,96 +529,72 @@ SELECT DISTINCT ?protein ?gene WHERE {{
             OPTIONAL {{ ?compound vocab:molecular_weight ?mw }}
             OPTIONAL {{ ?compound vocab:xlogp3 ?xlogp3 }}
             OPTIONAL {{ ?compound vocab:tpsa ?tpsa }}
-            }}"""
-        if row_limit:
-            q += f"\nLIMIT {row_limit}"
-            rows = self.client.select(q)
-            out.extend(rows)
-            return out
+            }}{limit_clause}"""
 
-        mg_values = " ".join(mgs)
-        # Optional intersection filters
-        compound_filter = ""
-        protein_filter = ""
-        if restrict_compounds:
-            comp_vals = " ".join(sorted(restrict_compounds))
-            compound_filter = f"\n  VALUES ?compound {{ {comp_vals} }}"
-        if restrict_proteins:
-            prot_vals = " ".join(sorted(restrict_proteins))
-            protein_filter = f"\n  VALUES ?protein {{ {prot_vals} }}"
+        cfg = getattr(self.client, "cfg", SparqlConfig())
+        return list(self.client.select(
+            q,
+            timeout_s=getattr(cfg, "evidence_timeout_s", None),
+            max_retries=getattr(cfg, "evidence_max_retries", None),
+        ))
 
-        tax_clause = ""
-        if flags.taxids:
-            tax_vals = " ".join([f"taxonomy:TAXID{t}" for t in flags.taxids])
-            tax_clause = f"\n  OPTIONAL {{ ?mg obo:RO_0000057 ?tax . FILTER(STRSTARTS(STR(?tax), STR(taxonomy:))) }}\n  OPTIONAL {{ ?mg obo:RO_0000057 ?tax2 . VALUES ?tax2 {{ {tax_vals} }} BIND(?tax2 AS ?taxMatch) }}"
-            # We already filtered mg list in some modes; keep optional here.
+    def _select_evidence_rows_adaptive(
+        self,
+        mg_chunk: List[str],
+        caps: BuildCaps,
+        flags: BuildFlags,
+        restrict_compounds: Optional[Set[str]] = None,
+        restrict_proteins: Optional[Set[str]] = None,
+    ) -> Tuple[List[Dict[str, Any]], int, int, Optional[Exception]]:
+        """Fetch evidence rows and split heavy chunks on timeout/failure.
 
-        # Endpoint cap is approximate: LIMIT rows
-        row_limit = None
-        if caps.max_endpoints_per_pair:
-            row_limit = int(caps.max_endpoints_per_pair) * max(1, len(mgs))
+        Public SPARQL mirrors can time out on a chunk even when individual
+        measuregroups are retrievable. This helper keeps the existing extraction
+        logic but makes the chunking adaptive: try the requested chunk, split on
+        failure, and only skip the smallest still-failing chunk when skipping is
+        enabled.
+        """
+        cfg = getattr(self.client, "cfg", SparqlConfig())
+        min_size = max(1, int(getattr(cfg, "min_page_size", 1) or 1))
+        try:
+            bindings = self._select_evidence_rows_for_measuregroups(
+                mg_chunk,
+                caps=caps,
+                flags=flags,
+                restrict_compounds=restrict_compounds,
+                restrict_proteins=restrict_proteins,
+            )
+            return bindings, 0, 0, None
+        except Exception as exc:
+            can_split = bool(getattr(cfg, "adaptive_chunking", True)) and len(mg_chunk) > min_size
+            if can_split:
+                mid = max(1, len(mg_chunk) // 2)
+                left = mg_chunk[:mid]
+                right = mg_chunk[mid:]
+                log.warning(
+                    "SPARQL evidence chunk timed out/failed at size=%d; splitting into %d + %d. error=%s",
+                    len(mg_chunk),
+                    len(left),
+                    len(right),
+                    exc,
+                )
+                rows_l, fail_l, mg_l, exc_l = self._select_evidence_rows_adaptive(
+                    left, caps, flags, restrict_compounds, restrict_proteins
+                )
+                rows_r, fail_r, mg_r, exc_r = self._select_evidence_rows_adaptive(
+                    right, caps, flags, restrict_compounds, restrict_proteins
+                )
+                return rows_l + rows_r, fail_l + fail_r, mg_l + mg_r, exc_r or exc_l
 
-        q = f"""{SPARQL_PREFIXES}
-            SELECT ?mg ?bioassay ?baname ?endpoint ?sub ?compound ?protein ?tax
-                ?geneTarget ?gname ?gsNode ?gsym
-                ?cell ?anat
-                ?value ?unit ?qual ?outcome ?eplabel ?ref
-                ?pname ?seq ?gene
-                ?cname ?smiles ?inchikey ?inchi ?formula ?mw ?xlogp3 ?tpsa
-                ?source
-            WHERE {{
-            VALUES ?mg {{ {mg_values} }}
-            ?mg obo:OBI_0000299 ?endpoint .
-            ?endpoint obo:IAO_0000136 ?sub .
-            ?sub sio:CHEMINF_000477 ?compound .
+            if not getattr(cfg, "skip_failed_chunks", True):
+                raise
 
-            ?mg obo:RO_0000057 ?proteinRaw .
-            FILTER(STRSTARTS(STR(?proteinRaw), STR(protein:)))
-            BIND(?proteinRaw AS ?protein)
-            {protein_filter}
-            {compound_filter}
-
-            OPTIONAL {{ ?mg obo:RO_0000057 ?tax . FILTER(STRSTARTS(STR(?tax), STR(taxonomy:))) }}
-            OPTIONAL {{ ?bioassay bao:BAO_0000209 ?mg }}
-            OPTIONAL {{ ?bioassay skos:prefLabel ?baname }}
-            OPTIONAL {{ ?bioassay rdfs:label ?baname }}
-
-            OPTIONAL {{ ?geneTarget skos:prefLabel ?gname }}
-            OPTIONAL {{ ?geneTarget rdfs:label ?gname }}
-            OPTIONAL {{ ?geneTarget bao:BAO_0002870 ?gsNode }}
-            OPTIONAL {{ ?gsNode skos:prefLabel ?gsym }}
-
-            OPTIONAL {{ ?mg obo:RO_0000057 ?cell . FILTER(STRSTARTS(STR(?cell), STR(cell:))) }}
-            OPTIONAL {{ ?cell obo:RO_0001000 ?anat }}
-
-            OPTIONAL {{ ?endpoint sio:SIO_000300 ?value }}
-            OPTIONAL {{ ?endpoint sio:SIO_000221 ?unit }}
-            OPTIONAL {{ ?endpoint vocab:hasQualifier ?qual }}
-            OPTIONAL {{ ?endpoint vocab:PubChemAssayOutcome ?outcome }}
-            OPTIONAL {{ ?endpoint rdfs:label ?eplabel }}
-            OPTIONAL {{ ?endpoint cito:citesAsDataSource ?ref }}
-            OPTIONAL {{ ?sub dcterms:source ?source }}
-
-            OPTIONAL {{ ?protein skos:prefLabel ?pname }}
-            OPTIONAL {{ ?protein bao:BAO_0002817 ?seq }}
-            OPTIONAL {{ ?protein up:encodedBy ?gene }}
-
-            OPTIONAL {{ ?compound skos:prefLabel ?cname }}
-            OPTIONAL {{ ?compound vocab:smiles ?smiles }}
-            OPTIONAL {{ ?compound vocab:inchikey ?inchikey }}
-            OPTIONAL {{ ?compound vocab:iupac_inchi ?inchi }}
-            OPTIONAL {{ ?compound vocab:molecular_formula ?formula }}
-            OPTIONAL {{ ?compound vocab:molecular_weight ?mw }}
-            OPTIONAL {{ ?compound vocab:xlogp3 ?xlogp3 }}
-            OPTIONAL {{ ?compound vocab:tpsa ?tpsa }}
-            }}"""
-        if row_limit:
-            q += f"\nLIMIT {row_limit}"
-
-        rows = self.client.select(q)
-        for b in rows:
-            out.append(b)
-        return out
+            log.warning(
+                "Skipping failed SPARQL evidence chunk: chunk_size=%d error=%s",
+                len(mg_chunk),
+                exc,
+            )
+            return [], 1, len(mg_chunk), exc
 
     # -------------------------
     # Public iterators
@@ -639,14 +689,54 @@ SELECT DISTINCT ?protein ?gene WHERE {{
         seen_ep: Set[str] = set()
         seen_ref: Set[str] = set()
 
-        for mg_chunk in _chunked(mgs, self.page_size):
-            bindings = self._select_evidence_rows_for_measuregroups(
+        failed_chunks = 0
+        failed_measuregroups = 0
+        evidence_queries = 0
+        cfg = getattr(self.client, "cfg", SparqlConfig())
+
+        log.info(
+            "sparql: evidence strategy=bounded_nested_optional page_size=%s endpoint_metadata=%s optional_context=%s endpoint_references=%s",
+            max(1, int(self.page_size or 1)),
+            getattr(flags, "include_endpoint_metadata", True),
+            getattr(flags, "include_optional_context", True),
+            getattr(flags, "include_endpoint_references", False),
+        )
+
+        for mg_chunk in _chunked(mgs, max(1, int(self.page_size or 1))):
+            if cfg.max_evidence_queries is not None and evidence_queries >= cfg.max_evidence_queries:
+                log.warning(
+                    "SPARQL max evidence query limit reached (%s). Stopping evidence expansion early.",
+                    cfg.max_evidence_queries,
+                )
+                break
+            evidence_queries += 1
+
+            bindings, chunk_failures, mg_failures, last_exc = self._select_evidence_rows_adaptive(
                 mg_chunk,
                 caps=caps,
                 flags=flags,
                 restrict_compounds=restrict_compounds,
                 restrict_proteins=restrict_proteins,
             )
+            if chunk_failures or mg_failures:
+                failed_chunks += chunk_failures
+                failed_measuregroups += mg_failures
+                log.warning(
+                    "SPARQL evidence skipped failures so far: failed_chunks=%d failed_measuregroups=%d last_error=%s",
+                    failed_chunks,
+                    failed_measuregroups,
+                    last_exc,
+                )
+                over_chunks = cfg.max_failed_chunks is not None and failed_chunks > cfg.max_failed_chunks
+                over_mgs = (
+                    cfg.max_failed_measuregroups is not None
+                    and failed_measuregroups > cfg.max_failed_measuregroups
+                )
+                if over_chunks or over_mgs:
+                    raise RuntimeError(
+                        "SPARQL evidence skipped too many chunks/measuregroups "
+                        f"(failed_chunks={failed_chunks}, failed_measuregroups={failed_measuregroups})"
+                    ) from last_exc
 
             for b in bindings:
                 def v(name: str) -> Optional[str]:
@@ -777,11 +867,12 @@ SELECT DISTINCT ?protein ?gene WHERE {{
                         }}
 
                 # Endpoint -> Reference
-                ref_term = iri_to_term(v("ref")) if v("ref") else None
-                if ref_term:
-                    ref_id = _term_id(ref_term)
-                    if ref_id not in seen_ref:
-                        seen_ref.add(ref_id)
-                        yield {"kind": "reference", "data": {"ref_id": ref_id, "ref_term": ref_term}}
-                    if ep_term:
-                        yield {"kind": "ep_reference", "data": {"endpoint_id": _term_id(ep_term), "ref_id": ref_id}}
+                if getattr(flags, "include_endpoint_references", False):
+                    ref_term = iri_to_term(v("ref")) if v("ref") else None
+                    if ref_term:
+                        ref_id = _term_id(ref_term)
+                        if ref_id not in seen_ref:
+                            seen_ref.add(ref_id)
+                            yield {"kind": "reference", "data": {"ref_id": ref_id, "ref_term": ref_term}}
+                        if ep_term:
+                            yield {"kind": "ep_reference", "data": {"endpoint_id": _term_id(ep_term), "ref_id": ref_id}}

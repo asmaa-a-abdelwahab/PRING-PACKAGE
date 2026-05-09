@@ -6,17 +6,20 @@ import logging
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator, List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple, Iterable, Set
 
 from pring.config import Settings, BuildCaps, BuildFlags
 from pring.extract.query_plan import decide_mode, decide_scope, load_id_file, Mode, Scope
-from pring.extract.pubchem_rdf_rest import PubChemRdfRestClient, PubChemRdfRestExtractor
+from pring.extract.pubchem_rdf_rest import PubChemRdfRestClient, PubChemRdfRestExtractor, PubChemPugClient
 from pring.extract.pubchem_sparql_mirror import SparqlMirrorClient, PubChemSparqlMirrorExtractor
 from pring.extract.pubchem_core import PubChemRow, iter_graph_records, to_graph_records
 from pring.neo4j.driver import Neo4jDriver
 from pring.neo4j.loader import Neo4jLoader
 from pring.plugins import load_plugins, normalize_plugin_list
+from pring.extract.textmining_import import iter_textmining_csv_rows
+from pring.enrich.compound_similarity import iter_compound_similarity_rows
 from pring.utils import setup_logging, RunStore
+from pring.utils.resource_control import ResourceGuard, ResourceLimitExceeded
 
 log = logging.getLogger("pring")
 
@@ -68,6 +71,10 @@ def _apply_resource_profile(settings: Settings, profile: str, raw_argv: List[str
                 write_csv_mirrors=False,
                 max_http_cache_mb=resources.max_http_cache_mb if resources.max_http_cache_mb is not None else 128,
                 max_graph_artifact_mb=resources.max_graph_artifact_mb if resources.max_graph_artifact_mb is not None else 512,
+                max_memory_mb=resources.max_memory_mb,
+                max_cpu_percent=resources.max_cpu_percent,
+                resource_check_interval_s=resources.resource_check_interval_s,
+                max_workers=resources.max_workers,
             )
         if not _flag_present(raw_argv, "--rest-min-delay-s"):
             rdf_rest = rdf_rest.__class__(
@@ -86,6 +93,8 @@ def _apply_resource_profile(settings: Settings, profile: str, raw_argv: List[str
             max_measuregroups_per_target=caps.max_measuregroups_per_target if _flag_present(raw_argv, "--max-measuregroups-per-target") else _min_cap(caps.max_measuregroups_per_target, 200),
             max_measuregroups_per_compound=caps.max_measuregroups_per_compound if _flag_present(raw_argv, "--max-measuregroups-per-compound") else _min_cap(caps.max_measuregroups_per_compound, 200),
             max_endpoints_per_pair=caps.max_endpoints_per_pair if _flag_present(raw_argv, "--max-endpoints-per-pair") else _min_cap(caps.max_endpoints_per_pair, 25),
+            max_similar_compounds_per_compound=caps.max_similar_compounds_per_compound if _flag_present(raw_argv, "--max-similar-compounds-per-compound") else _min_cap(caps.max_similar_compounds_per_compound, 5),
+            max_textmine_records=caps.max_textmine_records,
         )
     elif profile == "high":
         if not _flag_present(raw_argv, "--batch-size"):
@@ -96,6 +105,10 @@ def _apply_resource_profile(settings: Settings, profile: str, raw_argv: List[str
                 write_csv_mirrors=True,
                 max_http_cache_mb=resources.max_http_cache_mb,
                 max_graph_artifact_mb=resources.max_graph_artifact_mb,
+                max_memory_mb=resources.max_memory_mb,
+                max_cpu_percent=resources.max_cpu_percent,
+                resource_check_interval_s=resources.resource_check_interval_s,
+                max_workers=resources.max_workers,
             )
     else:
         resources = resources.__class__(
@@ -103,6 +116,10 @@ def _apply_resource_profile(settings: Settings, profile: str, raw_argv: List[str
             write_csv_mirrors=resources.write_csv_mirrors,
             max_http_cache_mb=resources.max_http_cache_mb,
             max_graph_artifact_mb=resources.max_graph_artifact_mb,
+            max_memory_mb=resources.max_memory_mb,
+            max_cpu_percent=resources.max_cpu_percent,
+            resource_check_interval_s=resources.resource_check_interval_s,
+            max_workers=resources.max_workers,
         )
 
     return settings.with_overrides(
@@ -130,12 +147,25 @@ def _make_sparql_client(settings: Settings, cache_dir: Optional[Path]):
         return SparqlMirrorClient(settings.sparql, cache_dir=cache_dir)
 
 
+def _make_sparql_extractor(client, settings: Settings):
+    """Create a SPARQL extractor while remaining compatible with older test doubles."""
+    try:
+        return PubChemSparqlMirrorExtractor(client, page_size=settings.sparql.page_size)
+    except TypeError:
+        extractor = PubChemSparqlMirrorExtractor(client)
+        try:
+            setattr(extractor, "page_size", settings.sparql.page_size)
+        except Exception:
+            pass
+        return extractor
+
+
 def _fallback_worth_trying(exc: Exception) -> bool:
     msg = str(exc).lower()
     return any(token in msg for token in ("http get failed", "http post failed", "503", "504", "429", "thrott", "timed out", "timeout"))
 
 
-def _iter_rows(extractor, scope: Scope, chem_ids: List[str], target_ids: List[str], settings: Settings, store: RunStore) -> Iterator[PubChemRow]:
+def _iter_rows(extractor, scope: Scope, chem_ids: List[str], target_ids: List[str], settings: Settings, store: RunStore, guard: Optional[ResourceGuard] = None) -> Iterator[PubChemRow]:
     """Stream extracted rows to disk and yield PubChemRow objects.
 
     This avoids holding the full row list in memory for large runs.
@@ -147,11 +177,13 @@ def _iter_rows(extractor, scope: Scope, chem_ids: List[str], target_ids: List[st
     else:
         iterator = extractor.iter_expand_from_compounds(chem_ids, caps=settings.caps, flags=settings.flags)
     for d in iterator:
+        if guard is not None:
+            guard.checkpoint(f"extract:{d.get('kind')}")
         store.save_row(d["kind"], d["data"])
         yield PubChemRow(kind=d["kind"], data=d["data"])
 
 
-def _build_graph_from_rows_stream(rows: Iterator[PubChemRow], store: RunStore) -> Tuple[int, int]:
+def _build_graph_from_rows_stream(rows: Iterator[PubChemRow], store: RunStore, guard: Optional[ResourceGuard] = None) -> Tuple[int, int]:
     """Convert rows to graph records in a streaming fashion and persist to disk.
 
     This avoids materializing all nodes/rels in memory.
@@ -159,6 +191,8 @@ def _build_graph_from_rows_stream(rows: Iterator[PubChemRow], store: RunStore) -
     n_nodes = 0
     n_rels = 0
     for rec_type, rec in iter_graph_records(rows):
+        if guard is not None:
+            guard.checkpoint(f"graph:{rec_type}")
         if rec_type == "node":
             store.save_node(rec)
             n_nodes += 1
@@ -176,6 +210,46 @@ def _iter_jsonl(path: Path) -> Iterator[dict]:
                 continue
             yield json.loads(line)
 
+
+
+def _append_layer_rows(rows: Iterable[PubChemRow], store: RunStore, guard: Optional[ResourceGuard] = None) -> Tuple[int, int, int]:
+    row_count = 0
+
+    def _rows() -> Iterator[PubChemRow]:
+        nonlocal row_count
+        for row in rows:
+            if guard is not None:
+                guard.checkpoint(f"layer:{row.kind}")
+            store.save_row(row.kind, row.data)
+            row_count += 1
+            yield row
+
+    node_count, rel_count = _build_graph_from_rows_stream(_rows(), store, guard)
+    return row_count, node_count, rel_count
+
+
+def _compound_cids_from_artifacts(store: RunStore, fallback_chem_ids: List[str]) -> List[int]:
+    cids: Set[int] = set()
+    compound_file = store.nodes_dir / "Compound.jsonl"
+    if compound_file.exists():
+        for rec in _iter_jsonl(compound_file):
+            key = rec.get("key") or {}
+            cid = key.get("cid")
+            try:
+                if cid is not None:
+                    cids.add(int(cid))
+            except Exception:
+                pass
+    import re
+    for raw in fallback_chem_ids or []:
+        text = str(raw).strip()
+        m = re.search(r"CID[:=]?(\d+)$", text, flags=re.IGNORECASE) or (re.search(r"^(\d+)$", text) if text else None)
+        if m:
+            try:
+                cids.add(int(m.group(1)))
+            except Exception:
+                pass
+    return sorted(cids)
 
 
 def _add_shared_args(parser: argparse.ArgumentParser, *, default_suppress: bool = False) -> None:
@@ -205,13 +279,42 @@ def _add_shared_args(parser: argparse.ArgumentParser, *, default_suppress: bool 
     parser.add_argument("--sparql-endpoint", type=str, default=default,
                         help="SPARQL endpoint URL for mirror mode (default: https://idsm.elixir-czech.cz/sparql/endpoint/idsm).")
     parser.add_argument("--sparql-timeout-s", type=float, default=default, help="SPARQL HTTP timeout seconds.")
+    parser.add_argument("--sparql-page-size", type=int, default=default,
+                        help="Number of measuregroups per SPARQL evidence query chunk. Lower values reduce timeout risk. Default: 25.")
+    parser.add_argument("--sparql-max-retries", type=int, default=default,
+                        help="Maximum retries for each SPARQL HTTP request. Default: 3.")
+    parser.add_argument("--sparql-skip-failed-chunks", type=str, choices=["true", "false"], default=default,
+                        help="Skip failed SPARQL evidence chunks instead of aborting the whole run. Default: true.")
+    parser.add_argument("--sparql-max-failed-chunks", type=int, default=default,
+                        help="Maximum failed SPARQL evidence chunks tolerated when skipping is enabled. Default: 3.")
+    parser.add_argument("--sparql-max-failed-measuregroups", type=int, default=default,
+                        help="Maximum measuregroups allowed to be skipped due to failed SPARQL evidence chunks.")
+    parser.add_argument("--sparql-max-evidence-queries", type=int, default=default,
+                        help="Maximum number of SPARQL evidence chunk queries before stopping evidence expansion early.")
+    parser.add_argument("--sparql-evidence-timeout-s", type=float, default=default,
+                        help="Timeout seconds for heavy SPARQL evidence chunk queries. Default: 60.")
+    parser.add_argument("--sparql-evidence-max-retries", type=int, default=default,
+                        help="Retries for heavy SPARQL evidence chunk queries. Default: 0 to fail fast and split/skip.")
+    parser.add_argument("--sparql-adaptive-chunking", type=str, choices=["true", "false"], default=default,
+                        help="Split timed-out SPARQL evidence chunks into smaller chunks automatically. Default: true.")
+    parser.add_argument("--sparql-min-page-size", type=int, default=default,
+                        help="Smallest SPARQL evidence chunk size before skipping/raising. Default: 1.")
 
     # Flags
-    parser.add_argument("--include-textmining", type=str, choices=["true", "false"], default=default)
+    parser.add_argument("--include-textmining", type=str, choices=["true", "false"], default=default,
+                        help="Add the separate text-mined co-occurrence layer from --textmining-file.")
+    parser.add_argument("--textmining-file", type=str, default=default,
+                        help="CSV/TSV file for text-mined co-occurrences. Used only when --include-textmining=true.")
+    parser.add_argument("--include-compound-similarity", type=str, choices=["true", "false"], default=default,
+                        help="Add PubChem PUG-REST compound similarity edges as a separate enrichment over extracted compounds.")
+    parser.add_argument("--compound-similarity-method", type=str, choices=["2d", "3d"], default=default,
+                        help="PubChem fast similarity method used when --include-compound-similarity=true.")
+    parser.add_argument("--compound-similarity-threshold", type=int, default=default,
+                        help="PubChem similarity threshold, usually 0-100. Default: 90.")
     parser.add_argument("--include-optional-context", type=str, choices=["true", "false"], default=default)
     parser.add_argument("--include-endpoint-metadata", type=str, choices=["true", "false"], default=default,
                         help="Fetch endpoint label/value/unit/outcome metadata (default: true).")
-    parser.add_argument("--include-endpoint-references", type=str, choices=["true", "false"], default=default,
+    parser.add_argument("--include-endpoint-references", type=str, choices=["true", "false"], default=argparse.SUPPRESS if default_suppress else "false",
                         help="Fetch endpoint reference links (default: false; often the most throttle-prone optional lookup).")
     parser.add_argument(
         "--taxid",
@@ -227,6 +330,10 @@ def _add_shared_args(parser: argparse.ArgumentParser, *, default_suppress: bool 
     parser.add_argument("--max-measuregroups-per-target", type=str, default=default)
     parser.add_argument("--max-measuregroups-per-compound", type=str, default=default)
     parser.add_argument("--max-endpoints-per-pair", type=str, default=default)
+    parser.add_argument("--max-similar-compounds-per-compound", type=str, default=default,
+                        help="Maximum similar compounds per extracted compound when similarity enrichment is enabled.")
+    parser.add_argument("--max-textmine-records", type=str, default=default,
+                        help="Maximum imported text-mining rows from --textmining-file.")
 
     # Cache + runtime
     parser.add_argument("--cache-dir", type=str, default=default, help="Cache directory for downloads/HTTP responses.")
@@ -243,6 +350,14 @@ def _add_shared_args(parser: argparse.ArgumentParser, *, default_suppress: bool 
                         help="Maximum on-disk HTTP cache budget in MB. When reached, new responses are not cached.")
     parser.add_argument("--max-graph-artifact-mb", type=int, default=default,
                         help="Maximum graph artifact budget in MB for saved rows/nodes/rels. Exceeding it stops the run early.")
+    parser.add_argument("--max-memory-mb", type=int, default=default,
+                        help="Hard process memory budget in MB. The run stops cleanly if RSS exceeds this limit.")
+    parser.add_argument("--max-cpu-percent", type=float, default=default,
+                        help="Soft process CPU target. Requires psutil; PRING sleeps briefly when above this target.")
+    parser.add_argument("--resource-check-interval", type=float, default=default,
+                        help="Seconds between resource checks. Default: 5.")
+    parser.add_argument("--max-workers", type=int, default=default,
+                        help="Maximum worker/thread hint for current/future optional layers. Default: 1.")
     parser.add_argument("--write-csv-mirrors", type=str, choices=["true", "false"], default=default,
                         help="Write thesis-friendly CSV mirrors alongside JSONL graph artifacts (default: true). Disable to reduce disk and I/O.")
     parser.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS if default_suppress else False, help="Plan + fetch (optional), but do not write to Neo4j.")
@@ -318,6 +433,10 @@ def main(argv: Optional[List[str]] = None) -> None:
             write_csv_mirrors=(args.write_csv_mirrors == "true"),
             max_http_cache_mb=settings.resources.max_http_cache_mb,
             max_graph_artifact_mb=settings.resources.max_graph_artifact_mb,
+            max_memory_mb=settings.resources.max_memory_mb,
+            max_cpu_percent=settings.resources.max_cpu_percent,
+            resource_check_interval_s=settings.resources.resource_check_interval_s,
+            max_workers=settings.resources.max_workers,
         ))
     if _flag_present(raw_argv, "--max-http-cache-mb") or _flag_present(raw_argv, "--max-graph-artifact-mb"):
         settings = settings.with_overrides(resources=settings.resources.__class__(
@@ -325,6 +444,22 @@ def main(argv: Optional[List[str]] = None) -> None:
             write_csv_mirrors=settings.resources.write_csv_mirrors,
             max_http_cache_mb=settings.resources.max_http_cache_mb if getattr(args, "max_http_cache_mb", None) is None else int(args.max_http_cache_mb),
             max_graph_artifact_mb=settings.resources.max_graph_artifact_mb if getattr(args, "max_graph_artifact_mb", None) is None else int(args.max_graph_artifact_mb),
+            max_memory_mb=settings.resources.max_memory_mb,
+            max_cpu_percent=settings.resources.max_cpu_percent,
+            resource_check_interval_s=settings.resources.resource_check_interval_s,
+            max_workers=settings.resources.max_workers,
+        ))
+
+    if any(_flag_present(raw_argv, f) for f in ["--max-memory-mb", "--max-cpu-percent", "--resource-check-interval", "--max-workers"]):
+        settings = settings.with_overrides(resources=settings.resources.__class__(
+            profile=settings.resources.profile,
+            write_csv_mirrors=settings.resources.write_csv_mirrors,
+            max_http_cache_mb=settings.resources.max_http_cache_mb,
+            max_graph_artifact_mb=settings.resources.max_graph_artifact_mb,
+            max_memory_mb=settings.resources.max_memory_mb if getattr(args, "max_memory_mb", None) is None else int(args.max_memory_mb),
+            max_cpu_percent=settings.resources.max_cpu_percent if getattr(args, "max_cpu_percent", None) is None else float(args.max_cpu_percent),
+            resource_check_interval_s=settings.resources.resource_check_interval_s if getattr(args, "resource_check_interval", None) is None else float(args.resource_check_interval),
+            max_workers=settings.resources.max_workers if getattr(args, "max_workers", None) is None else int(args.max_workers),
         ))
 
     load_neo4j = (args.load_neo4j == "true") and (not args.dry_run)
@@ -376,14 +511,62 @@ def main(argv: Optional[List[str]] = None) -> None:
             rr_kwargs["honor_throttling_headers"] = (args.rest_honor_throttling == "true")
         settings = settings.with_overrides(rdf_rest=rr.__class__(**rr_kwargs))
 
-    # SPARQL endpoint overrides
-    if args.sparql_endpoint or args.sparql_timeout_s:
+    # SPARQL endpoint/runtime overrides
+    sparql_override_flags = [
+        "--sparql-endpoint",
+        "--sparql-timeout-s",
+        "--sparql-page-size",
+        "--sparql-max-retries",
+        "--sparql-skip-failed-chunks",
+        "--sparql-max-failed-chunks",
+        "--sparql-max-failed-measuregroups",
+        "--sparql-max-evidence-queries",
+        "--sparql-evidence-timeout-s",
+        "--sparql-evidence-max-retries",
+        "--sparql-adaptive-chunking",
+        "--sparql-min-page-size",
+    ]
+    if any(_flag_present(raw_argv, f) for f in sparql_override_flags):
         sp = settings.sparql
-        sp_kwargs = dict(endpoint_url=sp.endpoint_url, timeout_s=sp.timeout_s, max_retries=sp.max_retries, user_agent=sp.user_agent)
-        if args.sparql_endpoint:
+        sp_kwargs = dict(
+            endpoint_url=sp.endpoint_url,
+            timeout_s=sp.timeout_s,
+            max_retries=sp.max_retries,
+            user_agent=sp.user_agent,
+            page_size=sp.page_size,
+            skip_failed_chunks=sp.skip_failed_chunks,
+            max_failed_chunks=sp.max_failed_chunks,
+            max_failed_measuregroups=sp.max_failed_measuregroups,
+            max_evidence_queries=sp.max_evidence_queries,
+            evidence_timeout_s=getattr(sp, "evidence_timeout_s", 60.0),
+            evidence_max_retries=getattr(sp, "evidence_max_retries", 0),
+            adaptive_chunking=getattr(sp, "adaptive_chunking", True),
+            min_page_size=getattr(sp, "min_page_size", 1),
+        )
+        if getattr(args, "sparql_endpoint", None):
             sp_kwargs["endpoint_url"] = args.sparql_endpoint
-        if args.sparql_timeout_s is not None:
+        if getattr(args, "sparql_timeout_s", None) is not None:
             sp_kwargs["timeout_s"] = float(args.sparql_timeout_s)
+        if getattr(args, "sparql_page_size", None) is not None:
+            sp_kwargs["page_size"] = int(args.sparql_page_size)
+        if getattr(args, "sparql_max_retries", None) is not None:
+            sp_kwargs["max_retries"] = int(args.sparql_max_retries)
+        if getattr(args, "sparql_skip_failed_chunks", None) is not None:
+            sp_kwargs["skip_failed_chunks"] = (args.sparql_skip_failed_chunks == "true")
+        if getattr(args, "sparql_max_failed_chunks", None) is not None:
+            sp_kwargs["max_failed_chunks"] = int(args.sparql_max_failed_chunks)
+        if getattr(args, "sparql_max_failed_measuregroups", None) is not None:
+            sp_kwargs["max_failed_measuregroups"] = int(args.sparql_max_failed_measuregroups)
+        if getattr(args, "sparql_max_evidence_queries", None) is not None:
+            sp_kwargs["max_evidence_queries"] = int(args.sparql_max_evidence_queries)
+        if getattr(args, "sparql_evidence_timeout_s", None) is not None:
+            sp_kwargs["evidence_timeout_s"] = float(args.sparql_evidence_timeout_s)
+        if getattr(args, "sparql_evidence_max_retries", None) is not None:
+            sp_kwargs["evidence_max_retries"] = int(args.sparql_evidence_max_retries)
+        if getattr(args, "sparql_adaptive_chunking", None) is not None:
+            sp_kwargs["adaptive_chunking"] = (args.sparql_adaptive_chunking == "true")
+        if getattr(args, "sparql_min_page_size", None) is not None:
+            sp_kwargs["min_page_size"] = int(args.sparql_min_page_size)
         settings = settings.with_overrides(sparql=sp.__class__(**sp_kwargs))
 
     # Neo4j overrides
@@ -402,14 +585,26 @@ def main(argv: Optional[List[str]] = None) -> None:
     if args.include_textmining is not None:
         flags = flags.__class__(
             include_textmining=(args.include_textmining == "true"),
+            include_compound_similarity=flags.include_compound_similarity,
             include_optional_context=flags.include_optional_context,
             include_endpoint_metadata=getattr(flags, "include_endpoint_metadata", True),
             include_endpoint_references=getattr(flags, "include_endpoint_references", False),
             taxids=getattr(flags, "taxids", None),
         )
+    if args.include_compound_similarity is not None:
+        flags = flags.__class__(
+            include_textmining=flags.include_textmining,
+            include_compound_similarity=(args.include_compound_similarity == "true"),
+            include_optional_context=flags.include_optional_context,
+            include_endpoint_metadata=getattr(flags, "include_endpoint_metadata", True),
+            include_endpoint_references=getattr(flags, "include_endpoint_references", False),
+            taxids=getattr(flags, "taxids", None),
+        )
+
     if args.include_optional_context is not None:
         flags = flags.__class__(
             include_textmining=flags.include_textmining,
+            include_compound_similarity=flags.include_compound_similarity,
             include_optional_context=(args.include_optional_context == "true"),
             include_endpoint_metadata=getattr(flags, "include_endpoint_metadata", True),
             include_endpoint_references=getattr(flags, "include_endpoint_references", False),
@@ -418,6 +613,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     if args.include_endpoint_metadata is not None:
         flags = flags.__class__(
             include_textmining=flags.include_textmining,
+            include_compound_similarity=flags.include_compound_similarity,
             include_optional_context=flags.include_optional_context,
             include_endpoint_metadata=(args.include_endpoint_metadata == "true"),
             include_endpoint_references=getattr(flags, "include_endpoint_references", False),
@@ -426,6 +622,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     if args.include_endpoint_references is not None:
         flags = flags.__class__(
             include_textmining=flags.include_textmining,
+            include_compound_similarity=flags.include_compound_similarity,
             include_optional_context=flags.include_optional_context,
             include_endpoint_metadata=getattr(flags, "include_endpoint_metadata", True),
             include_endpoint_references=(args.include_endpoint_references == "true"),
@@ -438,6 +635,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         taxids = _parse_taxids(args.taxid)
         flags = flags.__class__(
             include_textmining=flags.include_textmining,
+            include_compound_similarity=flags.include_compound_similarity,
             include_optional_context=flags.include_optional_context,
             include_endpoint_metadata=getattr(flags, "include_endpoint_metadata", True),
             include_endpoint_references=getattr(flags, "include_endpoint_references", False),
@@ -451,8 +649,20 @@ def main(argv: Optional[List[str]] = None) -> None:
         max_measuregroups_per_target=settings.caps.max_measuregroups_per_target if args.max_measuregroups_per_target is None else _parse_int_or_none(args.max_measuregroups_per_target),
         max_measuregroups_per_compound=settings.caps.max_measuregroups_per_compound if args.max_measuregroups_per_compound is None else _parse_int_or_none(args.max_measuregroups_per_compound),
         max_endpoints_per_pair=settings.caps.max_endpoints_per_pair if args.max_endpoints_per_pair is None else _parse_int_or_none(args.max_endpoints_per_pair),
+        max_similar_compounds_per_compound=settings.caps.max_similar_compounds_per_compound if args.max_similar_compounds_per_compound is None else _parse_int_or_none(args.max_similar_compounds_per_compound),
+        max_textmine_records=settings.caps.max_textmine_records if args.max_textmine_records is None else _parse_int_or_none(args.max_textmine_records),
     )
-    settings = settings.with_overrides(flags=flags, caps=caps)
+    textmining_file = settings.textmining_file
+    if getattr(args, "textmining_file", None):
+        textmining_file = Path(args.textmining_file)
+    similarity_method = settings.compound_similarity_method
+    if getattr(args, "compound_similarity_method", None):
+        similarity_method = args.compound_similarity_method
+    similarity_threshold = settings.compound_similarity_threshold
+    if getattr(args, "compound_similarity_threshold", None) is not None:
+        similarity_threshold = int(args.compound_similarity_threshold)
+
+    settings = settings.with_overrides(flags=flags, caps=caps, textmining_file=textmining_file, compound_similarity_method=similarity_method, compound_similarity_threshold=similarity_threshold)
 
     # Plugins
     plugin_args = args.plugins or []
@@ -486,6 +696,10 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "write_csv_mirrors": settings.resources.write_csv_mirrors,
                 "max_http_cache_mb": settings.resources.max_http_cache_mb,
                 "max_graph_artifact_mb": settings.resources.max_graph_artifact_mb,
+                "max_memory_mb": settings.resources.max_memory_mb,
+                "max_cpu_percent": settings.resources.max_cpu_percent,
+                "resource_check_interval_s": settings.resources.resource_check_interval_s,
+                "max_workers": settings.resources.max_workers,
                 "save_raw_http_cache": settings.save_raw_http_cache,
                 "save_extracted_artifacts": settings.save_extracted_artifacts,
                 "batch_size": settings.batch_size,
@@ -500,6 +714,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "run_dir": str(run_dir),
                 "log_file": str(log_path),
                 "cache_dir": str(settings.cache_dir),
+                "textmining_file": str(settings.textmining_file) if settings.textmining_file else None,
             },
         })
         for row in rows:
@@ -548,6 +763,10 @@ def main(argv: Optional[List[str]] = None) -> None:
             "write_csv_mirrors": settings.resources.write_csv_mirrors,
             "max_http_cache_mb": settings.resources.max_http_cache_mb,
             "max_graph_artifact_mb": settings.resources.max_graph_artifact_mb,
+            "max_memory_mb": settings.resources.max_memory_mb,
+            "max_cpu_percent": settings.resources.max_cpu_percent,
+            "resource_check_interval_s": settings.resources.resource_check_interval_s,
+            "max_workers": settings.resources.max_workers,
             "save_raw_http_cache": settings.save_raw_http_cache,
             "save_extracted_artifacts": settings.save_extracted_artifacts,
             "batch_size": settings.batch_size,
@@ -562,10 +781,14 @@ def main(argv: Optional[List[str]] = None) -> None:
             "run_dir": str(run_dir),
             "log_file": str(log_path),
             "cache_dir": str(settings.cache_dir),
+            "textmining_file": str(settings.textmining_file) if settings.textmining_file else None,
         },
     })
     log.info("Run dir: %s", run_dir)
     log.info("Log file: %s", log_path)
+
+    guard = ResourceGuard.from_settings(settings)
+    guard.checkpoint("start")
 
     # Extraction (streamed)
     row_count = 0
@@ -580,10 +803,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         try:
             def _rows():
                 nonlocal row_count
-                for r in _iter_rows(extractor, scope, chem_ids, target_ids, settings, store):
+                for r in _iter_rows(extractor, scope, chem_ids, target_ids, settings, store, guard):
                     row_count += 1
                     yield r
-            node_count, rel_count = _build_graph_from_rows_stream(_rows(), store)
+            node_count, rel_count = _build_graph_from_rows_stream(_rows(), store, guard)
         except Exception as exc:
             rest_error = exc
         finally:
@@ -604,9 +827,10 @@ def main(argv: Optional[List[str]] = None) -> None:
                 row_count = 0
                 sparql_cache = (settings.cache_dir / "sparql") if settings.save_raw_http_cache else None
                 client = _make_sparql_client(settings, sparql_cache)
-                extractor = PubChemSparqlMirrorExtractor(client)
+                extractor = _make_sparql_extractor(client, settings)
                 fallback_flags = BuildFlags(
                     include_textmining=settings.flags.include_textmining,
+                    include_compound_similarity=settings.flags.include_compound_similarity,
                     include_optional_context=settings.flags.include_optional_context,
                     include_endpoint_metadata=settings.flags.include_endpoint_metadata,
                     include_endpoint_references=False,
@@ -616,10 +840,10 @@ def main(argv: Optional[List[str]] = None) -> None:
                 try:
                     def _rows2():
                         nonlocal row_count
-                        for r in _iter_rows(extractor, scope, chem_ids, target_ids, fallback_settings, store):
+                        for r in _iter_rows(extractor, scope, chem_ids, target_ids, fallback_settings, store, guard):
                             row_count += 1
                             yield r
-                    node_count, rel_count = _build_graph_from_rows_stream(_rows2(), store)
+                    node_count, rel_count = _build_graph_from_rows_stream(_rows2(), store, guard)
                     effective_mode = "sparql-fallback"
                 finally:
                     try:
@@ -635,14 +859,14 @@ def main(argv: Optional[List[str]] = None) -> None:
     elif mode == Mode.sparql:
         sparql_cache = (settings.cache_dir / "sparql") if settings.save_raw_http_cache else None
         client = _make_sparql_client(settings, sparql_cache)
-        extractor = PubChemSparqlMirrorExtractor(client)
+        extractor = _make_sparql_extractor(client, settings)
         try:
             def _rows3():
                 nonlocal row_count
-                for r in _iter_rows(extractor, scope, chem_ids, target_ids, settings, store):
+                for r in _iter_rows(extractor, scope, chem_ids, target_ids, settings, store, guard):
                     row_count += 1
                     yield r
-            node_count, rel_count = _build_graph_from_rows_stream(_rows3(), store)
+            node_count, rel_count = _build_graph_from_rows_stream(_rows3(), store, guard)
         finally:
             try:
                 extractor.close()
@@ -658,6 +882,55 @@ def main(argv: Optional[List[str]] = None) -> None:
     if effective_mode != mode.value:
         log.info("effective_mode=%s", effective_mode)
     log.info("Extracted rows=%d -> nodes=%d rels=%d", row_count, node_count, rel_count)
+
+    # Optional additive layers. These do not change the selected core scope; they
+    # only add separate evidence/enrichment records over the extracted/searched entities.
+    textmine_rows = textmine_nodes = textmine_rels = 0
+    if settings.flags.include_textmining:
+        if settings.textmining_file is None:
+            log.warning("--include-textmining=true but no --textmining-file was provided; skipping text-mining layer.")
+        elif not settings.textmining_file.exists():
+            log.warning("Text-mining file not found: %s; skipping text-mining layer.", settings.textmining_file)
+        else:
+            textmine_rows, textmine_nodes, textmine_rels = _append_layer_rows(
+                iter_textmining_csv_rows(settings.textmining_file, max_records=settings.caps.max_textmine_records),
+                store,
+                guard,
+            )
+            node_count += textmine_nodes
+            rel_count += textmine_rels
+            row_count += textmine_rows
+            log.info("Text-mining layer: rows=%d nodes=%d rels=%d", textmine_rows, textmine_nodes, textmine_rels)
+
+    sim_rows = sim_nodes = sim_rels = 0
+    if settings.flags.include_compound_similarity:
+        cids = _compound_cids_from_artifacts(store, chem_ids)
+        if not cids:
+            log.warning("Compound similarity requested, but no Compound CIDs were available from extracted artifacts/input seeds.")
+        else:
+            pug_cache = (settings.cache_dir / "pugrest") if settings.save_raw_http_cache else None
+            pug = PubChemPugClient(cache_dir=pug_cache, max_cache_bytes=_mb_to_bytes(settings.resources.max_http_cache_mb))
+            try:
+                sim_rows, sim_nodes, sim_rels = _append_layer_rows(
+                    iter_compound_similarity_rows(
+                        cids,
+                        pug=pug,
+                        method=settings.compound_similarity_method,
+                        threshold=settings.compound_similarity_threshold,
+                        max_similar_per_compound=settings.caps.max_similar_compounds_per_compound,
+                    ),
+                    store,
+                    guard,
+                )
+            finally:
+                try:
+                    pug.close()
+                except Exception:
+                    pass
+            node_count += sim_nodes
+            rel_count += sim_rels
+            row_count += sim_rows
+            log.info("Compound similarity layer: source_compounds=%d rows=%d nodes=%d rels=%d", len(cids), sim_rows, sim_nodes, sim_rels)
 
     plugin_node_count = 0
     plugin_rel_count = 0

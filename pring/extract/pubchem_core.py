@@ -371,6 +371,68 @@ def iter_graph_records(rows: Iterable[PubChemRow]) -> Iterator[Tuple[str, Dict]]
             if protein_id and pathway_id:
                 rel("PARTICIPATES_IN", {"label": "Protein", "key": {"protein_id": protein_id}}, {"label": "Pathway", "key": {"pathway_id": pathway_id}})
 
+        elif r.kind == "textmine":
+            textmine_id = _as_text(_first_nonempty(d, "textmine_id", "method_id"))
+            if not textmine_id:
+                continue
+            node("TextMine", {"textmine_id": textmine_id}, {
+                "textmine_id": textmine_id,
+                "method_id": _as_text(d.get("method_id")) or textmine_id,
+                "name": _first_nonempty(d, "name", "method_name"),
+                "version": d.get("version"),
+                "source": d.get("source"),
+            })
+
+        elif r.kind == "cooc":
+            cooc_id = _as_text(d.get("cooc_id"))
+            if not cooc_id:
+                continue
+            node("Cooc", {"cooc_id": cooc_id}, {
+                "cooc_id": cooc_id,
+                "score": d.get("score"),
+                "sentence_count": d.get("sentence_count"),
+                "mention_context": d.get("mention_context"),
+                "association_type": d.get("association_type"),
+                "evidence_level": d.get("evidence_level") or "text_mined",
+                "direction": d.get("direction"),
+            })
+
+        elif r.kind == "cooc_compound":
+            cooc_id = _as_text(d.get("cooc_id"))
+            cid = _as_int(d.get("cid"))
+            if cooc_id and cid is not None:
+                rel("MENTIONS_COMPOUND", {"label": "Cooc", "key": {"cooc_id": cooc_id}}, {"label": "Compound", "key": {"cid": cid}})
+
+        elif r.kind == "cooc_protein":
+            cooc_id = _as_text(d.get("cooc_id"))
+            protein_id = _as_text(d.get("protein_id"))
+            if cooc_id and protein_id:
+                rel("MENTIONS_PROTEIN", {"label": "Cooc", "key": {"cooc_id": cooc_id}}, {"label": "Protein", "key": {"protein_id": protein_id}})
+
+        elif r.kind == "cooc_gene":
+            cooc_id = _as_text(d.get("cooc_id"))
+            gene_id = _as_text(d.get("gene_id"))
+            if cooc_id and gene_id:
+                rel("MENTIONS_GENE", {"label": "Cooc", "key": {"cooc_id": cooc_id}}, {"label": "Gene", "key": {"gene_id": gene_id}}, rel_type="MENTIONS_GENE")
+
+        elif r.kind == "cooc_disease":
+            cooc_id = _as_text(d.get("cooc_id"))
+            disease_id = _as_text(d.get("disease_id"))
+            if cooc_id and disease_id:
+                rel("MENTIONS_DISEASE", {"label": "Cooc", "key": {"cooc_id": cooc_id}}, {"label": "Disease", "key": {"disease_id": disease_id}})
+
+        elif r.kind == "cooc_reference":
+            cooc_id = _as_text(d.get("cooc_id"))
+            reference_id = _as_text(d.get("reference_id")) or _as_text(d.get("ref_id"))
+            if cooc_id and reference_id:
+                rel("FOUND_IN_REFERENCE", {"label": "Cooc", "key": {"cooc_id": cooc_id}}, {"label": "Reference", "key": {"reference_id": reference_id}})
+
+        elif r.kind == "cooc_textmine":
+            cooc_id = _as_text(d.get("cooc_id"))
+            textmine_id = _as_text(_first_nonempty(d, "textmine_id", "method_id"))
+            if cooc_id and textmine_id:
+                rel("EXTRACTED_BY", {"label": "Cooc", "key": {"cooc_id": cooc_id}}, {"label": "TextMine", "key": {"textmine_id": textmine_id}})
+
         while q:
             yield q.popleft()
 

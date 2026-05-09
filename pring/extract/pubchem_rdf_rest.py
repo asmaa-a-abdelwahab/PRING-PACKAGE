@@ -366,6 +366,21 @@ class PubChemPugClient:
         data = self._get(f"compound/inchi/{quote(inc, safe='')}/cids/JSON")
         return self._extract_cids(data)
 
+    def similar_cids(self, cid: int, *, method: str = "2d", threshold: int = 90, max_records: int = 10) -> List[int]:
+        """Return PubChem fast similarity neighbors for a CID.
+
+        method accepts ``2d`` or ``3d`` and maps to PubChem PUG-REST
+        fastsimilarity_2d / fastsimilarity_3d endpoints. The query is bounded
+        by Threshold and MaxRecords so the layer remains device friendly.
+        """
+        method_norm = str(method or "2d").lower().replace("-", "").replace("_", "")
+        if method_norm not in {"2d", "3d"}:
+            raise ValueError("similarity method must be '2d' or '3d'")
+        path = f"compound/fastsimilarity_{method_norm}/cid/{int(cid)}/cids/JSON"
+        url = self.base_url.rstrip("/") + "/" + path.lstrip("/")
+        data = self.http.get_json(url, params={"Threshold": int(threshold), "MaxRecords": int(max_records)})
+        return self._extract_cids(data)
+
 
 @dataclass
 class PubChemRdfRestExtractor:

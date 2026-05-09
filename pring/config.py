@@ -24,6 +24,19 @@ class SparqlConfig:
     timeout_s: float = 120.0
     max_retries: int = 3
     user_agent: str = "pring/0.1"
+    # Keep SPARQL evidence queries small enough for public mirrors and modest devices.
+    page_size: int = 25
+    skip_failed_chunks: bool = True
+    max_failed_chunks: Optional[int] = 3
+    max_failed_measuregroups: Optional[int] = None
+    max_evidence_queries: Optional[int] = None
+    # Evidence queries are often the heaviest SPARQL requests. Keep separate
+    # timeout/retry knobs so seed-resolution queries can remain tolerant while
+    # evidence chunks fail fast and can be split/skipped.
+    evidence_timeout_s: Optional[float] = 60.0
+    evidence_max_retries: int = 0
+    adaptive_chunking: bool = True
+    min_page_size: int = 1
 
 
 @dataclass(frozen=True)
@@ -43,11 +56,16 @@ class ResourceProfile:
     write_csv_mirrors: bool = True
     max_http_cache_mb: Optional[int] = None
     max_graph_artifact_mb: Optional[int] = None
+    max_memory_mb: Optional[int] = None
+    max_cpu_percent: Optional[float] = None
+    resource_check_interval_s: float = 5.0
+    max_workers: int = 1
 
 
 @dataclass(frozen=True)
 class BuildFlags:
     include_textmining: bool = False
+    include_compound_similarity: bool = False
     include_optional_context: bool = True
     include_endpoint_metadata: bool = True
     include_endpoint_references: bool = True
@@ -62,6 +80,8 @@ class BuildCaps:
     max_measuregroups_per_target: Optional[int] = 500
     max_measuregroups_per_compound: Optional[int] = None
     max_endpoints_per_pair: Optional[int] = 50
+    max_similar_compounds_per_compound: Optional[int] = 10
+    max_textmine_records: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -127,6 +147,9 @@ class Settings:
     save_raw_http_cache: bool = True
     save_extracted_artifacts: bool = True
     resources: ResourceProfile = field(default_factory=ResourceProfile)
+    textmining_file: Optional[Path] = None
+    compound_similarity_method: str = "2d"
+    compound_similarity_threshold: int = 90
 
     def with_overrides(self, **kwargs: Any) -> "Settings":
         return replace(self, **kwargs)
@@ -157,12 +180,22 @@ class Settings:
             timeout_s=float(os.getenv("PRING_SPARQL_TIMEOUT_S", "120.0")),
             max_retries=int(os.getenv("PRING_SPARQL_MAX_RETRIES", "3")),
             user_agent=os.getenv("PRING_SPARQL_USER_AGENT", "pring/0.1"),
+            page_size=int(os.getenv("PRING_SPARQL_PAGE_SIZE", "25")),
+            skip_failed_chunks=_parse_bool(os.getenv("PRING_SPARQL_SKIP_FAILED_CHUNKS"), True),
+            max_failed_chunks=_int_or_none(os.getenv("PRING_SPARQL_MAX_FAILED_CHUNKS"), 3),
+            max_failed_measuregroups=_int_or_none(os.getenv("PRING_SPARQL_MAX_FAILED_MEASUREGROUPS"), None),
+            max_evidence_queries=_int_or_none(os.getenv("PRING_SPARQL_MAX_EVIDENCE_QUERIES"), None),
+            evidence_timeout_s=_float_or_none(os.getenv("PRING_SPARQL_EVIDENCE_TIMEOUT_S"), 60.0),
+            evidence_max_retries=int(os.getenv("PRING_SPARQL_EVIDENCE_MAX_RETRIES", "0")),
+            adaptive_chunking=_parse_bool(os.getenv("PRING_SPARQL_ADAPTIVE_CHUNKING"), True),
+            min_page_size=int(os.getenv("PRING_SPARQL_MIN_PAGE_SIZE", "1")),
         )
         cache_dir = Path(os.getenv("PRING_CACHE_DIR", ".cache/pring"))
         batch_size = int(os.getenv("PRING_BATCH_SIZE", "1000"))
         schema_dot = os.getenv("PRING_SCHEMA_DOT_PATH")
         flags = BuildFlags(
             include_textmining=_parse_bool(os.getenv("PRING_INCLUDE_TEXTMINING"), False),
+            include_compound_similarity=_parse_bool(os.getenv("PRING_INCLUDE_COMPOUND_SIMILARITY"), False),
             include_optional_context=_parse_bool(os.getenv("PRING_INCLUDE_OPTIONAL_CONTEXT"), True),
             include_endpoint_metadata=_parse_bool(os.getenv("PRING_INCLUDE_ENDPOINT_METADATA"), True),
             include_endpoint_references=_parse_bool(os.getenv("PRING_INCLUDE_ENDPOINT_REFERENCES"), True),
@@ -175,6 +208,8 @@ class Settings:
             max_measuregroups_per_target=_int_or_none(os.getenv("PRING_MAX_MEASUREGROUPS_PER_TARGET"), 500),
             max_measuregroups_per_compound=_int_or_none(os.getenv("PRING_MAX_MEASUREGROUPS_PER_COMPOUND"), None),
             max_endpoints_per_pair=_int_or_none(os.getenv("PRING_MAX_ENDPOINTS_PER_PAIR"), 50),
+            max_similar_compounds_per_compound=_int_or_none(os.getenv("PRING_MAX_SIMILAR_COMPOUNDS_PER_COMPOUND"), 10),
+            max_textmine_records=_int_or_none(os.getenv("PRING_MAX_TEXTMINE_RECORDS"), None),
         )
         plugins_raw = os.getenv("PRING_PLUGINS", "")
         enabled_plugins = [p.strip() for p in plugins_raw.replace(";", ",").split(",") if p.strip()]
@@ -183,7 +218,12 @@ class Settings:
             write_csv_mirrors=_parse_bool(os.getenv("PRING_WRITE_CSV_MIRRORS"), True),
             max_http_cache_mb=_int_or_none(os.getenv("PRING_MAX_HTTP_CACHE_MB"), None),
             max_graph_artifact_mb=_int_or_none(os.getenv("PRING_MAX_GRAPH_ARTIFACT_MB"), None),
+            max_memory_mb=_int_or_none(os.getenv("PRING_MAX_MEMORY_MB"), None),
+            max_cpu_percent=_float_or_none(os.getenv("PRING_MAX_CPU_PERCENT"), None),
+            resource_check_interval_s=float(os.getenv("PRING_RESOURCE_CHECK_INTERVAL_S", "5.0")),
+            max_workers=int(os.getenv("PRING_MAX_WORKERS", "1")),
         )
+        textmining_file = os.getenv("PRING_TEXTMINING_FILE")
 
         return Settings(
             neo4j=neo,
@@ -201,6 +241,9 @@ class Settings:
             save_raw_http_cache=_parse_bool(os.getenv("PRING_SAVE_RAW_HTTP_CACHE"), True),
             save_extracted_artifacts=_parse_bool(os.getenv("PRING_SAVE_EXTRACTED_ARTIFACTS"), True),
             resources=resources,
+            textmining_file=Path(textmining_file) if textmining_file else None,
+            compound_similarity_method=os.getenv("PRING_COMPOUND_SIMILARITY_METHOD", "2d"),
+            compound_similarity_threshold=int(os.getenv("PRING_COMPOUND_SIMILARITY_THRESHOLD", "90")),
         )
 
 
@@ -234,5 +277,14 @@ def _int_or_none(v: Optional[str], default: Optional[int] = None) -> Optional[in
         return default
     try:
         return int(v)
+    except ValueError:
+        return default
+
+
+def _float_or_none(v: Optional[str], default: Optional[float] = None) -> Optional[float]:
+    if v is None or str(v).strip() == "":
+        return default
+    try:
+        return float(v)
     except ValueError:
         return default

@@ -241,10 +241,21 @@ class HttpClient:
                     continue
         raise RuntimeError(f"HTTP GET failed after retries: {url}") from last_exc
 
-    def post_json(self, url: str, data: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    def post_json(
+        self,
+        url: str,
+        data: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
+        *,
+        timeout_s: Optional[float] = None,
+        max_retries: Optional[int] = None,
+    ) -> Dict[str, Any]:
         """POST form data and parse JSON response.
 
         Used for SPARQL protocol endpoints (e.g., IDSM/ChemWebRDF).
+        Optional per-call timeout/retry overrides are useful for heavy SPARQL
+        evidence chunks, where retrying the exact same slow query can block the
+        whole build for many minutes.
         """
         # Cache key includes url + data
         p = self._cache_path(url, data, "json")
@@ -257,14 +268,29 @@ class HttpClient:
                 pass
 
         last_exc = None
-        for attempt in range(self.max_retries + 1):
+        effective_retries = self.max_retries if max_retries is None else max(0, int(max_retries))
+        effective_timeout = self.timeout_s if timeout_s is None else max(0.1, float(timeout_s))
+        for attempt in range(effective_retries + 1):
             try:
                 self._apply_pre_request_delay()
-                self._log.debug("POST %s data=%s", url, list((data or {}).keys()))
-                r = self._client.post(url, data=data, headers=headers)
+                self._log.debug(
+                    "POST %s data=%s timeout=%s retries=%s",
+                    url,
+                    list((data or {}).keys()),
+                    effective_timeout,
+                    effective_retries,
+                )
+                try:
+                    r = self._client.post(url, data=data, headers=headers, timeout=effective_timeout)
+                except TypeError as type_error:
+                    # Backwards compatibility for simple test doubles/older clients
+                    # that do not accept per-call timeout. Real httpx.Client does.
+                    if "timeout" not in str(type_error):
+                        raise
+                    r = self._client.post(url, data=data, headers=headers)
                 self._update_throttling_feedback(r)
                 if r.status_code in (429, 500, 502, 503, 504):
-                    if attempt < self.max_retries:
+                    if attempt < effective_retries:
                         self._retry_sleep(attempt, retry_after_s=self._parse_retry_after(r))
                         continue
                     last_exc = RuntimeError(f"retryable status {r.status_code}")
@@ -277,7 +303,7 @@ class HttpClient:
                 return out
             except Exception as e:
                 last_exc = e
-                if attempt < self.max_retries:
+                if attempt < effective_retries:
                     self._retry_sleep(attempt)
                     continue
         raise RuntimeError(f"HTTP POST failed after retries: {url}") from last_exc

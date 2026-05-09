@@ -7,3 +7,5 @@ tenacity
 pyyaml
 pydantic
 pydot
+httpx
+psutil
