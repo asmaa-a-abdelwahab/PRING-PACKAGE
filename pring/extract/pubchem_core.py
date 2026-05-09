@@ -6,6 +6,12 @@ import re
 from typing import Any, Dict, Iterable, Iterator, List, Tuple
 
 from pring.transform.normalizer import make_stable_id, normalize_id
+from pring.transform.target_normalization import (
+    infer_cyp_symbol,
+    infer_uniprot_id,
+    normalize_gene_props,
+    normalize_protein_props,
+)
 
 
 @dataclass(frozen=True)
@@ -176,36 +182,43 @@ def iter_graph_records(rows: Iterable[PubChemRow]) -> Iterator[Tuple[str, Dict]]
             if not pid:
                 continue
             protein_key = {"label": "Protein", "key": {"protein_id": pid}}
-            node("Protein", {"protein_id": pid}, {
+            protein_props = normalize_protein_props({
                 "protein_id": pid,
+                "uniprot_id": infer_uniprot_id(pid, _first_nonempty(d, "protein_term", "pubchem_uri")),
                 "name": _first_nonempty(d, "name", "label", "title"),
                 "protein_type": _first_nonempty(d, "protein_type", "type"),
                 "domain": d.get("domain"),
                 "sequence": d.get("sequence"),
                 "taxid": _as_int(_first_nonempty(d, "taxid", "tax_id")),
                 "pubchem_uri": _first_nonempty(d, "protein_term", "pubchem_uri"),
-            })
+            }, {"protein_id": pid})
+            node("Protein", {"protein_id": pid}, protein_props)
 
             gid = _as_text(d.get("gene_id"))
             if gid:
-                node("Gene", {"gene_id": gid}, {
+                gene_props = normalize_gene_props({
                     "gene_id": gid,
+                    "ncbi_gene_id": gid,
+                    "symbol": _first_nonempty(d, "gene_symbol", "symbol") or protein_props.get("cyp_symbol"),
                     "pubchem_uri": d.get("gene_term"),
-                })
+                }, {"gene_id": gid})
+                node("Gene", {"gene_id": gid}, gene_props)
                 rel("ENCODED_BY", protein_key, {"label": "Gene", "key": {"gene_id": gid}})
 
         elif r.kind == "gene":
             gid = _as_text(d.get("gene_id"))
             if not gid:
                 continue
-            node("Gene", {"gene_id": gid}, {
+            gene_props = normalize_gene_props({
                 "gene_id": gid,
-                "symbol": d.get("symbol"),
+                "ncbi_gene_id": gid,
+                "symbol": _first_nonempty(d, "symbol", "gene_symbol"),
                 "name": _first_nonempty(d, "name", "label", "title"),
                 "gene_type": _first_nonempty(d, "gene_type", "type"),
                 "encoding": d.get("encoding"),
                 "pubchem_uri": _first_nonempty(d, "gene_term", "pubchem_uri"),
-            })
+            }, {"gene_id": gid})
+            node("Gene", {"gene_id": gid}, gene_props)
 
         elif r.kind == "organism":
             taxid = _as_int(_first_nonempty(d, "taxid", "tax_id"))

@@ -19,6 +19,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set
 
 from pring.extract.pubchem_core import PubChemRow
 from pring.io.http import HttpClient
+from pring.transform.target_normalization import infer_cyp_symbol, infer_uniprot_id
 
 log = logging.getLogger("pring.enrich")
 
@@ -95,7 +96,20 @@ def iter_external_enrichment_rows(
                 protein_id = protein.get("protein_id") or acc
 
                 if "uniprot" in requested and rec:
-                    yield PubChemRow("uniprot", _uniprot_row(protein_id, acc, rec))
+                    urow = _uniprot_row(protein_id, acc, rec)
+                    yield PubChemRow("uniprot", urow)
+                    # Add an optional Protein update row with normalized aliases
+                    # from UniProt. The core extraction behavior is unchanged;
+                    # Neo4j will MERGE this onto the existing Protein node.
+                    yield PubChemRow("protein", {
+                        "protein_id": protein_id,
+                        "uniprot_id": acc,
+                        "accession": acc,
+                        "name": urow.get("protein_name"),
+                        "gene_symbol": urow.get("gene_symbol"),
+                        "cyp_symbol": urow.get("cyp_symbol"),
+                        "taxid": urow.get("taxid"),
+                    })
 
                 if "go" in requested and rec:
                     for row in _go_rows(protein_id, rec, max_records=max_records):
@@ -177,7 +191,7 @@ def load_enrichment_inputs(store: Any) -> EnrichmentInputs:
             continue
         p = dict(props)
         p["protein_id"] = pid
-        p["uniprot_acc"] = _extract_uniprot_acc(pid, props.get("pubchem_uri"))
+        p["uniprot_acc"] = props.get("uniprot_id") or props.get("uniprot_acc") or _extract_uniprot_acc(pid, props.get("pubchem_uri"))
         proteins[pid] = p
 
     for rec in _read_jsonl(Path(store.nodes_dir) / "Compound.jsonl"):
@@ -219,11 +233,16 @@ def _uniprot_row(protein_id: str, acc: str, rec: Dict[str, Any]) -> Dict[str, An
     org = rec.get("organism") or {}
     comments = rec.get("comments") or []
     function_text = _first_comment_text(comments, "FUNCTION")
+    protein_name = _protein_name(rec)
+    gene_symbol = _primary_gene_symbol(rec)
+    cyp_symbol = infer_cyp_symbol(gene_symbol, protein_name, acc, rec.get("uniProtkbId"))
     return {
         "protein_id": protein_id,
         "uniprot_acc": acc,
         "reviewed": rec.get("entryType") == "UniProtKB reviewed (Swiss-Prot)",
-        "protein_name": _protein_name(rec),
+        "protein_name": protein_name,
+        "gene_symbol": gene_symbol,
+        "cyp_symbol": cyp_symbol,
         "organism": org.get("scientificName") or org.get("commonName"),
         "taxid": _as_int((org.get("taxonId") if isinstance(org, dict) else None)),
         "sequence_length": seq.get("length"),
@@ -550,6 +569,16 @@ def _protein_name(rec: Dict[str, Any]) -> Optional[str]:
     rec_name = desc.get("recommendedName") or {}
     full = rec_name.get("fullName") or {}
     return full.get("value") or rec.get("uniProtkbId")
+
+
+def _primary_gene_symbol(rec: Dict[str, Any]) -> Optional[str]:
+    for gene in rec.get("genes") or []:
+        if not isinstance(gene, dict):
+            continue
+        gene_name = gene.get("geneName") or {}
+        if isinstance(gene_name, dict) and gene_name.get("value"):
+            return str(gene_name.get("value"))
+    return None
 
 
 def _first_comment_text(comments: List[Dict[str, Any]], comment_type: str) -> Optional[str]:

@@ -8,6 +8,8 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Iterator
 
+from pring.transform.target_normalization import normalize_node_record
+
 
 class RunStore:
     """Filesystem-backed store for run artifacts.
@@ -125,9 +127,16 @@ class RunStore:
             self.save_node(n)
 
     def save_node(self, n: Dict[str, Any]) -> None:
-        """Persist a single canonical node record."""
+        """Persist a single canonical node record.
+
+        Protein and Gene nodes are enriched with deterministic normalized target
+        aliases here, so both fresh runs and post-run materialization keep
+        query-friendly properties such as ``uniprot_id``, ``cyp_symbol``,
+        ``symbol``, and ``ncbi_gene_id`` without changing extraction logic.
+        """
         if not self.save_extracted:
             return
+        n = normalize_node_record(n)
         label = n.get("label", "Unknown")
         self._ensure_graph_budget(self._estimate_jsonl_size(n), f"node:{label}")
         self.append_jsonl(self.nodes_dir / f"{label}.jsonl", n)
