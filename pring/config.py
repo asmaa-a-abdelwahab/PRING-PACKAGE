@@ -82,6 +82,8 @@ class BuildCaps:
     max_endpoints_per_pair: Optional[int] = 50
     max_similar_compounds_per_compound: Optional[int] = 10
     max_textmine_records: Optional[int] = None
+    max_textmine_records_per_target: Optional[int] = 250
+    max_textmine_references_per_pair: Optional[int] = 5
 
 
 @dataclass(frozen=True)
@@ -148,6 +150,7 @@ class Settings:
     save_extracted_artifacts: bool = True
     resources: ResourceProfile = field(default_factory=ResourceProfile)
     textmining_file: Optional[Path] = None
+    textmining_source: str = "auto"  # auto | pubchem | file
     compound_similarity_method: str = "2d"
     compound_similarity_threshold: int = 90
     enrichment_timeout_s: float = 45.0
@@ -216,6 +219,8 @@ class Settings:
             max_endpoints_per_pair=_int_or_none(os.getenv("PRING_MAX_ENDPOINTS_PER_PAIR"), 50),
             max_similar_compounds_per_compound=_int_or_none(os.getenv("PRING_MAX_SIMILAR_COMPOUNDS_PER_COMPOUND"), 10),
             max_textmine_records=_int_or_none(os.getenv("PRING_MAX_TEXTMINE_RECORDS"), None),
+            max_textmine_records_per_target=_int_or_none(os.getenv("PRING_MAX_TEXTMINE_RECORDS_PER_TARGET"), 250),
+            max_textmine_references_per_pair=_int_or_none(os.getenv("PRING_MAX_TEXTMINE_REFERENCES_PER_PAIR"), 5),
         )
         plugins_raw = os.getenv("PRING_PLUGINS", "")
         enabled_plugins = [p.strip() for p in plugins_raw.replace(";", ",").split(",") if p.strip()]
@@ -250,6 +255,7 @@ class Settings:
             save_extracted_artifacts=_parse_bool(os.getenv("PRING_SAVE_EXTRACTED_ARTIFACTS"), True),
             resources=resources,
             textmining_file=Path(textmining_file) if textmining_file else None,
+            textmining_source=os.getenv("PRING_TEXTMINING_SOURCE", "auto").strip().lower() or "auto",
             compound_similarity_method=os.getenv("PRING_COMPOUND_SIMILARITY_METHOD", "2d"),
             compound_similarity_threshold=int(os.getenv("PRING_COMPOUND_SIMILARITY_THRESHOLD", "90")),
             enrichment_timeout_s=float(os.getenv("PRING_ENRICHMENT_TIMEOUT_S", "45.0")),

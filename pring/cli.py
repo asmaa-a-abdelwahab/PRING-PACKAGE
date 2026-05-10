@@ -6,7 +6,7 @@ import logging
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator, List, Optional, Tuple, Iterable, Set
+from typing import Dict, Iterator, List, Optional, Tuple, Iterable, Set
 
 from pring.config import Settings, BuildCaps, BuildFlags
 from pring.extract.query_plan import decide_mode, decide_scope, load_id_file, Mode, Scope
@@ -16,7 +16,7 @@ from pring.extract.pubchem_core import PubChemRow, iter_graph_records, to_graph_
 from pring.neo4j.driver import Neo4jDriver
 from pring.neo4j.loader import Neo4jLoader
 from pring.plugins import load_plugins, normalize_plugin_list
-from pring.extract.textmining_import import iter_textmining_csv_rows
+from pring.extract.textmining_import import iter_textmining_csv_rows, iter_pubchem_textmining_sparql_rows
 from pring.enrich.compound_similarity import iter_compound_similarity_rows
 from pring.utils import setup_logging, RunStore
 from pring.utils.resource_control import ResourceGuard, ResourceLimitExceeded
@@ -95,6 +95,8 @@ def _apply_resource_profile(settings: Settings, profile: str, raw_argv: List[str
             max_endpoints_per_pair=caps.max_endpoints_per_pair if _flag_present(raw_argv, "--max-endpoints-per-pair") else _min_cap(caps.max_endpoints_per_pair, 25),
             max_similar_compounds_per_compound=caps.max_similar_compounds_per_compound if _flag_present(raw_argv, "--max-similar-compounds-per-compound") else _min_cap(caps.max_similar_compounds_per_compound, 5),
             max_textmine_records=caps.max_textmine_records,
+            max_textmine_records_per_target=caps.max_textmine_records_per_target,
+            max_textmine_references_per_pair=caps.max_textmine_references_per_pair,
         )
     elif profile == "high":
         if not _flag_present(raw_argv, "--batch-size"):
@@ -361,6 +363,58 @@ def _compound_cids_from_artifacts(store: RunStore, fallback_chem_ids: List[str])
     return sorted(cids)
 
 
+def _target_terms_from_artifacts(store: RunStore) -> Tuple[List[str], List[str]]:
+    """Return PubChem protein:/gene: terms present in the extracted graph."""
+    proteins: Set[str] = set()
+    genes: Set[str] = set()
+    protein_file = store.nodes_dir / "Protein.jsonl"
+    if protein_file.exists():
+        for rec in _iter_jsonl(protein_file):
+            key = rec.get("key") or {}
+            props = rec.get("props") or {}
+            raw = key.get("protein_id") or props.get("protein_id") or props.get("uniprot_id") or props.get("accession")
+            uri = props.get("pubchem_uri")
+            term = _pubchem_term("protein", raw, uri)
+            if term:
+                proteins.add(term)
+    gene_file = store.nodes_dir / "Gene.jsonl"
+    if gene_file.exists():
+        for rec in _iter_jsonl(gene_file):
+            key = rec.get("key") or {}
+            props = rec.get("props") or {}
+            raw = key.get("gene_id") or props.get("gene_id") or props.get("ncbi_gene_id")
+            uri = props.get("pubchem_uri")
+            term = _pubchem_term("gene", raw, uri)
+            if term:
+                genes.add(term)
+    return sorted(proteins), sorted(genes)
+
+
+def _compound_terms_from_artifacts(store: RunStore, fallback_chem_ids: List[str]) -> List[str]:
+    return [f"compound:CID{cid}" for cid in _compound_cids_from_artifacts(store, fallback_chem_ids)]
+
+
+def _pubchem_term(kind: str, raw: object, uri: object = None) -> Optional[str]:
+    for value in (uri, raw):
+        if value in (None, ""):
+            continue
+        text = str(value).strip()
+        if text.startswith(f"{kind}:"):
+            return text
+        if "/pubchem/" in text:
+            parts = text.rstrip("/").rsplit("/", 2)[-2:]
+            if len(parts) == 2 and parts[0] == kind:
+                return f"{parts[0]}:{parts[1]}"
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if kind == "protein":
+        return text if text.startswith("protein:") else f"protein:{text}"
+    if kind == "gene":
+        return text if text.startswith("gene:") else f"gene:{text}"
+    return None
+
+
 def _write_textmining_template(run_dir: Path) -> Path:
     """Write a CSV template documenting the text-mining import contract."""
     template_dir = Path(run_dir) / "templates"
@@ -415,7 +469,6 @@ def _resolve_textmining_file(value: Optional[Path], run_dir: Path) -> Optional[P
     for candidate in Path(run_dir).glob("**/*text*min*.csv"):
         if candidate.is_file() and "template" not in candidate.name.lower():
             return candidate
-    _write_textmining_template(run_dir)
     return None
 
 def _add_shared_args(parser: argparse.ArgumentParser, *, default_suppress: bool = False) -> None:
@@ -468,9 +521,11 @@ def _add_shared_args(parser: argparse.ArgumentParser, *, default_suppress: bool 
 
     # Flags
     parser.add_argument("--include-textmining", type=str, choices=["true", "false"], default=default,
-                        help="Add the separate text-mined co-occurrence layer from --textmining-file.")
+                        help="Add the separate text-mined co-occurrence layer. Default source is auto: local file if present, otherwise PubChem SPARQL endpoint.")
+    parser.add_argument("--textmining-source", type=str, choices=["auto", "pubchem", "file"], default=default,
+                        help="Text-mining source: auto, pubchem endpoint, or local file. Default: auto.")
     parser.add_argument("--textmining-file", type=str, default=default,
-                        help="CSV/TSV file for text-mined co-occurrences. Used only when --include-textmining=true.")
+                        help="Optional CSV/TSV file for text-mined co-occurrences, or 'auto' to search common paths. Used when source=file or auto with a file present.")
     parser.add_argument("--include-compound-similarity", type=str, choices=["true", "false"], default=default,
                         help="Add PubChem PUG-REST compound similarity edges as a separate enrichment over extracted compounds.")
     parser.add_argument("--compound-similarity-method", type=str, choices=["2d", "3d"], default=default,
@@ -499,7 +554,11 @@ def _add_shared_args(parser: argparse.ArgumentParser, *, default_suppress: bool 
     parser.add_argument("--max-similar-compounds-per-compound", type=str, default=default,
                         help="Maximum similar compounds per extracted compound when similarity enrichment is enabled.")
     parser.add_argument("--max-textmine-records", type=str, default=default,
-                        help="Maximum imported text-mining rows from --textmining-file.")
+                        help="Global maximum text-mining co-occurrence rows from file or PubChem endpoint.")
+    parser.add_argument("--max-textmine-records-per-target", type=str, default=default,
+                        help="Maximum PubChem text-mining co-occurrence rows per target/gene. Default: 250.")
+    parser.add_argument("--max-textmine-references-per-pair", type=str, default=default,
+                        help="Maximum references/snippets kept per compound-target text-mining pair when the endpoint exposes them. Default: 5.")
 
     # Cache + runtime
     parser.add_argument("--cache-dir", type=str, default=default, help="Cache directory for downloads/HTTP responses.")
@@ -851,11 +910,20 @@ def main(argv: Optional[List[str]] = None) -> None:
         max_endpoints_per_pair=settings.caps.max_endpoints_per_pair if args.max_endpoints_per_pair is None else _parse_int_or_none(args.max_endpoints_per_pair),
         max_similar_compounds_per_compound=settings.caps.max_similar_compounds_per_compound if args.max_similar_compounds_per_compound is None else _parse_int_or_none(args.max_similar_compounds_per_compound),
         max_textmine_records=settings.caps.max_textmine_records if args.max_textmine_records is None else _parse_int_or_none(args.max_textmine_records),
+        max_textmine_records_per_target=settings.caps.max_textmine_records_per_target if getattr(args, "max_textmine_records_per_target", None) is None else _parse_int_or_none(args.max_textmine_records_per_target),
+        max_textmine_references_per_pair=settings.caps.max_textmine_references_per_pair if getattr(args, "max_textmine_references_per_pair", None) is None else _parse_int_or_none(args.max_textmine_references_per_pair),
     )
+    textmining_source = getattr(settings, "textmining_source", "auto") or "auto"
+    if getattr(args, "textmining_source", None):
+        textmining_source = args.textmining_source
+    textmining_source = str(textmining_source).strip().lower() or "auto"
+
     textmining_file = settings.textmining_file
     if getattr(args, "textmining_file", None):
         textmining_file = Path(args.textmining_file)
-    textmining_file = _resolve_textmining_file(textmining_file, run_dir)
+    elif flags.include_textmining and textmining_source in {"auto", "file"} and textmining_file is None:
+        textmining_file = Path("auto")
+    textmining_file = _resolve_textmining_file(textmining_file, run_dir) if textmining_source in {"auto", "file"} else None
     similarity_method = settings.compound_similarity_method
     if getattr(args, "compound_similarity_method", None):
         similarity_method = args.compound_similarity_method
@@ -863,7 +931,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     if getattr(args, "compound_similarity_threshold", None) is not None:
         similarity_threshold = int(args.compound_similarity_threshold)
 
-    settings = settings.with_overrides(flags=flags, caps=caps, textmining_file=textmining_file, compound_similarity_method=similarity_method, compound_similarity_threshold=similarity_threshold)
+    settings = settings.with_overrides(flags=flags, caps=caps, textmining_file=textmining_file, textmining_source=textmining_source, compound_similarity_method=similarity_method, compound_similarity_threshold=similarity_threshold)
 
     # Plugins / external enrichment
     plugin_args = args.plugins or []
@@ -943,7 +1011,8 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "run_dir": str(run_dir),
                 "log_file": str(log_path),
                 "cache_dir": str(settings.cache_dir),
-                "textmining_file": str(settings.textmining_file) if settings.textmining_file else None,
+                "textmining_source": getattr(settings, "textmining_source", "auto"),
+            "textmining_file": str(settings.textmining_file) if settings.textmining_file else None,
                 "bindingdb_file": str(settings.bindingdb_file) if getattr(settings, "bindingdb_file", None) else None,
                 "drugbank_file": str(settings.drugbank_file) if getattr(settings, "drugbank_file", None) else None,
             },
@@ -1020,6 +1089,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             "run_dir": str(run_dir),
             "log_file": str(log_path),
             "cache_dir": str(settings.cache_dir),
+            "textmining_source": getattr(settings, "textmining_source", "auto"),
             "textmining_file": str(settings.textmining_file) if settings.textmining_file else None,
             "bindingdb_file": str(settings.bindingdb_file) if getattr(settings, "bindingdb_file", None) else None,
             "drugbank_file": str(settings.drugbank_file) if getattr(settings, "drugbank_file", None) else None,
@@ -1128,22 +1198,49 @@ def main(argv: Optional[List[str]] = None) -> None:
     # only add separate evidence/enrichment records over the extracted/searched entities.
     textmine_rows = textmine_nodes = textmine_rels = 0
     if settings.flags.include_textmining:
-        if settings.textmining_file is None:
+        source = str(getattr(settings, "textmining_source", "auto") or "auto").lower()
+        use_file = settings.textmining_file is not None and settings.textmining_file.exists()
+        if source == "file" and not use_file:
             template = _write_textmining_template(run_dir)
-            log.warning("--include-textmining=true but no --textmining-file was provided; skipping text-mining rows. A template was written to %s", template)
-        elif not settings.textmining_file.exists():
-            template = _write_textmining_template(run_dir)
-            log.warning("Text-mining file not found: %s; skipping text-mining rows. A template was written to %s", settings.textmining_file, template)
-        else:
-            textmine_rows, textmine_nodes, textmine_rels = _append_layer_rows(
-                iter_textmining_csv_rows(settings.textmining_file, max_records=settings.caps.max_textmine_records),
-                store,
-                guard,
-            )
+            log.warning("Text-mining source=file but file was not found: %s; skipping text-mining rows. A template was written to %s", settings.textmining_file, template)
+        elif use_file:
+            textmine_iter = iter_textmining_csv_rows(settings.textmining_file, max_records=settings.caps.max_textmine_records)
+            textmine_rows, textmine_nodes, textmine_rels = _append_layer_rows(textmine_iter, store, guard)
             node_count += textmine_nodes
             rel_count += textmine_rels
             row_count += textmine_rows
-            log.info("Text-mining layer: rows=%d nodes=%d rels=%d", textmine_rows, textmine_nodes, textmine_rels)
+            log.info("Text-mining file layer: rows=%d nodes=%d rels=%d", textmine_rows, textmine_nodes, textmine_rels)
+        else:
+            # Endpoint-backed text mining: read target/compound terms from the
+            # already extracted graph and query PubChemRDF through the same
+            # SPARQL mirror. No local template/file is required.
+            protein_terms, gene_terms = _target_terms_from_artifacts(store)
+            compound_terms = _compound_terms_from_artifacts(store, chem_ids)
+            if not (protein_terms or gene_terms):
+                log.warning("Text-mining endpoint requested, but no Protein/Gene nodes were available from the extracted graph; skipping.")
+            else:
+                sparql_cache = (settings.cache_dir / "sparql_textmining") if settings.save_raw_http_cache else None
+                text_client = _make_sparql_client(settings, sparql_cache)
+                try:
+                    textmine_iter = iter_pubchem_textmining_sparql_rows(
+                        text_client,
+                        compound_terms=compound_terms,
+                        protein_terms=protein_terms,
+                        gene_terms=gene_terms,
+                        max_records=settings.caps.max_textmine_records,
+                        max_records_per_target=getattr(settings.caps, "max_textmine_records_per_target", 250),
+                        max_references_per_pair=getattr(settings.caps, "max_textmine_references_per_pair", 5),
+                    )
+                    textmine_rows, textmine_nodes, textmine_rels = _append_layer_rows(textmine_iter, store, guard)
+                finally:
+                    try:
+                        text_client.close()
+                    except Exception:
+                        pass
+                node_count += textmine_nodes
+                rel_count += textmine_rels
+                row_count += textmine_rows
+                log.info("PubChem text-mining endpoint layer: rows=%d nodes=%d rels=%d", textmine_rows, textmine_nodes, textmine_rels)
 
     sim_rows = sim_nodes = sim_rels = 0
     if settings.flags.include_compound_similarity:

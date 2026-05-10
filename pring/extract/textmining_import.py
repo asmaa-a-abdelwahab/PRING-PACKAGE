@@ -10,7 +10,7 @@ that the columns map to the fields below.
 
 import csv
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Iterable, Iterator, Optional
 
 from pring.extract.pubchem_core import PubChemRow
 from pring.transform.normalizer import make_stable_id, normalize_id
@@ -166,3 +166,242 @@ def _reference_id(row: Dict[str, Any]) -> Optional[str]:
     if doi:
         return f"DOI:{doi}"
     return None
+
+# ---------------------------------------------------------------------------
+# PubChem endpoint-backed text-mining import
+# ---------------------------------------------------------------------------
+
+import logging
+import re
+from typing import Set
+
+log = logging.getLogger("pring.textmining")
+
+
+def _term_from_node(label: str, identifier: Any, pubchem_uri: Any = None) -> Optional[str]:
+    """Build a PubChem CURIE-like term from a PRING node id/property."""
+    for value in (pubchem_uri, identifier):
+        if value in (None, ""):
+            continue
+        text = str(value).strip()
+        if text.startswith(("compound:", "protein:", "gene:", "disease:", "reference:")):
+            return text
+        if "/pubchem/" in text:
+            tail = text.rstrip("/").rsplit("/", 2)[-2:]
+            if len(tail) == 2:
+                return f"{tail[0]}:{tail[1]}"
+    text = str(identifier or "").strip()
+    if not text:
+        return None
+    if label == "Compound":
+        if text.startswith("CID"):
+            return f"compound:{text}"
+        if text.isdigit():
+            return f"compound:CID{text}"
+    if label == "Protein":
+        return text if text.startswith("protein:") else f"protein:{text}"
+    if label == "Gene":
+        return text if text.startswith("gene:") else f"gene:{text}"
+    return None
+
+
+def iter_pubchem_textmining_sparql_rows(
+    client: Any,
+    *,
+    compound_terms: Optional[Iterable[str]] = None,
+    protein_terms: Optional[Iterable[str]] = None,
+    gene_terms: Optional[Iterable[str]] = None,
+    max_records: Optional[int] = None,
+    max_records_per_target: Optional[int] = 250,
+    max_references_per_pair: Optional[int] = 5,
+) -> Iterator[PubChemRow]:
+    """Fetch a separate PubChemRDF text-mined co-occurrence layer.
+
+    The layer is intentionally weak/context evidence and is never converted into
+    curated positive labels. The query is target-bounded and optionally
+    compound-bounded so it remains safe for public SPARQL mirrors.
+    """
+    # Imported lazily to avoid coupling the CSV importer to the SPARQL extractor.
+    from pring.extract.pubchem_sparql_mirror import SPARQL_PREFIXES, iri_to_term
+
+    compounds = sorted({str(x).strip() for x in (compound_terms or []) if str(x).strip()})
+    targets = sorted({str(x).strip() for x in list(protein_terms or []) + list(gene_terms or []) if str(x).strip()})
+    if not targets:
+        log.warning("Text-mining endpoint requested, but no protein/gene target terms were available from the extracted graph.")
+        return
+
+    global_limit = None if max_records is None else max(0, int(max_records))
+    per_target_limit = None if max_records_per_target is None else max(1, int(max_records_per_target))
+    refs_per_pair = None if max_references_per_pair is None else max(1, int(max_references_per_pair))
+    emitted = 0
+    seen: Set[str] = set()
+
+    yield PubChemRow("textmine", {
+        "textmine_id": "textmine:pubchem_rdf_cooccurrence",
+        "method_id": "textmine:pubchem_rdf_cooccurrence",
+        "name": "PubChemRDF co-occurrence endpoint",
+        "version": "endpoint",
+        "source": getattr(getattr(client, "cfg", None), "endpoint_url", "PubChemRDF SPARQL"),
+    })
+
+    for target in targets:
+        if global_limit is not None and emitted >= global_limit:
+            break
+        remaining = None if global_limit is None else max(0, global_limit - emitted)
+        limit = per_target_limit if remaining is None else min(per_target_limit or remaining, remaining)
+        if not limit:
+            break
+        compound_values = ""
+        # Always try to bind compounds. If the user provided extracted compounds,
+        # use them as a VALUES filter; otherwise let the endpoint return any
+        # compound co-mentioned with the target.
+        compound_bound_clause = "?cooc ?compoundPred ?compound ."
+        if compounds:
+            # Keep the VALUES list modest; the curated graph already bounds the
+            # candidate compounds. Large target-only text mining should be done
+            # with a higher max_textmine_records_per_target instead of huge VALUES.
+            comp_vals = " ".join(compounds[:500])
+            compound_values = f"VALUES ?compound {{ {comp_vals} }}"
+        query = f"""{SPARQL_PREFIXES}
+PREFIX cooccurrence: <http://rdf.ncbi.nlm.nih.gov/pubchem/cooccurrence/>
+PREFIX disease: <http://rdf.ncbi.nlm.nih.gov/pubchem/disease/>
+PREFIX reference: <http://rdf.ncbi.nlm.nih.gov/pubchem/reference/>
+
+SELECT DISTINCT ?cooc ?compound ?protein ?gene ?disease ?reference ?score ?sentenceCount ?context WHERE {{
+  VALUES ?target {{ {target} }}
+  ?cooc ?targetPred ?target .
+  FILTER(STRSTARTS(STR(?cooc), STR(cooccurrence:)))
+
+  OPTIONAL {{
+    {compound_values}
+    {compound_bound_clause}
+    FILTER(STRSTARTS(STR(?compound), STR(compound:)))
+  }}
+  OPTIONAL {{ ?cooc ?proteinPred ?protein . FILTER(STRSTARTS(STR(?protein), STR(protein:))) }}
+  OPTIONAL {{ ?cooc ?genePred ?gene . FILTER(STRSTARTS(STR(?gene), STR(gene:))) }}
+  OPTIONAL {{ ?cooc ?diseasePred ?disease . FILTER(STRSTARTS(STR(?disease), STR(disease:))) }}
+  OPTIONAL {{ ?cooc ?referencePred ?reference . FILTER(STRSTARTS(STR(?reference), STR(reference:))) }}
+  OPTIONAL {{ ?cooc ?scorePred ?score . FILTER(isNumeric(?score)) }}
+  OPTIONAL {{ ?cooc ?sentenceCountPred ?sentenceCount . FILTER(isNumeric(?sentenceCount)) }}
+  OPTIONAL {{ ?cooc rdfs:comment ?context }}
+}}
+LIMIT {int(limit)}"""
+        try:
+            rows = client.select(query, timeout_s=getattr(getattr(client, "cfg", None), "evidence_timeout_s", None), max_retries=0)
+        except TypeError:
+            rows = client.select(query)
+        except Exception as exc:
+            log.warning("PubChem text-mining endpoint query failed for %s: %s", target, exc)
+            continue
+
+        pair_ref_counts: Dict[tuple[str, str], int] = {}
+        for b in rows:
+            if global_limit is not None and emitted >= global_limit:
+                break
+            cooc_term = _binding_term(b, "cooc", iri_to_term)
+            if not cooc_term:
+                continue
+            compound = _binding_term(b, "compound", iri_to_term)
+            protein = _binding_term(b, "protein", iri_to_term)
+            gene = _binding_term(b, "gene", iri_to_term)
+            disease = _binding_term(b, "disease", iri_to_term)
+            ref = _binding_term(b, "reference", iri_to_term)
+
+            # Some endpoint rows only bind the requested target. Preserve it.
+            if target.startswith("protein:") and not protein:
+                protein = target
+            if target.startswith("gene:") and not gene:
+                gene = target
+
+            pair_key = (compound or "", protein or gene or target)
+            if refs_per_pair is not None and ref:
+                current = pair_ref_counts.get(pair_key, 0)
+                if current >= refs_per_pair:
+                    continue
+                pair_ref_counts[pair_key] = current + 1
+
+            cooc_id = cooc_term.replace("cooccurrence:", "cooc:")
+            uniq = "|".join([cooc_id, compound or "", protein or "", gene or "", disease or "", ref or ""])
+            if uniq in seen:
+                continue
+            seen.add(uniq)
+
+            data: Dict[str, Any] = {
+                "cooc_id": cooc_id,
+                "cid": _cid_from_term(compound),
+                "protein_id": _protein_id_from_term(protein),
+                "gene_id": _gene_id_from_term(gene),
+                "disease_id": _disease_id_from_term(disease),
+                "reference_id": _reference_id_from_term(ref),
+                "score": _binding_value(b, "score"),
+                "sentence_count": _binding_value(b, "sentenceCount"),
+                "mention_context": _binding_value(b, "context"),
+                "association_type": "compound-target cooccurrence" if compound and (protein or gene) else "entity cooccurrence",
+                "direction": "unknown",
+                "evidence_level": "text_mined_weak_context",
+                "method_id": "textmine:pubchem_rdf_cooccurrence",
+                "method_name": "PubChemRDF co-occurrence endpoint",
+                "method_version": "endpoint",
+                "method_source": getattr(getattr(client, "cfg", None), "endpoint_url", "PubChemRDF SPARQL"),
+            }
+            if data.get("cid") is None and compounds:
+                # Do not create target-only Cooc records when the user explicitly
+                # bounded text mining to extracted compounds and the endpoint did
+                # not return a compound binding.
+                continue
+            emitted += 1
+            yield PubChemRow("cooc", data)
+            yield PubChemRow("cooc_textmine", data)
+            if data.get("cid") is not None:
+                yield PubChemRow("cooc_compound", data)
+            if data.get("protein_id"):
+                yield PubChemRow("cooc_protein", data)
+            if data.get("gene_id"):
+                yield PubChemRow("cooc_gene", data)
+            if data.get("disease_id"):
+                yield PubChemRow("cooc_disease", data)
+            if data.get("reference_id"):
+                yield PubChemRow("cooc_reference", data)
+
+    if emitted == 0:
+        log.info("PubChem text-mining endpoint returned no co-occurrence rows for the extracted target/compound scope.")
+
+
+def _binding_term(binding: Dict[str, Any], key: str, converter: Any) -> Optional[str]:
+    value = ((binding.get(key) or {}).get("value") if isinstance(binding.get(key), dict) else None)
+    return converter(value) if value else None
+
+
+def _binding_value(binding: Dict[str, Any], key: str) -> Optional[Any]:
+    return ((binding.get(key) or {}).get("value") if isinstance(binding.get(key), dict) else None)
+
+
+def _cid_from_term(term: Optional[str]) -> Optional[int]:
+    if not term:
+        return None
+    m = re.search(r"CID(\d+)$", str(term))
+    return int(m.group(1)) if m else None
+
+
+def _protein_id_from_term(term: Optional[str]) -> Optional[str]:
+    if not term:
+        return None
+    return str(term).rsplit(":", 1)[-1]
+
+
+def _gene_id_from_term(term: Optional[str]) -> Optional[str]:
+    if not term:
+        return None
+    return str(term).rsplit(":", 1)[-1]
+
+
+def _disease_id_from_term(term: Optional[str]) -> Optional[str]:
+    if not term:
+        return None
+    return str(term).rsplit(":", 1)[-1]
+
+
+def _reference_id_from_term(term: Optional[str]) -> Optional[str]:
+    if not term:
+        return None
+    return str(term).rsplit(":", 1)[-1]

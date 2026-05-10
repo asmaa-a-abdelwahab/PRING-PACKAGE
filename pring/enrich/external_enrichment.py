@@ -350,51 +350,83 @@ def _pdb_rows(protein_id: str, rec: Dict[str, Any], *, max_records: Optional[int
 
 
 def _alphafold_rows(client: HttpClient, protein_id: str, acc: str, *, max_records: Optional[int]) -> Iterator[Dict[str, Any]]:
-    data = _safe_get_json(client, f"https://alphafold.ebi.ac.uk/api/prediction/{acc}")
+    """Yield AlphaFold model rows for a UniProt accession.
+
+    The AlphaFold DB API response has evolved over time. Recent responses use
+    fields such as ``modelEntityId`` and ``globalMetricValue`` while older
+    parsers often expected ``modelIdentifier`` and ``uniprotAveragePlddt``. Keep
+    support for both so successful API calls are not incorrectly treated as
+    failures.
+    """
+    data = _safe_get_json(client, f"https://alphafold.ebi.ac.uk/api/prediction/{acc}", warn=False)
     if isinstance(data, list) and data:
         for i, item in enumerate(data):
             if max_records is not None and i >= max_records:
                 break
-            model_id = item.get("entryId") or item.get("modelIdentifier") or f"AF-{acc}-F1"
+            if not isinstance(item, dict):
+                continue
+            model_id = (
+                item.get("entryId")
+                or item.get("modelEntityId")
+                or item.get("modelIdentifier")
+                or f"AF-{acc}-F1"
+            )
+            row_acc = item.get("uniprotAccession") or acc
             yield {
                 "protein_id": protein_id,
-                "uniprot_acc": acc,
+                "uniprot_acc": row_acc,
                 "alphafold_id": model_id,
                 "model_version": item.get("latestVersion") or item.get("version"),
                 "confidence_summary": item.get("confidenceCategory"),
-                "average_plddt": item.get("uniprotAveragePlddt"),
+                "average_plddt": item.get("uniprotAveragePlddt") or item.get("globalMetricValue"),
+                "fraction_plddt_very_low": item.get("fractionPlddtVeryLow"),
+                "fraction_plddt_low": item.get("fractionPlddtLow"),
+                "fraction_plddt_confident": item.get("fractionPlddtConfident"),
+                "fraction_plddt_very_high": item.get("fractionPlddtVeryHigh"),
+                "gene_symbol": item.get("gene"),
+                "uniprot_id": item.get("uniprotId"),
+                "protein_name": item.get("uniprotDescription"),
+                "taxid": _as_int(item.get("taxId")),
+                "organism": item.get("organismScientificName"),
+                "sequence_start": _as_int(item.get("sequenceStart") or item.get("uniprotStart")),
+                "sequence_end": _as_int(item.get("sequenceEnd") or item.get("uniprotEnd")),
+                "sequence_length": _as_int(item.get("sequenceEnd") or item.get("uniprotEnd")),
+                "is_reviewed": item.get("isReviewed") if item.get("isReviewed") is not None else item.get("isUniProtReviewed"),
                 "pdb_url": item.get("pdbUrl"),
                 "cif_url": item.get("cifUrl"),
+                "bcif_url": item.get("bcifUrl"),
                 "pae_url": item.get("paeDocUrl"),
-                "storage_uri": item.get("pdbUrl") or item.get("cifUrl"),
-                "source_url": f"https://alphafold.ebi.ac.uk/entry/{acc}",
+                "pae_image_url": item.get("paeImageUrl"),
+                "plddt_doc_url": item.get("plddtDocUrl"),
+                "msa_url": item.get("msaUrl"),
+                "storage_uri": item.get("pdbUrl") or item.get("cifUrl") or item.get("bcifUrl"),
+                "source_url": f"https://alphafold.ebi.ac.uk/entry/{model_id}",
                 "model_status": "api_confirmed",
                 "source": "AlphaFold Protein Structure Database API",
             }
         return
 
-    # Conservative fallback: AlphaFold uses stable public URL patterns for most
-    # UniProt accessions. Mark these rows as unverified so downstream analyses
-    # can choose whether to use them. This prevents CYP targets from losing the
-    # AlphaFold layer just because the API timed out during a bounded run.
+    # Conservative fallback: create a marked, unverified node so the schema layer
+    # is still materialized when the public API is unreachable from the Python
+    # runtime. Downstream code can filter model_status=url_pattern_unverified.
     if max_records is not None and max_records <= 0:
         return
     model_id = f"AF-{acc}-F1"
-    version = 4
+    log.warning("AlphaFold API returned no usable record for %s; writing unverified fallback model links.", acc)
     yield {
         "protein_id": protein_id,
         "uniprot_acc": acc,
         "alphafold_id": model_id,
-        "model_version": version,
+        "model_version": None,
         "confidence_summary": None,
         "average_plddt": None,
-        "pdb_url": f"https://alphafold.ebi.ac.uk/files/{model_id}-model_v{version}.pdb",
-        "cif_url": f"https://alphafold.ebi.ac.uk/files/{model_id}-model_v{version}.cif",
-        "pae_url": f"https://alphafold.ebi.ac.uk/files/{model_id}-predicted_aligned_error_v{version}.json",
-        "storage_uri": f"https://alphafold.ebi.ac.uk/files/{model_id}-model_v{version}.pdb",
-        "source_url": f"https://alphafold.ebi.ac.uk/entry/{acc}",
+        "pdb_url": None,
+        "cif_url": None,
+        "pae_url": None,
+        "storage_uri": None,
+        "source_url": f"https://alphafold.ebi.ac.uk/entry/{model_id}",
         "model_status": "url_pattern_unverified",
-        "source": "AlphaFold deterministic URL pattern fallback",
+        "source": "AlphaFold API fallback placeholder",
     }
 
 def _protein_embedding_row(protein_id: str, acc: str, rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -496,40 +528,88 @@ def _chembl_rows(client: HttpClient, compound: Dict[str, Any], *, max_records: O
 
 
 def _bindingdb_uniprot_rows(client: HttpClient, protein_id: str, acc: str, *, max_records: Optional[int]) -> Iterator[Dict[str, Any]]:
-    url = "https://www.bindingdb.org/rwd/bind/BindingDBRESTfulAPI.jsp"
-    data = _safe_get_json(client, url, params={"response": "application/json", "getLigandsByUniprot": acc})
-    records = []
-    if isinstance(data, dict):
-        # BindingDB has changed JSON wrappers over time; collect dict/list leaves.
-        records = _collect_dict_leaves(data)
-    elif isinstance(data, list):
-        records = data
+    """Yield BindingDB rows for one UniProt accession using the documented REST API."""
+    url = "https://bindingdb.org/rest/getLigandsByUniprot"
+    data = _safe_get_json(
+        client,
+        url,
+        params={"uniprot": f"{acc};10000", "response": "application/json"},
+        warn=False,
+    )
+    records = _bindingdb_records_from_response(data)
+
+    # Some targets genuinely have no BindingDB records. Do not fail the build.
+    if not records:
+        log.info("BindingDB returned no ligand records for UniProt %s", acc)
+
     seen = 0
     for item in records:
         if not isinstance(item, dict):
             continue
-        ligand = item.get("monomerid") or item.get("Ligand") or item.get("bindingdb_ligand_id") or item.get("BindingDB MonomerID")
+        norm = {_norm_bindingdb_key(k): v for k, v in item.items()}
+        ligand = (
+            norm.get("monomerid")
+            or norm.get("bindingdbmonomerid")
+            or norm.get("bindingdbligandid")
+            or norm.get("ligand")
+        )
         cid = (
-            item.get("PubChem CID") or item.get("pubchem_cid") or item.get("cid") or
-            item.get("PubChem CID(s)") or item.get("PubChemCID")
+            norm.get("pubchemcid")
+            or norm.get("pubchemcids")
+            or norm.get("cid")
+            or norm.get("pubchemcompoundid")
         )
         if not ligand and not cid:
             continue
-        ligand_id = ligand or f"CID{cid}"
+        ligand_id = str(ligand or f"CID{cid}").strip()
         yield {
             "protein_id": protein_id,
             "cid": _as_int(cid),
             "bindingdb_id": f"BindingDB:{ligand_id}",
             "ligand_id": ligand_id,
             "target_uniprot_acc": acc,
-            "kd": item.get("kd") or item.get("Kd") or item.get("Kd (nM)"),
-            "ki": item.get("ki") or item.get("Ki") or item.get("Ki (nM)"),
-            "ic50": item.get("ic50") or item.get("IC50") or item.get("IC50 (nM)"),
+            "kd": _first_bindingdb_value(norm, "kd", "kdnm"),
+            "ki": _first_bindingdb_value(norm, "ki", "kinm"),
+            "ic50": _first_bindingdb_value(norm, "ic50", "ic50nm"),
+            "affinity_type": _first_bindingdb_value(norm, "affinitytype", "type"),
+            "affinity_value": _first_bindingdb_value(norm, "affinity", "affinityvalue", "value"),
+            "smiles": _first_bindingdb_value(norm, "smiles", "ligandsmiles"),
+            "source_ref": _first_bindingdb_value(norm, "pmid", "pubmedid", "doi", "reference"),
+            "source_url": f"https://bindingdb.org/rest/getLigandsByUniprot?uniprot={acc};10000&response=application/json",
             "source": "BindingDB REST getLigandsByUniprot",
         }
         seen += 1
         if max_records is not None and seen >= max_records:
             break
+
+
+def _bindingdb_records_from_response(data: Any) -> List[Dict[str, Any]]:
+    """Normalize known BindingDB JSON wrappers to a list of record dicts."""
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+    if not isinstance(data, dict):
+        return []
+    for key in ("getLigandsByUniprotResponse", "getLigandsByUniprotsResponse", "response", "rows", "data", "records", "results"):
+        value = data.get(key)
+        if isinstance(value, list):
+            return [x for x in value if isinstance(x, dict)]
+        if isinstance(value, dict):
+            leaves = _collect_dict_leaves(value)
+            if leaves:
+                return leaves
+    return _collect_dict_leaves(data)
+
+
+def _norm_bindingdb_key(key: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(key or "").strip().lower())
+
+
+def _first_bindingdb_value(row: Dict[str, Any], *keys: str) -> Optional[Any]:
+    for key in keys:
+        value = row.get(_norm_bindingdb_key(key))
+        if value not in (None, "", "NA", "N/A"):
+            return value
+    return None
 
 
 def _bindingdb_file_rows(path: Path, inputs: EnrichmentInputs, *, max_records: Optional[int]) -> Iterator[Dict[str, Any]]:
@@ -572,11 +652,14 @@ def _drugbank_file_rows(path: Path, inputs: EnrichmentInputs, *, max_records: Op
         }
 
 
-def _safe_get_json(client: HttpClient, url: str, params: Optional[Dict[str, Any]] = None) -> Any:
+def _safe_get_json(client: HttpClient, url: str, params: Optional[Dict[str, Any]] = None, *, warn: bool = True) -> Any:
     try:
         return client.get_json(url, params=params)
     except Exception as exc:
-        log.warning("Skipping enrichment request %s params=%s error=%s", url, params, exc)
+        if warn:
+            log.warning("Skipping enrichment request %s params=%s error=%s", url, params, exc)
+        else:
+            log.debug("Enrichment request failed %s params=%s error=%s", url, params, exc)
         return {}
 
 

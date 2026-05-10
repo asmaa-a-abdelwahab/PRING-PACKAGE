@@ -224,7 +224,8 @@ class PubChemSparqlMirrorExtractor:
             if s.startswith("gene:") or "/gene/" in s:
                 genes.append(iri_to_term(s))
                 continue
-            # treat remaining short tokens as gene symbols
+            # treat remaining short tokens as gene symbols. Resolution converts
+            # legacy gene:SYMBOL terms to PubChemRDF genesymbol:* IRIs.
             if u.startswith("SYMBOL:"):
                 sym = s.split(":", 1)[1].strip()
                 genes.append(f"gene:{sym}")
@@ -240,9 +241,18 @@ class PubChemSparqlMirrorExtractor:
 
     def _resolve_symbols_to_geneids(self, gene_terms: List[str]) -> List[str]:
         """Resolve gene symbols (gene:BRCA1) into gene:GIDxxxx where possible."""
-        # Keep gene:GID as-is
+        # Keep concrete PubChem gene IDs as-is and resolve symbols through
+        # genesymbol:* terms. Accept legacy gene:SYMBOL inputs for backwards
+        # compatibility with older CLI behavior.
         gids = [g for g in gene_terms if re.search(r"GID\d+$", g)]
-        syms = [g for g in gene_terms if g.startswith("gene:") and not re.search(r"GID\d+$", g)]
+        syms: List[str] = []
+        for g in gene_terms:
+            if re.search(r"GID\d+$", g):
+                continue
+            if g.startswith("genesymbol:"):
+                syms.append(g)
+            elif g.startswith("gene:"):
+                syms.append("genesymbol:" + g.split(":", 1)[1])
         if not syms:
             return gids
 
@@ -259,9 +269,17 @@ SELECT DISTINCT ?gene WHERE {{
                 gids.append(iri_to_term(v))
         return list(dict.fromkeys(gids))
 
-    def _genes_to_proteins(self, geneids: List[str], flags: BuildFlags) -> List[str]:
+    def _genes_to_proteins_map(self, geneids: List[str], flags: BuildFlags) -> Dict[str, List[str]]:
+        """Resolve each PubChem gene term to its encoded protein terms.
+
+        The mapping is kept per gene so target-scoped extraction can bind each
+        MeasureGrp only to the protein(s) supported by the specific target that
+        selected that MeasureGrp. This prevents the combined target list from
+        turning into a many-to-many MeasureGrp -> Protein fan-out.
+        """
+        out: Dict[str, List[str]] = {g: [] for g in geneids}
         if not geneids:
-            return []
+            return out
         values = " ".join(geneids)
         tax_filter = ""
         if flags.taxids:
@@ -274,11 +292,30 @@ SELECT DISTINCT ?protein ?gene WHERE {{
   {tax_filter}
 }}"""
         rows = self.client.select(q)
-        prots: List[str] = []
         for b in rows:
-            v = b.get("protein", {}).get("value")
-            if v:
-                prots.append(iri_to_term(v))
+            gv = b.get("gene", {}).get("value")
+            pv = b.get("protein", {}).get("value")
+            if not pv:
+                continue
+            # Some tests/mirrors may omit ?gene in this simple lookup when a
+            # single gene was supplied. Use that input gene as a safe fallback.
+            if not gv and len(geneids) == 1:
+                gv = geneids[0]
+            if not gv:
+                continue
+            gene = iri_to_term(gv)
+            prot = iri_to_term(pv)
+            if gene not in out:
+                out[gene] = []
+            if prot not in out[gene]:
+                out[gene].append(prot)
+        return out
+
+    def _genes_to_proteins(self, geneids: List[str], flags: BuildFlags) -> List[str]:
+        gene_map = self._genes_to_proteins_map(geneids, flags)
+        prots: List[str] = []
+        for ps in gene_map.values():
+            prots.extend(ps)
         return list(dict.fromkeys(prots))
 
     def _resolve_targets_to_proteins(self, target_ids: List[str], flags: BuildFlags) -> List[str]:
@@ -325,6 +362,7 @@ SELECT DISTINCT ?protein ?gene WHERE {{
             SELECT DISTINCT ?mg WHERE {{
             VALUES ?target {{ {values} }}
             ?mg obo:RO_0000057 ?target .
+            {tax}
             }}"""
         if limit:
             q += f"\nLIMIT {int(limit)}"
@@ -335,6 +373,49 @@ SELECT DISTINCT ?protein ?gene WHERE {{
             if v:
                 mgs.append(iri_to_term(v))
         return list(dict.fromkeys(mgs))
+
+    def _select_measuregroups_by_target(self, targets: List[str], caps: BuildCaps, flags: BuildFlags) -> Dict[str, Set[str]]:
+        """Return a MeasureGrp -> target-term map using per-target limits.
+
+        This is used by target and intersection scopes to preserve evidence
+        specificity. A MeasureGrp selected because of CYP3A4 must not be later
+        emitted as also tested on CYP2D6 just because both proteins are in the
+        same run.
+        """
+        mg_to_targets: Dict[str, Set[str]] = {}
+        if not targets:
+            return mg_to_targets
+        limit_clause = f"\nLIMIT {int(caps.max_measuregroups_per_target)}" if caps.max_measuregroups_per_target else ""
+        tax = self._tax_filter_on_var("?target", "?tTax", flags)
+        for target in targets:
+            q = f"""{SPARQL_PREFIXES}
+SELECT DISTINCT ?mg WHERE {{
+  VALUES ?target {{ {target} }}
+  ?mg obo:RO_0000057 ?target .
+  {tax}
+}}{limit_clause}"""
+            rows = self.client.select(q)
+            for b in rows:
+                v = b.get("mg", {}).get("value")
+                if v:
+                    mg_to_targets.setdefault(iri_to_term(v), set()).add(target)
+        return mg_to_targets
+
+    @staticmethod
+    def _target_scoped_proteins_for_measuregroups(
+        mg_to_targets: Dict[str, Set[str]],
+        gene_to_proteins: Dict[str, List[str]],
+    ) -> Dict[str, Set[str]]:
+        """Convert MeasureGrp -> selected targets into MeasureGrp -> allowed proteins."""
+        out: Dict[str, Set[str]] = {}
+        for mg, targets in (mg_to_targets or {}).items():
+            for target in targets:
+                if target.startswith("protein:"):
+                    out.setdefault(mg, set()).add(target)
+                elif target.startswith("gene:"):
+                    for prot in gene_to_proteins.get(target, []):
+                        out.setdefault(mg, set()).add(prot)
+        return {mg: prots for mg, prots in out.items() if prots}
 
     def _select_substances_for_compounds(self, compounds: List[str], caps: BuildCaps) -> List[str]:
         if not compounds:
@@ -388,7 +469,8 @@ SELECT DISTINCT ?protein ?gene WHERE {{
 
     def _select_evidence_rows_for_measuregroups(self, mgs: List[str], caps: BuildCaps, flags: BuildFlags,
                                                 restrict_compounds: Optional[Set[str]] = None,
-                                                restrict_proteins: Optional[Set[str]] = None) -> List[Dict[str, Any]]:
+                                                restrict_proteins: Optional[Set[str]] = None,
+                                                restrict_mg_proteins: Optional[Dict[str, Set[str]]] = None) -> List[Dict[str, Any]]:
         """Return denormalized evidence rows for one measuregroup chunk.
 
         This intentionally keeps the original/legacy PRING SPARQL evidence
@@ -409,10 +491,28 @@ SELECT DISTINCT ?protein ?gene WHERE {{
             comp_vals = " ".join(sorted(restrict_compounds))
             compound_filter = f"\n            VALUES ?compound {{ {comp_vals} }}"
 
-        # Keep the participant pattern bounded. The older query used an
-        # OPTIONAL protein-from-gene join where ?geneTarget could be unbound,
-        # which can explode on public SPARQL engines.
-        if restrict_proteins:
+        # Keep the participant pattern bounded. For target/intersection scopes
+        # prefer MeasureGrp-specific protein pairs instead of a global VALUES
+        # list; otherwise every selected MeasureGrp can be emitted against every
+        # protein in the run.
+        pair_values = ""
+        if restrict_mg_proteins:
+            pairs: List[str] = []
+            for mg in mgs:
+                for prot in sorted(restrict_mg_proteins.get(mg, set())):
+                    pairs.append(f"({mg} {prot})")
+            pair_values = " ".join(pairs)
+
+        if pair_values:
+            participant_clause = f"""
+            VALUES (?mg ?protein) {{ {pair_values} }}
+            ?mg obo:RO_0000057 ?protein .
+            OPTIONAL {{ ?protein up:encodedBy ?gene }}
+            OPTIONAL {{
+                ?mg obo:RO_0000057 ?geneTarget .
+                FILTER(STRSTARTS(STR(?geneTarget), STR(gene:)))
+            }}"""
+        elif restrict_proteins:
             prot_vals = " ".join(sorted(restrict_proteins))
             participant_clause = f"""
             VALUES ?protein {{ {prot_vals} }}
@@ -545,6 +645,7 @@ SELECT DISTINCT ?protein ?gene WHERE {{
         flags: BuildFlags,
         restrict_compounds: Optional[Set[str]] = None,
         restrict_proteins: Optional[Set[str]] = None,
+        restrict_mg_proteins: Optional[Dict[str, Set[str]]] = None,
     ) -> Tuple[List[Dict[str, Any]], int, int, Optional[Exception]]:
         """Fetch evidence rows and split heavy chunks on timeout/failure.
 
@@ -563,6 +664,7 @@ SELECT DISTINCT ?protein ?gene WHERE {{
                 flags=flags,
                 restrict_compounds=restrict_compounds,
                 restrict_proteins=restrict_proteins,
+                restrict_mg_proteins=restrict_mg_proteins,
             )
             return bindings, 0, 0, None
         except Exception as exc:
@@ -579,10 +681,10 @@ SELECT DISTINCT ?protein ?gene WHERE {{
                     exc,
                 )
                 rows_l, fail_l, mg_l, exc_l = self._select_evidence_rows_adaptive(
-                    left, caps, flags, restrict_compounds, restrict_proteins
+                    left, caps, flags, restrict_compounds, restrict_proteins, restrict_mg_proteins
                 )
                 rows_r, fail_r, mg_r, exc_r = self._select_evidence_rows_adaptive(
-                    right, caps, flags, restrict_compounds, restrict_proteins
+                    right, caps, flags, restrict_compounds, restrict_proteins, restrict_mg_proteins
                 )
                 return rows_l + rows_r, fail_l + fail_r, mg_l + mg_r, exc_r or exc_l
 
@@ -603,17 +705,41 @@ SELECT DISTINCT ?protein ?gene WHERE {{
         # Parse + resolve
         prots, genes = self._parse_targets(target_ids)
         geneids = self._resolve_symbols_to_geneids(genes)
-        prots2 = self._genes_to_proteins(geneids, flags)
+        # Tests and downstream integrations sometimes monkeypatch the older
+        # _genes_to_proteins() helper. Respect that override without consuming a
+        # SPARQL result page in _genes_to_proteins_map().
+        if getattr(self._genes_to_proteins, "__func__", None) is not PubChemSparqlMirrorExtractor._genes_to_proteins:
+            fallback_prots = self._genes_to_proteins(geneids, flags)
+            gene_to_proteins = {g: list(fallback_prots) for g in geneids}
+        else:
+            gene_to_proteins = self._genes_to_proteins_map(geneids, flags)
+            if geneids and not any(gene_to_proteins.values()):
+                fallback_prots = self._genes_to_proteins(geneids, flags)
+                gene_to_proteins = {g: list(fallback_prots) for g in geneids}
+        prots2 = [p for ps in gene_to_proteins.values() for p in ps]
 
         proteins = list(dict.fromkeys(prots + prots2))
         # Include geneids as valid measuregroup participants in addition to proteins
         targets = list(dict.fromkeys(proteins + geneids))
 
         log.info("sparql: resolved proteins=%d genes=%d", len(proteins), len(geneids))
-        mgs = self._select_measuregroups_for_proteins(targets, caps, flags)
-        log.info("sparql: measuregroups=%d", len(mgs))
+        mg_to_targets = self._select_measuregroups_by_target(targets, caps, flags)
+        mgs = list(mg_to_targets.keys())
+        if not mgs and targets:
+            # Backwards-compatible fallback for older tests or SPARQL mirrors
+            # where the pair-preserving selector cannot be used. Production
+            # paths normally use mg_to_targets above.
+            mgs = self._select_measuregroups_for_proteins(targets, caps, flags)
+            mg_to_targets = {mg: set(targets) for mg in mgs}
+        mg_to_proteins = self._target_scoped_proteins_for_measuregroups(mg_to_targets, gene_to_proteins)
+        log.info("sparql: measuregroups=%d target_scoped_mg_protein_pairs=%d", len(mgs), sum(len(v) for v in mg_to_proteins.values()))
 
-        yield from self._emit_from_measuregroups(mgs, caps, flags, restrict_proteins=set(proteins))
+        try:
+            yield from self._emit_from_measuregroups(mgs, caps, flags, restrict_proteins=set(proteins), restrict_mg_proteins=mg_to_proteins)
+        except TypeError as exc:
+            if "restrict_mg_proteins" not in str(exc):
+                raise
+            yield from self._emit_from_measuregroups(mgs, caps, flags, restrict_proteins=set(proteins))
 
     def iter_expand_from_compounds(self, chem_ids: List[str], caps: BuildCaps, flags: BuildFlags) -> Iterator[Dict[str, Any]]:
         terms = self._parse_compounds(chem_ids)
@@ -640,45 +766,58 @@ SELECT DISTINCT ?protein ?gene WHERE {{
         # Resolve targets: include both proteins and geneids for mg selection
         prots, genes = self._parse_targets(target_ids)
         geneids = self._resolve_symbols_to_geneids(genes)
-        prots2 = self._genes_to_proteins(geneids, flags)
+        # Tests and downstream integrations sometimes monkeypatch the older
+        # _genes_to_proteins() helper. Respect that override without consuming a
+        # SPARQL result page in _genes_to_proteins_map().
+        if getattr(self._genes_to_proteins, "__func__", None) is not PubChemSparqlMirrorExtractor._genes_to_proteins:
+            fallback_prots = self._genes_to_proteins(geneids, flags)
+            gene_to_proteins = {g: list(fallback_prots) for g in geneids}
+        else:
+            gene_to_proteins = self._genes_to_proteins_map(geneids, flags)
+            if geneids and not any(gene_to_proteins.values()):
+                fallback_prots = self._genes_to_proteins(geneids, flags)
+                gene_to_proteins = {g: list(fallback_prots) for g in geneids}
+        prots2 = [p for ps in gene_to_proteins.values() for p in ps]
         proteins = list(dict.fromkeys(prots + prots2))
         targets = list(dict.fromkeys(proteins + geneids))
 
         log.info("sparql: intersection proteins=%d genes=%d compounds=%d", len(proteins), len(geneids), len(compounds))
 
-        # Select measuregroups satisfying both constraints
-        mg_values = " ".join(targets)
         comp_values = " ".join(sorted(compounds)) if compounds else ""
-        q = f"""{SPARQL_PREFIXES}
+        mg_to_targets: Dict[str, Set[str]] = {}
+        limit_clause = f"\nLIMIT {int(caps.max_measuregroups_per_target)}" if caps.max_measuregroups_per_target else ""
+        for target in targets:
+            q = f"""{SPARQL_PREFIXES}
             SELECT DISTINCT ?mg WHERE {{
-            VALUES ?protein {{ {mg_values} }}
+            VALUES ?target {{ {target} }}
             ?mg obo:RO_0000057 ?target .
             ?mg obo:OBI_0000299 ?endpoint .
             ?endpoint obo:IAO_0000136 ?sub .
             ?sub sio:CHEMINF_000477 ?compound .
                 {('VALUES ?compound { ' + comp_values + ' }') if comp_values else ''}
-            }}"""
-        limit = None
-        if caps.max_measuregroups_per_target:
-            limit = caps.max_measuregroups_per_target * max(1, len(targets))
-        if limit:
-            q += f"\nLIMIT {int(limit)}"
-        rows = self.client.select(q)
-        mgs: List[str] = []
-        for b in rows:
-            v = b.get("mg", {}).get("value")
-            if v:
-                mgs.append(iri_to_term(v))
-        mgs = list(dict.fromkeys(mgs))
-        log.info("sparql: intersection measuregroups=%d", len(mgs))
-        yield from self._emit_from_measuregroups(mgs, caps, flags, restrict_compounds=compounds or None, restrict_proteins=set(proteins))
+            }}{limit_clause}"""
+            rows = self.client.select(q)
+            for b in rows:
+                v = b.get("mg", {}).get("value")
+                if v:
+                    mg_to_targets.setdefault(iri_to_term(v), set()).add(target)
+        mgs = list(mg_to_targets.keys())
+        mg_to_proteins = self._target_scoped_proteins_for_measuregroups(mg_to_targets, gene_to_proteins)
+        log.info("sparql: intersection measuregroups=%d target_scoped_mg_protein_pairs=%d", len(mgs), sum(len(v) for v in mg_to_proteins.values()))
+        try:
+            yield from self._emit_from_measuregroups(mgs, caps, flags, restrict_compounds=compounds or None, restrict_proteins=set(proteins), restrict_mg_proteins=mg_to_proteins)
+        except TypeError as exc:
+            if "restrict_mg_proteins" not in str(exc):
+                raise
+            yield from self._emit_from_measuregroups(mgs, caps, flags, restrict_compounds=compounds or None, restrict_proteins=set(proteins))
 
     # -------------------------
     # Emit row stream
     # -------------------------
     def _emit_from_measuregroups(self, mgs: List[str], caps: BuildCaps, flags: BuildFlags,
                                  restrict_compounds: Optional[Set[str]] = None,
-                                 restrict_proteins: Optional[Set[str]] = None) -> Iterator[Dict[str, Any]]:
+                                 restrict_proteins: Optional[Set[str]] = None,
+                                 restrict_mg_proteins: Optional[Dict[str, Set[str]]] = None) -> Iterator[Dict[str, Any]]:
         seen_comp: Set[int] = set()
         seen_sub: Set[int] = set()
         seen_prot: Set[str] = set()
@@ -717,6 +856,7 @@ SELECT DISTINCT ?protein ?gene WHERE {{
                 flags=flags,
                 restrict_compounds=restrict_compounds,
                 restrict_proteins=restrict_proteins,
+                restrict_mg_proteins=restrict_mg_proteins,
             )
             if chunk_failures or mg_failures:
                 failed_chunks += chunk_failures

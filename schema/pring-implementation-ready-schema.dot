@@ -207,7 +207,7 @@ digraph PRING_Final_ImplementationReady_Thesis {
 
   // Text-mined layer (kept distinct from curated evidence)
   Cooc -> Compound  [label="MENTIONS_COMPOUND", style=dashed];
-  Cooc -> Protein   [label="MENTIONS_PROTEIN", style=dashed];
+  Cooc -> Gene      [label="MENTIONS_GENE", style=dashed];
   Cooc -> Disease   [label="MENTIONS_DISEASE", style=dashed];
   Cooc -> Reference [label="FOUND_IN_REFERENCE", style=dashed];
   Cooc -> TextMine  [label="EXTRACTED_BY", style=dashed];
