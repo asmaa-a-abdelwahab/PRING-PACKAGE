@@ -236,13 +236,15 @@ def iter_graph_records(rows: Iterable[PubChemRow]) -> Iterator[Tuple[str, Dict]]
             if aid is None:
                 continue
             assay_key = {"label": "BioAssay", "key": {"aid": aid}}
-            node("BioAssay", {"aid": aid}, {
+            node("BioAssay", {"aid": aid}, _with_raw_fields({
                 "aid": aid,
-                "title": _first_nonempty(d, "title", "name"),
-                "assay_type": d.get("assay_type"),
-                "activity_outcome_method": d.get("activity_outcome_method"),
+                "title": _first_nonempty(d, "title", "name", "assay_title"),
+                "name": _first_nonempty(d, "name", "title", "assay_title"),
+                "assay_type": _first_nonempty(d, "assay_type", "type"),
+                "activity_outcome_method": _first_nonempty(d, "activity_outcome_method", "outcome_method", "method"),
+                "source_name": _first_nonempty(d, "source_name", "source_term"),
                 "pubchem_uri": _first_nonempty(d, "bioassay_term", "pubchem_uri"),
-            })
+            }, d))
             source_term = _first_nonempty(d, "source_term", "source_name")
             if source_term:
                 source_id = _source_id(d)
@@ -290,7 +292,7 @@ def iter_graph_records(rows: Iterable[PubChemRow]) -> Iterator[Tuple[str, Dict]]
             reference_id, ref_props = _reference_identity(d)
             if not reference_id:
                 continue
-            node("Reference", {"reference_id": reference_id}, ref_props)
+            node("Reference", {"reference_id": reference_id}, _with_raw_fields(ref_props, d))
 
         elif r.kind == "cellline":
             cellline_id = _as_text(d.get("cellline_id"))
@@ -459,6 +461,7 @@ def iter_graph_records(rows: Iterable[PubChemRow]) -> Iterator[Tuple[str, Dict]]
                 "function": d.get("function"),
                 "protein_name": _first_nonempty(d, "protein_name", "name"),
                 "organism": d.get("organism"),
+                "taxid": _as_int(d.get("taxid")),
                 "sequence_length": _as_int(d.get("sequence_length")),
             }, d))
             protein_id = _as_text(d.get("protein_id"))
@@ -483,17 +486,33 @@ def iter_graph_records(rows: Iterable[PubChemRow]) -> Iterator[Tuple[str, Dict]]
             reactome_id = _as_text(_first_nonempty(d, "reactome_id", "pathway_id", "id"))
             if not reactome_id:
                 continue
+            pathway_id = _as_text(d.get("pathway_id")) or f"Reactome:{reactome_id}"
+            pathway_name = _first_nonempty(d, "name", "title", "label")
             node("Reactome", {"reactome_id": reactome_id}, _with_raw_fields({
                 "reactome_id": reactome_id,
-                "name": _first_nonempty(d, "name", "title", "label"),
+                "name": pathway_name,
                 "species": d.get("species"),
+                "pathway_id": pathway_id,
+                "source_url": f"https://reactome.org/content/detail/{reactome_id}",
             }, d))
+            # Bridge plugin-specific Reactome records to the generic Pathway
+            # layer used by schema-level KG queries and GCN context features.
+            node("Pathway", {"pathway_id": pathway_id}, {
+                "pathway_id": pathway_id,
+                "title": pathway_name,
+                "name": pathway_name,
+                "source": "Reactome",
+                "pathway_type": "reactome",
+                "species": d.get("species"),
+                "external_id": reactome_id,
+                "pubchem_uri": d.get("pubchem_uri"),
+                "source_url": f"https://reactome.org/content/detail/{reactome_id}",
+            })
             protein_id = _as_text(d.get("protein_id"))
             if protein_id:
                 rel("MAPS_TO_REACTOME_PATHWAY", {"label": "Protein", "key": {"protein_id": protein_id}}, {"label": "Reactome", "key": {"reactome_id": reactome_id}})
-            pathway_id = _as_text(d.get("pathway_id"))
-            if pathway_id:
-                rel("ALIGNS_TO_PATHWAY", {"label": "Reactome", "key": {"reactome_id": reactome_id}}, {"label": "Pathway", "key": {"pathway_id": pathway_id}})
+                rel("PARTICIPATES_IN", {"label": "Protein", "key": {"protein_id": protein_id}}, {"label": "Pathway", "key": {"pathway_id": pathway_id}}, rel_type="PARTICIPATES_IN")
+            rel("ALIGNS_TO_PATHWAY", {"label": "Reactome", "key": {"reactome_id": reactome_id}}, {"label": "Pathway", "key": {"pathway_id": pathway_id}})
 
         elif r.kind == "interpro":
             interpro_id = _as_text(_first_nonempty(d, "interpro_id", "id"))
@@ -518,6 +537,8 @@ def iter_graph_records(rows: Iterable[PubChemRow]) -> Iterator[Tuple[str, Dict]]
                 "method": d.get("method"),
                 "resolution": d.get("resolution"),
                 "chain_map": d.get("chain_map"),
+                "pdb_url": d.get("pdb_url") or f"https://www.rcsb.org/structure/{pdb_id}",
+                "source_url": d.get("source_url") or f"https://www.rcsb.org/structure/{pdb_id}",
             }, d))
             protein_id = _as_text(d.get("protein_id"))
             if protein_id:
@@ -531,7 +552,12 @@ def iter_graph_records(rows: Iterable[PubChemRow]) -> Iterator[Tuple[str, Dict]]
                 "alphafold_id": alphafold_id,
                 "model_version": d.get("model_version"),
                 "confidence_summary": _first_nonempty(d, "confidence_summary", "plddt_summary"),
-                "storage_uri": d.get("storage_uri"),
+                "average_plddt": d.get("average_plddt"),
+                "pdb_url": d.get("pdb_url"),
+                "cif_url": d.get("cif_url"),
+                "pae_url": d.get("pae_url"),
+                "storage_uri": d.get("storage_uri") or d.get("pdb_url") or d.get("cif_url"),
+                "model_status": d.get("model_status"),
             }, d))
             protein_id = _as_text(d.get("protein_id"))
             if protein_id:
@@ -729,39 +755,55 @@ def _source_id(d: Dict[str, Any]) -> str:
 
 
 def _reference_identity(d: Dict[str, Any]) -> tuple[str | None, Dict[str, Any]]:
-    raw_id = _as_text(d.get("reference_id")) or _as_text(d.get("ref_id"))
-    raw_term = _as_text(d.get("ref_term")) or raw_id
-    seed = raw_id or raw_term
+    raw_id = _as_text(d.get("reference_id")) or _as_text(d.get("ref_id")) or _as_text(d.get("pmid")) or _as_text(d.get("doi"))
+    raw_term = _as_text(d.get("ref_term")) or _as_text(d.get("raw_term")) or raw_id
+    seed = raw_id or raw_term or _as_text(d.get("title"))
     if not seed:
         return None, {}
-    reference_id = raw_id or make_stable_id(seed, "reference")
-    haystack = " ".join(v for v in [raw_id, raw_term] if v)
-    doi = None
-    pmid = None
-    patent_id = None
-    year = None
-    m = _DOI_RE.search(haystack)
-    if m:
-        doi = m.group(1)
-    m = _PMID_RE.search(haystack)
-    if m:
-        pmid = m.group(1)
-    m = _PATENT_RE.search(haystack)
-    if m:
-        patent_id = m.group(1)
-    m = _YEAR_RE.search(haystack)
-    if m:
-        year = int(m.group(1))
+
+    pmid = _as_text(d.get("pmid"))
+    doi = _as_text(d.get("doi"))
+    patent_id = _as_text(d.get("patent_id"))
+    year = _as_int(d.get("year"))
+    title = _as_text(_first_nonempty(d, "title", "name", "article_title"))
+
+    haystack = " ".join(v for v in [raw_id, raw_term, doi, pmid, title] if v)
+    if not doi:
+        m = _DOI_RE.search(haystack)
+        if m:
+            doi = m.group(1)
+    if not pmid:
+        m = _PMID_RE.search(haystack)
+        if m:
+            pmid = m.group(1)
+    if not patent_id:
+        m = _PATENT_RE.search(haystack)
+        if m:
+            patent_id = m.group(1)
+    if year is None:
+        m = _YEAR_RE.search(haystack)
+        if m:
+            year = int(m.group(1))
+
+    if pmid:
+        reference_id = f"PMID:{re.sub(r'[^0-9]', '', pmid) or pmid}"
+    elif doi:
+        reference_id = f"DOI:{doi}"
+    elif raw_id:
+        reference_id = raw_id
+    else:
+        reference_id = make_stable_id(seed, "reference")
+
     return reference_id, _drop_none({
         "reference_id": reference_id,
+        "title": title,
         "doi": doi,
-        "pmid": pmid,
+        "pmid": re.sub(r"[^0-9]", "", pmid) if pmid else None,
         "patent_id": patent_id,
         "year": year,
         "raw_term": raw_term,
         "pubchem_uri": raw_term if raw_term and (raw_term.startswith("http") or ":" in raw_term) else None,
     })
-
 
 def _compound_neighbor_target(payload: Any) -> tuple[int | None, Dict[str, Any]]:
     rel_props: Dict[str, Any] = {}

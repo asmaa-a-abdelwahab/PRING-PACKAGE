@@ -9,6 +9,49 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Iterator
 
 from pring.transform.target_normalization import normalize_node_record
+from pring.transform.endpoint_normalization import normalize_endpoint_node_record
+from pring.transform.metadata_normalization import normalize_metadata_node_record
+
+
+ML_PAIR_COLUMNS = [
+    "compound_node_id",
+    "protein_node_id",
+    "compound_node_ref",
+    "protein_node_ref",
+    "label",
+    "split",
+    "split_group",
+    "split_strategy",
+    "evidence_measuregroups",
+    "evidence_endpoints",
+    "evidence_count",
+]
+
+ML_CANDIDATE_COLUMNS = [
+    "compound_node_id",
+    "protein_node_id",
+    "compound_node_ref",
+    "protein_node_ref",
+    "label",
+    "split",
+    "split_group",
+    "split_strategy",
+    "candidate_sampling_method",
+    "evidence_count",
+]
+
+ML_NEGATIVE_COLUMNS = [
+    "compound_node_id",
+    "protein_node_id",
+    "compound_node_ref",
+    "protein_node_ref",
+    "label",
+    "split",
+    "split_group",
+    "split_strategy",
+    "negative_source",
+    "evidence_count",
+]
 
 
 class RunStore:
@@ -136,7 +179,7 @@ class RunStore:
         """
         if not self.save_extracted:
             return
-        n = normalize_node_record(n)
+        n = normalize_metadata_node_record(normalize_endpoint_node_record(normalize_node_record(n)))
         label = n.get("label", "Unknown")
         self._ensure_graph_budget(self._estimate_jsonl_size(n), f"node:{label}")
         self.append_jsonl(self.nodes_dir / f"{label}.jsonl", n)
@@ -173,15 +216,57 @@ class RunStore:
         endpoint_to_mgs: dict[str, set[str]] = {}
         endpoint_to_substances: dict[str, set[str]] = {}
         substance_to_compounds: dict[str, set[str]] = {}
+        substance_to_sources: dict[str, set[str]] = {}
         mg_to_proteins: dict[str, set[str]] = {}
         mg_to_organisms: dict[str, set[str]] = {}
         endpoint_to_refs: dict[str, set[str]] = {}
         compounds: set[str] = set()
+        organism_refs: set[str] = set()
+        protein_ref_to_taxids: dict[str, set[int]] = {}
+        protein_ref_to_accs: dict[str, set[str]] = {}
+        uniprot_acc_to_taxids: dict[str, set[int]] = {}
+        reactome_ref_to_pathway: dict[str, dict[str, Any]] = {}
+        protein_ref_to_reactomes: dict[str, set[str]] = {}
+        default_taxids = _default_taxids_from_manifest(self.run_dir)
 
         for path in sorted(self.nodes_dir.glob("*.jsonl")):
             for rec in _read_jsonl(path):
-                if (rec.get("label") or path.stem) == "Compound":
-                    compounds.add(_node_ref("Compound", rec.get("key") or {}))
+                rec = normalize_metadata_node_record(normalize_endpoint_node_record(normalize_node_record(rec)))
+                label = rec.get("label") or path.stem
+                ref = _node_ref(label, rec.get("key") or {})
+                props = rec.get("props") or {}
+                if label == "Compound":
+                    compounds.add(ref)
+                elif label == "Organism":
+                    organism_refs.add(ref)
+                elif label == "Protein":
+                    protein_ref_to_taxids.setdefault(ref, set()).update(_extract_taxids_from_props(props))
+                    acc = _first_nonempty_prop(props, "uniprot_id", "uniprot_acc", "accession")
+                    if not acc:
+                        _, key = _parse_node_ref(ref)
+                        acc = _uniprot_acc_from_protein_id(str(key.get("protein_id", "")))
+                    if acc:
+                        protein_ref_to_accs.setdefault(ref, set()).add(str(acc).split("-")[0])
+                elif label == "UniProt":
+                    _, key = _parse_node_ref(ref)
+                    acc = str(key.get("uniprot_acc") or props.get("uniprot_acc") or props.get("accession") or "").split("-")[0]
+                    if acc:
+                        uniprot_acc_to_taxids.setdefault(acc, set()).update(_extract_taxids_from_props(props))
+                elif label == "Reactome":
+                    _, key = _parse_node_ref(ref)
+                    reactome_id = str(key.get("reactome_id") or props.get("reactome_id") or "").strip()
+                    if reactome_id:
+                        pathway_id = str(props.get("pathway_id") or f"Reactome:{reactome_id}")
+                        reactome_ref_to_pathway[ref] = {
+                            "pathway_id": pathway_id,
+                            "title": props.get("name") or props.get("title") or props.get("label"),
+                            "name": props.get("name") or props.get("title") or props.get("label"),
+                            "source": "Reactome",
+                            "pathway_type": "reactome",
+                            "species": props.get("species"),
+                            "external_id": reactome_id,
+                            "source_url": props.get("source_url") or f"https://reactome.org/content/detail/{reactome_id}",
+                        }
 
         for path in sorted(self.rels_dir.glob("*.jsonl")):
             for rec in _read_jsonl(path):
@@ -203,12 +288,16 @@ class RunStore:
                     endpoint_to_substances.setdefault(start_ref, set()).add(end_ref)
                 elif schema_label == "STANDARDIZED_TO" and sl == "Substance" and el == "Compound":
                     substance_to_compounds.setdefault(start_ref, set()).add(end_ref)
+                elif schema_label == "SUBMITTED_BY" and sl == "Substance" and el == "Source":
+                    substance_to_sources.setdefault(start_ref, set()).add(end_ref)
                 elif schema_label in {"TESTED_ON", "HAS_PARTICIPANT"} and sl == "MeasureGrp" and el == "Protein":
                     mg_to_proteins.setdefault(start_ref, set()).add(end_ref)
                 elif schema_label == "IN_ORGANISM" and sl == "MeasureGrp" and el == "Organism":
                     mg_to_organisms.setdefault(start_ref, set()).add(end_ref)
                 elif schema_label == "SUPPORTED_BY" and sl == "Endpoint" and el == "Reference":
                     endpoint_to_refs.setdefault(start_ref, set()).add(end_ref)
+                elif schema_label == "MAPS_TO_REACTOME_PATHWAY" and sl == "Protein" and el == "Reactome":
+                    protein_ref_to_reactomes.setdefault(start_ref, set()).add(end_ref)
 
         added_nodes = 0
         added_rels = 0
@@ -242,9 +331,73 @@ class RunStore:
         # Optional MolGraph feature nodes for every compound. These are lightweight
         # modeling placeholders over parsed PubChem features and can be replaced by
         # RDKit/fingerprint exporters later without changing the schema.
-        existing_nodes = {_node_ref((rec.get("label") or path.stem), rec.get("key") or {})
-                          for path in sorted(self.nodes_dir.glob("*.jsonl"))
-                          for rec in _read_jsonl(path)}
+        existing_node_props_by_ref: dict[str, dict[str, Any]] = {}
+        for path in sorted(self.nodes_dir.glob("*.jsonl")):
+            for rec in _read_jsonl(path):
+                rec = normalize_metadata_node_record(normalize_endpoint_node_record(normalize_node_record(rec)))
+                ref = _node_ref((rec.get("label") or path.stem), rec.get("key") or {})
+                props = dict(rec.get("props") or {})
+                existing_node_props_by_ref[ref] = _merge_nonempty(existing_node_props_by_ref.get(ref, {}), props)
+        existing_nodes = set(existing_node_props_by_ref)
+
+        # Materialize Organism context required by the schema. When PubChem has
+        # not returned explicit MeasureGrp->Organism rows, infer human context
+        # only when supported by protein/UniProt taxids or by the run manifest
+        # taxid filter (default PRING CYP450 use case: taxid=9606).
+        def ensure_organism(taxid: int, *, derived_by: str = "PRING") -> str:
+            nonlocal added_nodes
+            org_ref = _node_ref("Organism", {"taxid": int(taxid)})
+            if org_ref not in existing_nodes:
+                self.save_node({
+                    "label": "Organism",
+                    "key": {"taxid": int(taxid)},
+                    "props": _organism_props_for_taxid(int(taxid), derived_by=derived_by),
+                })
+                existing_nodes.add(org_ref)
+                existing_node_props_by_ref[org_ref] = _organism_props_for_taxid(int(taxid), derived_by=derived_by)
+                added_nodes += 1
+            organism_refs.add(org_ref)
+            return org_ref
+
+        for protein_ref, accs in list(protein_ref_to_accs.items()):
+            for acc in accs:
+                protein_ref_to_taxids.setdefault(protein_ref, set()).update(uniprot_acc_to_taxids.get(acc, set()))
+
+        inferred_mg_organism_links = 0
+        for mg_ref, protein_refs in sorted(mg_to_proteins.items()):
+            explicit = mg_to_organisms.setdefault(mg_ref, set())
+            for protein_ref in sorted(protein_refs):
+                taxids = set(protein_ref_to_taxids.get(protein_ref, set()))
+                if not taxids:
+                    taxids.update(default_taxids)
+                for taxid in sorted(taxids):
+                    org_ref = ensure_organism(taxid, derived_by="PRING inferred from target taxid/run filter")
+                    if org_ref not in explicit:
+                        if add_rel("IN_ORGANISM", mg_ref, org_ref, {"derived_by": "PRING", "source_path": "MeasureGrp-Protein target taxid/run taxid filter"}):
+                            inferred_mg_organism_links += 1
+                        explicit.add(org_ref)
+
+        # Bridge Reactome plugin records to the generic Pathway layer used by
+        # the implementation-ready schema and downstream GCN context features.
+        for reactome_ref, pathway_props in sorted(reactome_ref_to_pathway.items()):
+            pathway_id = pathway_props.get("pathway_id")
+            if not pathway_id:
+                continue
+            pathway_ref = _node_ref("Pathway", {"pathway_id": pathway_id})
+            if pathway_ref not in existing_nodes:
+                self.save_node({
+                    "label": "Pathway",
+                    "key": {"pathway_id": pathway_id},
+                    "props": {k: v for k, v in pathway_props.items() if v not in (None, "")},
+                })
+                existing_nodes.add(pathway_ref)
+                existing_node_props_by_ref[pathway_ref] = dict(pathway_props)
+                added_nodes += 1
+            add_rel("ALIGNS_TO_PATHWAY", reactome_ref, pathway_ref, {"derived_by": "PRING", "source_path": "Reactome cross-reference"})
+            for protein_ref, reactome_refs in sorted(protein_ref_to_reactomes.items()):
+                if reactome_ref in reactome_refs:
+                    add_rel("PARTICIPATES_IN", protein_ref, pathway_ref, {"derived_by": "PRING", "source_path": "Protein-Reactome-Pathway"})
+
         for compound_ref in sorted(compounds):
             _, key = _parse_node_ref(compound_ref)
             cid = key.get("cid")
@@ -267,49 +420,76 @@ class RunStore:
                 added_nodes += 1
             add_rel("HAS_MOLECULAR_REPRESENTATION", compound_ref, mol_ref, {"derived_by": "PRING", "method": "pubchem_features_v1"})
 
+        # BioAssay -> Source is implied by BioAssay -> MeasureGrp -> Endpoint -> Substance -> Source.
+        for mg_ref, endpoint_refs in mg_to_endpoints.items():
+            for assay_ref in mg_to_aids.get(mg_ref, set()):
+                for endpoint_ref in endpoint_refs:
+                    for substance_ref in endpoint_to_substances.get(endpoint_ref, set()):
+                        for source_ref in substance_to_sources.get(substance_ref, set()):
+                            add_rel("HAS_SOURCE", assay_ref, source_ref, {"derived_by": "PRING", "source_path": "BioAssay-MeasureGrp-Endpoint-Substance-Source"})
+
         if generate_interactions:
-            interaction_refs: set[str] = set()
+            interaction_support: dict[tuple[str, str], dict[str, set[str]]] = {}
             for mg_ref, endpoint_refs in mg_to_endpoints.items():
+                protein_refs = mg_to_proteins.get(mg_ref, set())
+                if not protein_refs:
+                    continue
                 for endpoint_ref in endpoint_refs:
                     compound_refs = set()
                     for substance_ref in endpoint_to_substances.get(endpoint_ref, set()):
                         compound_refs.update(substance_to_compounds.get(substance_ref, set()))
                     if not compound_refs:
                         continue
-                    protein_refs = mg_to_proteins.get(mg_ref, set())
-                    if not protein_refs:
-                        continue
-                    assay_refs = mg_to_aids.get(mg_ref, set())
-                    ref_refs = endpoint_to_refs.get(endpoint_ref, set())
-                    organism_refs = mg_to_organisms.get(mg_ref, set())
                     for compound_ref in compound_refs:
                         for protein_ref in protein_refs:
-                            interaction_id = _stable_id(f"{compound_ref}|{protein_ref}", prefix="interaction")
-                            interaction_ref = _node_ref("Interaction", {"interaction_id": interaction_id})
-                            if interaction_ref not in interaction_refs and interaction_ref not in existing_nodes:
-                                self.save_node({
-                                    "label": "Interaction",
-                                    "key": {"interaction_id": interaction_id},
-                                    "props": {
-                                        "interaction_id": interaction_id,
-                                        "label": "curated_positive",
-                                        "confidence": 1.0,
-                                        "aggregation_rule": "PubChem evidence path: Compound<-Substance<-Endpoint<-MeasureGrp->Protein",
-                                        "created_by": "PRING",
-                                    },
-                                })
-                                existing_nodes.add(interaction_ref)
-                                added_nodes += 1
-                            interaction_refs.add(interaction_ref)
-                            add_rel("ASSERTS_CHEMICAL", interaction_ref, compound_ref)
-                            add_rel("ASSERTS_TARGET", interaction_ref, protein_ref)
-                            add_rel("SUPPORTED_BY_ENDPOINT", interaction_ref, endpoint_ref)
-                            for assay_ref in assay_refs:
-                                add_rel("SUPPORTED_BY_ASSAY", interaction_ref, assay_ref)
-                            for ref_ref in ref_refs:
-                                add_rel("SUPPORTED_BY_REFERENCE", interaction_ref, ref_ref)
-                            for organism_ref in organism_refs:
-                                add_rel("SCOPED_TO_ORGANISM", interaction_ref, organism_ref)
+                            bucket = interaction_support.setdefault((compound_ref, protein_ref), {
+                                "endpoints": set(),
+                                "measuregroups": set(),
+                                "assays": set(),
+                                "references": set(),
+                                "organisms": set(),
+                            })
+                            bucket["endpoints"].add(endpoint_ref)
+                            bucket["measuregroups"].add(mg_ref)
+                            bucket["assays"].update(mg_to_aids.get(mg_ref, set()))
+                            bucket["references"].update(endpoint_to_refs.get(endpoint_ref, set()))
+                            bucket["organisms"].update(mg_to_organisms.get(mg_ref, set()))
+
+            for (compound_ref, protein_ref), support in sorted(interaction_support.items()):
+                interaction_id = _stable_id(f"{compound_ref}|{protein_ref}", prefix="interaction")
+                interaction_ref = _node_ref("Interaction", {"interaction_id": interaction_id})
+                interaction_props = {
+                    "interaction_id": interaction_id,
+                    "label": "curated_positive",
+                    "confidence": 1.0,
+                    "evidence_count": len(support["endpoints"]),
+                    "measuregroup_count": len(support["measuregroups"]),
+                    "assay_count": len(support["assays"]),
+                    "reference_count": len(support["references"]),
+                    "aggregation_rule": "PubChem evidence path: Compound<-Substance<-Endpoint<-MeasureGrp->Protein",
+                    "created_by": "PRING",
+                }
+                existing_props = existing_node_props_by_ref.get(interaction_ref, {})
+                if interaction_ref not in existing_nodes or "evidence_count" not in existing_props:
+                    self.save_node({
+                        "label": "Interaction",
+                        "key": {"interaction_id": interaction_id},
+                        "props": interaction_props,
+                    })
+                    existing_node_props_by_ref[interaction_ref] = _merge_nonempty(existing_props, interaction_props)
+                    if interaction_ref not in existing_nodes:
+                        existing_nodes.add(interaction_ref)
+                        added_nodes += 1
+                add_rel("ASSERTS_CHEMICAL", interaction_ref, compound_ref)
+                add_rel("ASSERTS_TARGET", interaction_ref, protein_ref)
+                for endpoint_ref in sorted(support["endpoints"]):
+                    add_rel("SUPPORTED_BY_ENDPOINT", interaction_ref, endpoint_ref)
+                for assay_ref in sorted(support["assays"]):
+                    add_rel("SUPPORTED_BY_ASSAY", interaction_ref, assay_ref)
+                for ref_ref in sorted(support["references"]):
+                    add_rel("SUPPORTED_BY_REFERENCE", interaction_ref, ref_ref)
+                for organism_ref in sorted(support["organisms"]):
+                    add_rel("SCOPED_TO_ORGANISM", interaction_ref, organism_ref)
 
         return {
             "enabled": True,
@@ -318,6 +498,9 @@ class RunStore:
             "derived_described_by": (self.rels_dir / "DESCRIBED_BY.jsonl").exists(),
             "derived_interactions": (self.nodes_dir / "Interaction.jsonl").exists(),
             "derived_molgraph": (self.nodes_dir / "MolGraph.jsonl").exists(),
+            "derived_organisms": (self.nodes_dir / "Organism.jsonl").exists(),
+            "derived_pathways": (self.nodes_dir / "Pathway.jsonl").exists(),
+            "inferred_mg_organism_links": locals().get("inferred_mg_organism_links", 0),
         }
 
     def materialize_csv_mirrors(self) -> Dict[str, Any]:
@@ -353,23 +536,39 @@ class RunStore:
         node_records_by_ref: dict[str, dict[str, str]] = {}
         next_node_id = 0
         for path in sorted(self.nodes_dir.glob("*.jsonl")):
-            label_rows: list[dict[str, Any]] = []
-            neo_rows: list[dict[str, Any]] = []
+            # Deduplicate nodes by their schema key before writing CSV mirrors.
+            # JSONL remains lossless, while CSV/Neo4j bulk-import artifacts become
+            # safe for direct import and easier to inspect. Later records merge
+            # non-empty properties into earlier records for the same node_ref.
+            merged_by_ref: dict[str, dict[str, Any]] = {}
             for rec in _read_jsonl(path):
+                rec = normalize_metadata_node_record(normalize_endpoint_node_record(normalize_node_record(rec)))
                 label = _stringify_cell(rec.get("label") or path.stem)
                 key = rec.get("key") or {}
                 props = rec.get("props") or {}
                 ref = _node_ref(label, key)
+                if ref not in merged_by_ref:
+                    merged_by_ref[ref] = {"label": label, "key": dict(key), "props": dict(props)}
+                else:
+                    merged_by_ref[ref]["key"] = _merge_nonempty(merged_by_ref[ref].get("key") or {}, key)
+                    merged_by_ref[ref]["props"] = _merge_nonempty(merged_by_ref[ref].get("props") or {}, props)
+
+            label_rows: list[dict[str, Any]] = []
+            neo_rows: list[dict[str, Any]] = []
+            for ref, merged in sorted(merged_by_ref.items()):
+                label = _stringify_cell(merged.get("label") or path.stem)
+                key = merged.get("key") or {}
+                props = merged.get("props") or {}
                 if ref not in node_id_by_ref:
                     node_id_by_ref[ref] = next_node_id
                     next_node_id += 1
                 flat = {"node_id": node_id_by_ref[ref], "node_ref": ref, "label": label}
                 flat.update({f"key_{k}": v for k, v in _flatten(key).items()})
                 flat.update({f"props_{k}": v for k, v in _flatten(props).items()})
-                label_rows.append(_stringify_row(flat))
+                flat = _stringify_row(flat)
+                label_rows.append(flat)
 
                 neo = {":ID": ref, ":LABEL": label}
-                # Keep node key columns readable and also keep all parsed props.
                 neo.update({f"key_{k}": v for k, v in _flatten(key).items()})
                 neo.update({k: v for k, v in _flatten(props).items()})
                 neo_rows.append(_stringify_row(neo))
@@ -382,7 +581,7 @@ class RunStore:
             _write_rows_csv(out, label_rows)
             neo_out = self.neo4j_csv_dir / "nodes" / f"{path.stem}.csv"
             _write_rows_csv(neo_out, neo_rows)
-            summary["nodes"][path.stem] = {"records": len(label_rows), "columns": _columns(label_rows)}
+            summary["nodes"][path.stem] = {"records": len(label_rows), "columns": _columns(label_rows), "deduplicated": True}
 
         edge_rows: list[dict[str, Any]] = []
         positive_pairs: dict[tuple[str, str], dict[str, Any]] = {}
@@ -391,6 +590,7 @@ class RunStore:
         mg_to_endpoints: dict[str, set[str]] = {}
         mg_to_proteins: dict[str, set[str]] = {}
         seen_edge_keys: set[tuple[str, str, str, str]] = set()
+        similarity_components = _UnionFind()
 
         for path in sorted(self.rels_dir.glob("*.jsonl")):
             rel_rows: list[dict[str, Any]] = []
@@ -429,12 +629,17 @@ class RunStore:
                 neo.update(_flatten(props))
                 neo_rows.append(_stringify_row(neo))
 
+                start_label_text = str(start.get("label") or "")
+                end_label_text = str(end.get("label") or "")
+                if schema_label == "SIMILAR_TO" and start_label_text == "Compound" and end_label_text == "Compound":
+                    similarity_components.union(start_ref, end_ref)
+
                 _collect_interaction_paths(
                     schema_label=schema_label,
                     start_ref=start_ref,
-                    start_label=str(start.get("label") or ""),
+                    start_label=start_label_text,
                     end_ref=end_ref,
-                    end_label=str(end.get("label") or ""),
+                    end_label=end_label_text,
                     endpoint_to_substance=endpoint_to_substance,
                     substance_to_compound=substance_to_compound,
                     mg_to_endpoints=mg_to_endpoints,
@@ -484,11 +689,17 @@ class RunStore:
             for rtype, idx in sorted(relation_id_by_type.items(), key=lambda kv: kv[1])
         ]
 
+        compound_refs = sorted(ref for ref, lab in node_ref_by_key.items() if lab == "Compound")
+        protein_refs = sorted(ref for ref, lab in node_ref_by_key.items() if lab == "Protein")
+        for compound_ref in compound_refs:
+            similarity_components.find(compound_ref)
+
         pair_rows = []
         positive_pair_keys: set[tuple[str, str]] = set()
         for (_, _), rec in sorted(positive_pairs.items()):
             positive_pair_keys.add((rec["compound_node_ref"], rec["protein_node_ref"]))
-            split = _deterministic_split(rec["compound_node_ref"] + "|" + rec["protein_node_ref"])
+            split_group = similarity_components.find(rec["compound_node_ref"])
+            split = _deterministic_split(split_group)
             pair_rows.append({
                 "compound_node_id": rec["compound_node_id"],
                 "protein_node_id": rec["protein_node_id"],
@@ -496,34 +707,43 @@ class RunStore:
                 "protein_node_ref": rec["protein_node_ref"],
                 "label": 1,
                 "split": split,
+                "split_group": split_group,
+                "split_strategy": "compound_similarity_component_holdout",
                 "evidence_measuregroups": " | ".join(sorted(rec["evidence_measuregroups"])),
                 "evidence_endpoints": " | ".join(sorted(rec["evidence_endpoints"])),
                 "evidence_count": len(rec["evidence_endpoints"]),
             })
 
-        compound_refs = sorted(ref for ref, lab in node_ref_by_key.items() if lab == "Compound")
-        protein_refs = sorted(ref for ref, lab in node_ref_by_key.items() if lab == "Protein")
-        negative_candidates = [
+        # For CYP450 link prediction, absence of a curated PubChem evidence path
+        # does NOT mean a true negative interaction. Keep unobserved compound-target
+        # pairs as prediction candidates/unknown labels. Downstream supervised GCN
+        # training can add its own experimentally confirmed negatives if available.
+        unknown_candidates = [
             (c, p) for c in compound_refs for p in protein_refs
             if (c, p) not in positive_pair_keys
         ]
         rng = random.Random(13)
-        rng.shuffle(negative_candidates)
-        negative_limit = len(pair_rows) if pair_rows else min(len(negative_candidates), 1000)
-        negative_rows = []
-        for compound_ref, protein_ref in negative_candidates[:negative_limit]:
-            split = _deterministic_split(compound_ref + "|" + protein_ref)
-            negative_rows.append({
+        rng.shuffle(unknown_candidates)
+        candidate_limit = min(len(unknown_candidates), max(1000, len(pair_rows) * 10 if pair_rows else 1000))
+        candidate_rows = []
+        for compound_ref, protein_ref in unknown_candidates[:candidate_limit]:
+            split_group = similarity_components.find(compound_ref)
+            split = _deterministic_split(split_group)
+            candidate_rows.append({
                 "compound_node_id": node_id_by_ref.get(compound_ref, ""),
                 "protein_node_id": node_id_by_ref.get(protein_ref, ""),
                 "compound_node_ref": compound_ref,
                 "protein_node_ref": protein_ref,
-                "label": 0,
+                "label": "unknown",
                 "split": split,
-                "negative_sampling_method": "unobserved_within_extracted_scope",
+                "split_group": split_group,
+                "split_strategy": "compound_similarity_component_holdout",
+                "candidate_sampling_method": "unobserved_within_extracted_scope",
                 "evidence_count": 0,
             })
-        training_pair_rows = pair_rows + negative_rows
+        negative_rows: list[dict[str, Any]] = []
+        training_pair_rows = pair_rows
+        link_prediction_pair_rows = pair_rows + candidate_rows
 
         compound_feature_rows = _build_compound_feature_rows(node_records_by_ref, node_id_by_ref)
         protein_feature_rows = _build_protein_feature_rows(node_records_by_ref, node_id_by_ref)
@@ -535,9 +755,11 @@ class RunStore:
         _write_rows_csv(self.ml_dir / "node_features_compound.csv", compound_feature_rows)
         _write_rows_csv(self.ml_dir / "node_features_protein.csv", protein_feature_rows)
         _write_rows_csv(self.ml_dir / "node_features_endpoint.csv", endpoint_feature_rows)
-        _write_rows_csv(self.ml_dir / "positive_compound_target_pairs.csv", pair_rows)
-        _write_rows_csv(self.ml_dir / "negative_compound_target_pairs.csv", negative_rows)
-        _write_rows_csv(self.ml_dir / "compound_target_training_pairs.csv", training_pair_rows)
+        _write_rows_csv(self.ml_dir / "positive_compound_target_pairs.csv", pair_rows, columns=ML_PAIR_COLUMNS)
+        _write_rows_csv(self.ml_dir / "negative_compound_target_pairs.csv", negative_rows, columns=ML_NEGATIVE_COLUMNS)
+        _write_rows_csv(self.ml_dir / "candidate_missing_compound_target_pairs.csv", candidate_rows, columns=ML_CANDIDATE_COLUMNS)
+        _write_rows_csv(self.ml_dir / "compound_target_training_pairs.csv", training_pair_rows, columns=ML_PAIR_COLUMNS)
+        _write_rows_csv(self.ml_dir / "compound_target_link_prediction_pairs.csv", link_prediction_pair_rows, columns=_columns(pair_rows + candidate_rows) or list(dict.fromkeys(ML_PAIR_COLUMNS + ML_CANDIDATE_COLUMNS)))
 
         summary["ml"] = {
             "node_mapping_records": len(node_mapping_rows),
@@ -548,7 +770,11 @@ class RunStore:
             "endpoint_feature_records": len(endpoint_feature_rows),
             "positive_compound_target_pairs": len(pair_rows),
             "negative_compound_target_pairs": len(negative_rows),
+            "candidate_missing_compound_target_pairs": len(candidate_rows),
             "training_pair_records": len(training_pair_rows),
+            "link_prediction_pair_records": len(link_prediction_pair_rows),
+            "split_strategy": "compound_similarity_component_holdout",
+            "label_semantics": "unobserved compound-target pairs are exported as unknown candidates, not true negatives",
         }
         summary_path = self.graph_dir / "csv_export_summary.json"
         summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -577,6 +803,37 @@ class RunStore:
                 except Exception:
                     pass
         self._graph_bytes_written = 0
+
+
+
+
+class _UnionFind:
+    """Tiny union-find for similarity-aware compound holdout splitting."""
+
+    def __init__(self) -> None:
+        self.parent: dict[str, str] = {}
+
+    def find(self, item: str) -> str:
+        item = str(item)
+        if item not in self.parent:
+            self.parent[item] = item
+            return item
+        root = item
+        while self.parent[root] != root:
+            root = self.parent[root]
+        while self.parent[item] != item:
+            nxt = self.parent[item]
+            self.parent[item] = root
+            item = nxt
+        return root
+
+    def union(self, a: str, b: str) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return
+        # Deterministic root keeps splits stable across runs.
+        root, child = sorted([ra, rb])[0], sorted([ra, rb])[1]
+        self.parent[child] = root
 
 
 def _read_jsonl(path: Path) -> Iterator[dict[str, Any]]:
@@ -650,6 +907,25 @@ def _stringify_row(row: dict[str, Any]) -> dict[str, str]:
     return {str(k): _stringify_cell(v) for k, v in row.items()}
 
 
+
+
+def _merge_nonempty(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
+    """Merge dictionaries while preserving existing non-empty values.
+
+    This is used for deduplicated CSV mirrors. Canonical JSONL remains lossless,
+    but readable CSV/Neo4j bulk artifacts should contain one row per node key.
+    """
+    out = dict(base or {})
+    for k, v in (extra or {}).items():
+        if v is None or v == "":
+            continue
+        if k not in out or out.get(k) in (None, "", [], {}):
+            out[k] = v
+        elif isinstance(out.get(k), list) and isinstance(v, list):
+            seen = {_stringify_cell(x) for x in out[k]}
+            out[k].extend(x for x in v if _stringify_cell(x) not in seen)
+    return out
+
 def _columns(rows: list[dict[str, Any]]) -> list[str]:
     preferred: list[str] = []
     for special in [
@@ -663,9 +939,13 @@ def _columns(rows: list[dict[str, Any]]) -> list[str]:
     return preferred + rest
 
 
-def _write_rows_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+def _write_rows_csv(path: Path, rows: list[dict[str, Any]], *, columns: Optional[list[str]] = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    cols = _columns(rows)
+    cols = list(columns or []) or _columns(rows)
+    # Preserve known schemas for empty downstream tables instead of writing
+    # zero-byte CSVs. This keeps pandas, Neo4j import tooling, and GCN scripts
+    # from failing on expected-but-empty files such as unknown/negative pairs in
+    # a one-target run.
     with path.open("w", newline="", encoding="utf-8-sig") as f:
         if not cols:
             f.write("")
@@ -818,13 +1098,88 @@ def _build_endpoint_feature_rows(node_records_by_ref: dict[str, dict[str, str]],
             "node_ref": ref,
             "endpoint_id": key.get("endpoint_id", ""),
             "endpoint_type": rec.get("props_endpoint_type", ""),
-            "value": rec.get("props_value", ""),
-            "unit": rec.get("props_unit", ""),
+            "value_raw": rec.get("props_value_raw", rec.get("props_value", "")),
+            "value_float": rec.get("props_value_float", ""),
+            "value_molar": rec.get("props_value_molar", ""),
+            "negative_log10_molar": rec.get("props_negative_log10_molar", ""),
+            "unit_raw": rec.get("props_unit", ""),
+            "unit_uri": rec.get("props_unit_uri", ""),
+            "unit_curie": rec.get("props_unit_curie", ""),
+            "unit_label": rec.get("props_unit_label", ""),
+            "unit_symbol": rec.get("props_unit_symbol", ""),
             "qualifier": rec.get("props_qualifier", ""),
+            "qualifier_symbol": rec.get("props_qualifier_symbol", ""),
             "outcome_label": rec.get("props_outcome_label", ""),
+            "outcome_label_normalized": rec.get("props_outcome_label_normalized", ""),
+            "activity_flag": rec.get("props_activity_flag", ""),
             "score": rec.get("props_score", ""),
+            "has_numeric_value": rec.get("props_has_numeric_value", ""),
         })
     return rows
+
+
+def _default_taxids_from_manifest(run_dir: Path) -> set[int]:
+    path = Path(run_dir) / "manifest.json"
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except Exception:
+        manifest = {}
+    candidates = []
+    # Current manifests usually store flags.taxids as a tuple/list inside the settings dict.
+    for container in [manifest, manifest.get("settings", {}) if isinstance(manifest, dict) else {}]:
+        if not isinstance(container, dict):
+            continue
+        flags = container.get("flags") if isinstance(container.get("flags"), dict) else {}
+        candidates.extend(flags.get("taxids") or [])
+        candidates.extend(container.get("taxids") or [])
+    out: set[int] = set()
+    for value in candidates:
+        try:
+            out.add(int(str(value).replace("TAXID", "")))
+        except Exception:
+            pass
+    return out
+
+
+def _extract_taxids_from_props(props: dict[str, Any]) -> set[int]:
+    out: set[int] = set()
+    for key in ["taxid", "taxonomy_id", "tax_id", "raw_taxid", "organism_taxid", "ncbi_taxid"]:
+        value = props.get(key)
+        if value in (None, ""):
+            continue
+        values = value if isinstance(value, (list, tuple, set)) else [value]
+        for item in values:
+            try:
+                out.add(int(str(item).replace("TAXID", "").strip()))
+            except Exception:
+                import re
+                m = re.search(r"(\d+)", str(item))
+                if m:
+                    try:
+                        out.add(int(m.group(1)))
+                    except Exception:
+                        pass
+    return out
+
+
+def _organism_props_for_taxid(taxid: int, *, derived_by: str) -> dict[str, Any]:
+    props: dict[str, Any] = {
+        "taxid": int(taxid),
+        "taxonomy_id": int(taxid),
+        "pubchem_uri": f"taxonomy:TAXID{int(taxid)}",
+        "derived_by": derived_by,
+    }
+    if int(taxid) == 9606:
+        props.update({"scientific_name": "Homo sapiens", "common_name": "human"})
+    return props
+
+
+def _first_nonempty_prop(props: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = props.get(key)
+        if value not in (None, "", [], {}):
+            return value
+    return None
 
 
 def _parse_node_ref(ref: str) -> tuple[str, dict[str, Any]]:

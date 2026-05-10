@@ -361,6 +361,63 @@ def _compound_cids_from_artifacts(store: RunStore, fallback_chem_ids: List[str])
     return sorted(cids)
 
 
+def _write_textmining_template(run_dir: Path) -> Path:
+    """Write a CSV template documenting the text-mining import contract."""
+    template_dir = Path(run_dir) / "templates"
+    template_dir.mkdir(parents=True, exist_ok=True)
+    path = template_dir / "textmining_cooccurrence_template.csv"
+    if not path.exists():
+        path.write_text(
+            "cooc_id,cid,compound_name,protein_id,protein_name,gene_id,gene_symbol,disease_id,disease_label,reference_id,pmid,doi,score,sentence_count,mention_context,association_type,direction,method_id,method_name,method_version,method_source\n"
+            "cooc:example,2244,Caffeine,P08684,Cytochrome P450 3A4,1576,CYP3A4,,,PMID:000000,000000,,0.92,3,Example sentence mentioning caffeine and CYP3A4.,compound-target cooccurrence,unknown,textmine:example,Example text-mining pipeline,1.0,external-file\n",
+            encoding="utf-8",
+        )
+    readme = template_dir / "TEXTMINING_IMPORT_README.md"
+    if not readme.exists():
+        readme.write_text(
+            "# PRING text-mining import\n\n"
+            "The text-mining layer is intentionally separate from curated PubChem assay evidence. "
+            "Provide a CSV/TSV file with one co-occurrence per row and run with `--include-textmining true --textmining-file <path>` or `--textmining-file auto`.\n\n"
+            "Accepted columns include: `cooc_id`, `cid`, `compound_name`, `protein_id`, `protein_name`, "
+            "`gene_id`, `gene_symbol`, `disease_id`, `disease_label`, `reference_id`, `pmid`, `doi`, "
+            "`score`, `sentence_count`, `mention_context`, `association_type`, `direction`, "
+            "`method_id`, `method_name`, `method_version`, and `method_source`.\n\n"
+            "If the file is not found, PRING creates this template and skips text-mined evidence rather than fabricating associations.\n",
+            encoding="utf-8",
+        )
+    return path
+
+def _resolve_textmining_file(value: Optional[Path], run_dir: Path) -> Optional[Path]:
+    """Resolve explicit/auto text-mining paths without failing the core build."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text.lower() != "auto":
+        return Path(value)
+    candidates = [
+        Path("textmining.csv"),
+        Path("textmining.tsv"),
+        Path("textmine_cooccurrence.csv"),
+        Path("textmine_cooccurrence.tsv"),
+        Path("cooccurrences.csv"),
+        Path("cooccurrences.tsv"),
+        Path("text_mining.csv"),
+        Path("text_mining.tsv"),
+        Path("data/textmining.csv"),
+        Path("data/textmining.tsv"),
+        Path("data/textmine_cooccurrence.csv"),
+        Path("inputs/textmining.csv"),
+        Path("inputs/textmining.tsv"),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    for candidate in Path(run_dir).glob("**/*text*min*.csv"):
+        if candidate.is_file() and "template" not in candidate.name.lower():
+            return candidate
+    _write_textmining_template(run_dir)
+    return None
+
 def _add_shared_args(parser: argparse.ArgumentParser, *, default_suppress: bool = False) -> None:
     default = argparse.SUPPRESS if default_suppress else None
 
@@ -798,6 +855,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     textmining_file = settings.textmining_file
     if getattr(args, "textmining_file", None):
         textmining_file = Path(args.textmining_file)
+    textmining_file = _resolve_textmining_file(textmining_file, run_dir)
     similarity_method = settings.compound_similarity_method
     if getattr(args, "compound_similarity_method", None):
         similarity_method = args.compound_similarity_method
@@ -1071,9 +1129,11 @@ def main(argv: Optional[List[str]] = None) -> None:
     textmine_rows = textmine_nodes = textmine_rels = 0
     if settings.flags.include_textmining:
         if settings.textmining_file is None:
-            log.warning("--include-textmining=true but no --textmining-file was provided; skipping text-mining layer.")
+            template = _write_textmining_template(run_dir)
+            log.warning("--include-textmining=true but no --textmining-file was provided; skipping text-mining rows. A template was written to %s", template)
         elif not settings.textmining_file.exists():
-            log.warning("Text-mining file not found: %s; skipping text-mining layer.", settings.textmining_file)
+            template = _write_textmining_template(run_dir)
+            log.warning("Text-mining file not found: %s; skipping text-mining rows. A template was written to %s", settings.textmining_file, template)
         else:
             textmine_rows, textmine_nodes, textmine_rels = _append_layer_rows(
                 iter_textmining_csv_rows(settings.textmining_file, max_records=settings.caps.max_textmine_records),

@@ -8,6 +8,8 @@ from pring.neo4j.driver import Neo4jDriver
 from pring.neo4j.schema_cypher import constraint_statements, parse_schema_dot, relationship_type_map_from_dot
 from pring.transform.normalizer import rel_type_from_schema_label
 from pring.transform.target_normalization import normalize_node_record
+from pring.transform.endpoint_normalization import normalize_endpoint_node_record
+from pring.transform.metadata_normalization import normalize_metadata_node_record
 
 
 def _chunked(items: List[Dict[str, Any]], size: int) -> Iterator[List[Dict[str, Any]]]:
@@ -90,7 +92,7 @@ def _sanitize_node_record(node: Dict[str, Any]) -> Dict[str, Any]:
     # Add deterministic Protein/Gene aliases at load time too. This makes
     # existing run folders query-friendly even if their JSONL artifacts were
     # produced before target normalization was added.
-    node = normalize_node_record(node)
+    node = normalize_metadata_node_record(normalize_endpoint_node_record(normalize_node_record(node)))
     return {
         **node,
         "key": _sanitize_property_map(node.get("key") or {}),

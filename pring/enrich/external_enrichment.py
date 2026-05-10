@@ -333,12 +333,15 @@ def _pdb_rows(protein_id: str, rec: Dict[str, Any], *, max_records: Optional[int
         pdb_id = x.get("id")
         if not pdb_id:
             continue
+        pdb_id_text = str(pdb_id).upper()
         yield {
             "protein_id": protein_id,
-            "pdb_id": str(pdb_id).upper(),
+            "pdb_id": pdb_id_text,
             "method": props.get("Method"),
             "resolution": props.get("Resolution"),
             "chain_map": props.get("Chains"),
+            "pdb_url": f"https://www.rcsb.org/structure/{pdb_id_text}",
+            "source_url": f"https://www.rcsb.org/structure/{pdb_id_text}",
             "source": "UniProtKB PDB cross-reference",
         }
         count += 1
@@ -348,26 +351,51 @@ def _pdb_rows(protein_id: str, rec: Dict[str, Any], *, max_records: Optional[int
 
 def _alphafold_rows(client: HttpClient, protein_id: str, acc: str, *, max_records: Optional[int]) -> Iterator[Dict[str, Any]]:
     data = _safe_get_json(client, f"https://alphafold.ebi.ac.uk/api/prediction/{acc}")
-    if not isinstance(data, list):
+    if isinstance(data, list) and data:
+        for i, item in enumerate(data):
+            if max_records is not None and i >= max_records:
+                break
+            model_id = item.get("entryId") or item.get("modelIdentifier") or f"AF-{acc}-F1"
+            yield {
+                "protein_id": protein_id,
+                "uniprot_acc": acc,
+                "alphafold_id": model_id,
+                "model_version": item.get("latestVersion") or item.get("version"),
+                "confidence_summary": item.get("confidenceCategory"),
+                "average_plddt": item.get("uniprotAveragePlddt"),
+                "pdb_url": item.get("pdbUrl"),
+                "cif_url": item.get("cifUrl"),
+                "pae_url": item.get("paeDocUrl"),
+                "storage_uri": item.get("pdbUrl") or item.get("cifUrl"),
+                "source_url": f"https://alphafold.ebi.ac.uk/entry/{acc}",
+                "model_status": "api_confirmed",
+                "source": "AlphaFold Protein Structure Database API",
+            }
         return
-    for i, item in enumerate(data):
-        if max_records is not None and i >= max_records:
-            break
-        model_id = item.get("entryId") or item.get("modelIdentifier") or f"AF-{acc}-F1"
-        yield {
-            "protein_id": protein_id,
-            "uniprot_acc": acc,
-            "alphafold_id": model_id,
-            "model_version": item.get("latestVersion") or item.get("version"),
-            "confidence_summary": item.get("confidenceCategory"),
-            "average_plddt": item.get("uniprotAveragePlddt"),
-            "pdb_url": item.get("pdbUrl"),
-            "cif_url": item.get("cifUrl"),
-            "pae_url": item.get("paeDocUrl"),
-            "storage_uri": item.get("pdbUrl") or item.get("cifUrl"),
-            "source": "AlphaFold Protein Structure Database API",
-        }
 
+    # Conservative fallback: AlphaFold uses stable public URL patterns for most
+    # UniProt accessions. Mark these rows as unverified so downstream analyses
+    # can choose whether to use them. This prevents CYP targets from losing the
+    # AlphaFold layer just because the API timed out during a bounded run.
+    if max_records is not None and max_records <= 0:
+        return
+    model_id = f"AF-{acc}-F1"
+    version = 4
+    yield {
+        "protein_id": protein_id,
+        "uniprot_acc": acc,
+        "alphafold_id": model_id,
+        "model_version": version,
+        "confidence_summary": None,
+        "average_plddt": None,
+        "pdb_url": f"https://alphafold.ebi.ac.uk/files/{model_id}-model_v{version}.pdb",
+        "cif_url": f"https://alphafold.ebi.ac.uk/files/{model_id}-model_v{version}.cif",
+        "pae_url": f"https://alphafold.ebi.ac.uk/files/{model_id}-predicted_aligned_error_v{version}.json",
+        "storage_uri": f"https://alphafold.ebi.ac.uk/files/{model_id}-model_v{version}.pdb",
+        "source_url": f"https://alphafold.ebi.ac.uk/entry/{acc}",
+        "model_status": "url_pattern_unverified",
+        "source": "AlphaFold deterministic URL pattern fallback",
+    }
 
 def _protein_embedding_row(protein_id: str, acc: str, rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     seq = ((rec.get("sequence") or {}).get("value") or "").upper()
