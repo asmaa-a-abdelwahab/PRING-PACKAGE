@@ -439,6 +439,7 @@ class PubChemPugClient:
                     "name": title,
                     "smiles": item.get("CanonicalSMILES") or item.get("IsomericSMILES"),
                     "canonical_smiles": item.get("CanonicalSMILES"),
+                    "isomeric_smiles": item.get("IsomericSMILES"),
                     "inchi": item.get("InChI"),
                     "inchikey": item.get("InChIKey"),
                     "formula": item.get("MolecularFormula"),

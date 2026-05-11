@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -243,6 +244,154 @@ def _validate_existing_run_dir(run_dir: Path) -> None:
         raise FileNotFoundError(f"Existing run has no relationship JSONL artifacts: {rels_dir}")
 
 
+def _copy_existing_run_artifacts(source_run_dir: Path, target_run_dir: Path) -> None:
+    """Copy canonical run artifacts for non-destructive ``load-run --run-id``.
+
+    ``load-run`` historically refreshed the source folder in place. When the user
+    provides ``--run-id``, we now create a new run folder and copy only the
+    reproducible artifacts needed for rematerialization (manifest + graph). Raw
+    HTTP cache is not copied to avoid duplicating large files.
+    """
+    source_run_dir = Path(source_run_dir)
+    target_run_dir = Path(target_run_dir)
+    target_run_dir.mkdir(parents=True, exist_ok=True)
+    src_graph = source_run_dir / "graph"
+    dst_graph = target_run_dir / "graph"
+    if dst_graph.exists():
+        shutil.rmtree(dst_graph)
+    shutil.copytree(src_graph, dst_graph)
+    src_manifest = source_run_dir / "manifest.json"
+    if src_manifest.exists():
+        shutil.copy2(src_manifest, target_run_dir / "source_manifest.json")
+    load_manifest = {
+        "mode": "load-run-copy",
+        "source_run_dir": str(source_run_dir),
+        "target_run_dir": str(target_run_dir),
+        "copied_at": datetime.now().isoformat(),
+        "note": "Canonical graph artifacts copied from source run; raw HTTP cache intentionally not copied.",
+    }
+    (target_run_dir / "manifest.json").write_text(json.dumps(load_manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _node_ref(label: object, key: dict) -> str:
+    label_text = str(label or "Unknown").strip() or "Unknown"
+    if not key:
+        return f"{label_text}|unknown"
+    parts = []
+    for k, v in sorted((key or {}).items()):
+        parts.append(f"{k}={str(v).strip()}")
+    return f"{label_text}|" + "|".join(parts)
+
+
+def _as_int(value: object) -> Optional[int]:
+    try:
+        if value in (None, ""):
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+
+def _missing_similarity_target_cids(store: RunStore) -> List[int]:
+    node_refs: Set[str] = set()
+    for node_file in sorted(store.nodes_dir.glob("*.jsonl")):
+        for rec in _iter_jsonl(node_file):
+            node_refs.add(_node_ref(rec.get("label") or node_file.stem, rec.get("key") or {}))
+
+    missing: Set[int] = set()
+    rel_file = store.rels_dir / "SIMILAR_TO.jsonl"
+    if not rel_file.exists():
+        return []
+    for rec in _iter_jsonl(rel_file):
+        end = rec.get("end") or {}
+        end_ref = _node_ref(end.get("label"), end.get("key") or {})
+        if end_ref in node_refs:
+            continue
+        if str(end.get("label") or "") != "Compound":
+            continue
+        cid = _as_int((end.get("key") or {}).get("cid"))
+        if cid is not None:
+            missing.add(cid)
+    return sorted(missing)
+
+
+def _iter_missing_compound_rows(pug: PubChemPugClient, missing_cids: Iterable[int], *, synonym_limit: int = 25) -> Iterator[PubChemRow]:
+    cids = [int(x) for x in missing_cids]
+    for start in range(0, len(cids), 100):
+        batch = cids[start:start + 100]
+        try:
+            for rec in pug.compound_records(batch, synonym_limit=synonym_limit):
+                rec.setdefault("neighbor_source", "compound_similarity_repair")
+                rec.setdefault("similarity_expansion", True)
+                rec.setdefault("retrieval_source", "PubChem PUG-REST similarity repair")
+                yield PubChemRow("compound", rec)
+            continue
+        except Exception:
+            log.warning("Batch repair for missing similar compound nodes failed; falling back to per-CID retrieval.", exc_info=True)
+        for cid in batch:
+            try:
+                records = list(pug.compound_records([cid], synonym_limit=synonym_limit))
+                if records:
+                    rec = records[0]
+                    rec.setdefault("neighbor_source", "compound_similarity_repair")
+                    rec.setdefault("similarity_expansion", True)
+                    rec.setdefault("retrieval_source", "PubChem PUG-REST similarity repair")
+                    yield PubChemRow("compound", rec)
+                    continue
+            except Exception:
+                log.warning("Could not retrieve full similar compound node for CID%s; writing minimal fallback node.", cid, exc_info=True)
+            yield PubChemRow("compound", {
+                "cid": cid,
+                "compound_term": f"compound:CID{cid}",
+                "pubchem_uri": f"compound:CID{cid}",
+                "preferred_name": f"CID {cid}",
+                "similarity_expansion": True,
+                "neighbor_source": "compound_similarity_repair",
+                "retrieval_status": "minimal_fallback",
+            })
+
+
+def _complete_missing_similarity_compound_nodes(
+    *,
+    store: RunStore,
+    settings: Settings,
+    allow_network: bool,
+    guard: Optional[ResourceGuard] = None,
+) -> None:
+    """Repair historical runs by materializing missing SIMILAR_TO target compounds."""
+    missing = _missing_similarity_target_cids(store)
+    marker_payload = {"missing_similarity_target_compounds": len(missing), "missing_cid_sample": missing[:25]}
+    if not missing:
+        store._write_stage_marker("similarity_repair", "complete", {**marker_payload, "added_rows": 0, "added_nodes": 0, "added_relationships": 0})
+        log.info("Similarity repair: no missing SIMILAR_TO target compound nodes detected.")
+        return
+    if not allow_network:
+        store._write_stage_marker("similarity_repair", "skipped", {**marker_payload, "reason": "network disabled"})
+        log.warning(
+            "Similarity repair found %d missing target Compound nodes but --allow-network is false; "
+            "rerun load-run with --complete-similar-compound-nodes true --allow-network true to fetch them.",
+            len(missing),
+        )
+        return
+
+    if guard is not None:
+        guard.checkpoint("similarity-repair:start", force=True)
+    store._write_stage_marker("similarity_repair", "running", marker_payload)
+    pug_cache = (settings.cache_dir / "pugrest") if settings.save_raw_http_cache else None
+    pug = PubChemPugClient(cache_dir=pug_cache, max_cache_bytes=_mb_to_bytes(settings.resources.max_http_cache_mb))
+    try:
+        rows, nodes, rels = _append_layer_rows(_iter_missing_compound_rows(pug, missing), store, guard)
+    finally:
+        try:
+            pug.close()
+        except Exception:
+            pass
+    store._write_stage_marker("similarity_repair", "complete", {**marker_payload, "added_rows": rows, "added_nodes": nodes, "added_relationships": rels})
+    log.info("Similarity repair: fetched/materialized missing target compounds=%d rows=%d nodes=%d rels=%d", len(missing), rows, nodes, rels)
+    if guard is not None:
+        guard.checkpoint("similarity-repair:done", force=True)
+
+
 def _load_existing_run_to_neo4j(
     *,
     source_run_dir: Path,
@@ -253,12 +402,17 @@ def _load_existing_run_to_neo4j(
     rematerialize_csv: bool,
     ensure_schema: bool,
     validate_schema: bool,
+    complete_similar_compound_nodes: bool = False,
+    allow_network: bool = False,
     guard: Optional[ResourceGuard] = None,
 ) -> None:
     """Build/load Neo4j graph from an existing run folder without PubChem re-querying."""
     _validate_existing_run_dir(source_run_dir)
-    log.info("📦 Existing run mode: source_run_dir=%s", source_run_dir)
+    log.info("📦 Existing run mode: source_run_dir=%s target_run_dir=%s", source_run_dir, store.run_dir)
     log.info("No PubChem extraction will be executed; loading canonical JSONL graph artifacts from disk.")
+    if source_run_dir.resolve() != store.run_dir.resolve():
+        _copy_existing_run_artifacts(source_run_dir, store.run_dir)
+        log.info("Copied canonical artifacts from %s to %s before rematerialization.", source_run_dir, store.run_dir)
 
     node_count_before = _count_jsonl_files(store.nodes_dir)
     rel_count_before = _count_jsonl_files(store.rels_dir)
@@ -266,6 +420,9 @@ def _load_existing_run_to_neo4j(
 
     if guard is not None:
         guard.checkpoint("load-run:start")
+
+    if complete_similar_compound_nodes:
+        _complete_missing_similarity_compound_nodes(store=store, settings=settings, allow_network=allow_network, guard=guard)
 
     if rematerialize_schema:
         derived_summary = store.materialize_schema_derived_graph(guard=guard, activity_threshold_um=settings.activity_threshold_um, weak_activity_as_negative=settings.weak_activity_as_negative)
@@ -669,6 +826,10 @@ def build_argparser() -> argparse.ArgumentParser:
                           help="Create/ensure Neo4j uniqueness constraints before loading. Default: true.")
     load_run.add_argument("--validate-dot-schema", type=str, choices=["true", "false"], default="true",
                           help="Validate Settings node keys against --schema-dot when provided. Default: true.")
+    load_run.add_argument("--complete-similar-compound-nodes", type=str, choices=["true", "false"], default="false",
+                          help="Repair historical similarity edges by fetching full Compound/Structure/Properties/Synonyms nodes for missing SIMILAR_TO target CIDs. Default: false.")
+    load_run.add_argument("--allow-network", type=str, choices=["true", "false"], default="false",
+                          help="Allow load-run repair steps to query PubChem. Default: false, so load-run remains offline/reproducible unless explicitly enabled.")
     return ap
 
 
@@ -737,10 +898,15 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     load_neo4j = (args.load_neo4j == "true") and (not args.dry_run)
 
-    # Run folder + logging (early). For load-run, reuse the existing run folder.
+    # Run folder + logging (early). For load-run, default is in-place refresh.
+    # When --run-id is explicitly supplied, create a new non-destructive output
+    # folder under --out-dir and copy canonical artifacts from --run-dir.
     run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
     if getattr(args, "cmd", None) == "load-run":
-        run_dir = Path(args.run_dir)
+        if _flag_present(raw_argv, "--run-id"):
+            run_dir = Path(args.out_dir) / run_id
+        else:
+            run_dir = Path(args.run_dir)
         # load-run should be able to refresh CSV/ML mirrors even under resource-profile low.
         save_csv_mirrors = (getattr(args, "rematerialize_csv", "true") == "true") or settings.resources.write_csv_mirrors
     else:
@@ -1000,6 +1166,8 @@ def main(argv: Optional[List[str]] = None) -> None:
             rematerialize_csv=(args.rematerialize_csv == "true"),
             ensure_schema=(args.ensure_neo4j_schema == "true"),
             validate_schema=(args.validate_dot_schema == "true"),
+            complete_similar_compound_nodes=(getattr(args, "complete_similar_compound_nodes", "false") == "true"),
+            allow_network=(getattr(args, "allow_network", "false") == "true"),
             guard=guard,
         )
         return

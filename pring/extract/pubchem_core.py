@@ -82,7 +82,9 @@ def iter_graph_records(rows: Iterable[PubChemRow]) -> Iterator[Tuple[str, Dict]]
 
             structure_props = {
                 "cid": cid,
-                "smiles": _first_nonempty(d, "smiles", "canonical_smiles"),
+                "smiles": _first_nonempty(d, "smiles", "canonical_smiles", "isomeric_smiles"),
+                "canonical_smiles": d.get("canonical_smiles"),
+                "isomeric_smiles": d.get("isomeric_smiles"),
                 "inchi": d.get("inchi"),
                 "inchikey": d.get("inchikey"),
             }

@@ -124,10 +124,21 @@ class RunStore:
         path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
 
     def _write_stage_marker(self, stage: str, status: str, payload: Optional[Dict[str, Any]] = None) -> None:
-        """Write a small stage status marker for resumability/QA."""
+        """Write a small stage status marker for resumability/QA.
+
+        Completion/failure markers remove stale ``*.running.json`` files for the
+        same stage, so the quality report cannot show both running and complete
+        states after a successful run.
+        """
         try:
             markers_dir = self.graph_dir / "stage_markers"
             markers_dir.mkdir(parents=True, exist_ok=True)
+            if status in {"complete", "failed", "skipped"}:
+                for stale in markers_dir.glob(f"{stage}.running*.json"):
+                    try:
+                        stale.unlink()
+                    except Exception:
+                        pass
             marker = {"stage": stage, "status": status}
             if payload:
                 marker.update(payload)
@@ -195,6 +206,9 @@ class RunStore:
                 except Exception:
                     pass
 
+        similarity_report = _similarity_quality_report(self.nodes_dir, self.rels_dir, node_refs)
+        optional_layer_report = _optional_layer_report(node_counts, relationship_counts, self.run_dir)
+
         ml_summary = (csv_summary or {}).get("ml", {}) if isinstance(csv_summary, dict) else {}
         report = {
             "node_counts_raw": node_counts,
@@ -205,6 +219,8 @@ class RunStore:
             "dangling_relationship_counts": dangling_relationship_counts,
             "endpoint_label_distribution": endpoint_label_distribution,
             "interaction_label_distribution_raw": interaction_label_distribution,
+            "similarity_report": similarity_report,
+            "optional_layer_report": optional_layer_report,
             "observed_compound_target_pairs": ml_summary.get("observed_compound_target_pairs"),
             "candidate_missing_compound_target_pairs": ml_summary.get("candidate_missing_compound_target_pairs"),
             "positive_compound_target_pairs": ml_summary.get("positive_compound_target_pairs"),
@@ -215,6 +231,7 @@ class RunStore:
             "stage_markers": stage_markers,
             "quality_flags": {
                 "has_dangling_relationships": bool(dangling_relationship_counts),
+                "has_dangling_similarity_edges": bool(similarity_report.get("similarity_missing_target_compounds")),
                 "all_interactions_unlabeled": (
                     bool(interaction_label_distribution)
                     and sum(v for k, v in interaction_label_distribution.items() if k != "curated_unlabeled") == 0
@@ -1071,10 +1088,10 @@ class RunStore:
         }
         summary_path = self.graph_dir / "csv_export_summary.json"
         summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
-        self.write_run_quality_report(summary)
         if guard is not None:
             guard.checkpoint("csv-ml:done", force=True)
         self._write_stage_marker("csv_ml_export", "complete", {"summary": summary.get("ml", {})})
+        self.write_run_quality_report(summary)
         return summary
 
     def clear_extracted_artifacts(self) -> None:
@@ -1101,6 +1118,102 @@ class RunStore:
                     pass
         self._graph_bytes_written = 0
 
+
+
+
+def _similarity_quality_report(nodes_dir: Path, rels_dir: Path, node_refs: set[str]) -> Dict[str, Any]:
+    """Summarize raw/exportable compound similarity coverage.
+
+    JSONL may contain dangling SIMILAR_TO relationships when a historical run
+    emitted similarity edges before target compound nodes were expanded. Neo4j
+    and ML CSV exports skip those edges, but the report makes the loss explicit.
+    """
+    raw_edges = 0
+    valid_edges = 0
+    missing_target_cids: set[int] = set()
+    missing_source_cids: set[int] = set()
+    similarity_expanded_nodes = 0
+    fallback_nodes = 0
+
+    compound_file = nodes_dir / "Compound.jsonl"
+    for rec in _read_jsonl(compound_file):
+        props = rec.get("props") or {}
+        if _truthy(props.get("similarity_expansion")):
+            similarity_expanded_nodes += 1
+        if props.get("retrieval_status") == "minimal_fallback":
+            fallback_nodes += 1
+
+    rel_file = rels_dir / "SIMILAR_TO.jsonl"
+    for rec in _read_jsonl(rel_file):
+        raw_edges += 1
+        start = rec.get("start") or {}
+        end = rec.get("end") or {}
+        start_ref = _node_ref(start.get("label"), start.get("key") or {})
+        end_ref = _node_ref(end.get("label"), end.get("key") or {})
+        if start_ref in node_refs and end_ref in node_refs:
+            valid_edges += 1
+        else:
+            if start_ref not in node_refs:
+                cid = _as_int((start.get("key") or {}).get("cid"))
+                if cid is not None:
+                    missing_source_cids.add(cid)
+            if end_ref not in node_refs:
+                cid = _as_int((end.get("key") or {}).get("cid"))
+                if cid is not None:
+                    missing_target_cids.add(cid)
+
+    return {
+        "raw_similarity_edges": raw_edges,
+        "valid_similarity_edges_from_jsonl": valid_edges,
+        "dangling_similarity_edges": max(0, raw_edges - valid_edges),
+        "similarity_missing_source_compounds": len(missing_source_cids),
+        "similarity_missing_target_compounds": len(missing_target_cids),
+        "missing_target_cid_sample": sorted(missing_target_cids)[:25],
+        "similarity_expansion_performed": similarity_expanded_nodes > 0,
+        "similarity_expanded_compound_nodes": similarity_expanded_nodes,
+        "similarity_minimal_fallback_compound_nodes": fallback_nodes,
+        "note": (
+            "If missing_target_compounds is greater than zero, rerun build with complete similarity expansion "
+            "or run load-run with --complete-similar-compound-nodes true --allow-network true."
+        ),
+    }
+
+
+def _optional_layer_report(node_counts: Dict[str, int], relationship_counts: Dict[str, int], run_dir: Path) -> Dict[str, Any]:
+    """Give explicit status for optional schema layers used by thesis QA."""
+    manifest: Dict[str, Any] = {}
+    try:
+        manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    except Exception:
+        manifest = {}
+    paths = manifest.get("paths") or {}
+    plugins = set(str(x).lower() for x in (manifest.get("plugins") or []))
+    requested_all = any("all" == p or p.endswith(":make_all_plugin") for p in plugins)
+    return {
+        "textmining": {
+            "textmine_nodes": int(node_counts.get("TextMine", 0)),
+            "cooc_nodes": int(node_counts.get("Cooc", 0)),
+            "mentions_compound_edges": int(relationship_counts.get("MENTIONS_COMPOUND", 0)),
+            "mentions_gene_edges": int(relationship_counts.get("MENTIONS_GENE", 0)),
+            "status": "materialized" if node_counts.get("Cooc", 0) else "not_materialized_or_empty",
+        },
+        "bindingdb": {
+            "bindingdb_nodes": int(node_counts.get("BindingDB", 0)),
+            "validated_by_bindingdb_edges": int(relationship_counts.get("VALIDATED_BY_BINDINGDB", 0)),
+            "status": "materialized" if node_counts.get("BindingDB", 0) else "not_materialized_or_empty",
+        },
+        "drugbank": {
+            "drugbank_nodes": int(node_counts.get("DrugBank", 0)),
+            "drugbank_file": paths.get("drugbank_file"),
+            "status": "materialized" if node_counts.get("DrugBank", 0) else ("skipped_no_drugbank_file" if requested_all and not paths.get("drugbank_file") else "not_materialized_or_empty"),
+        },
+        "optional_context": {
+            "cellline_nodes": int(node_counts.get("CellLine", 0)),
+            "anatomy_nodes": int(node_counts.get("Anatomy", 0)),
+            "disease_nodes": int(node_counts.get("Disease", 0)),
+            "status": "partially_materialized" if any(node_counts.get(x, 0) for x in ["CellLine", "Anatomy", "Disease"]) else "not_available_in_extracted_evidence",
+        },
+    }
 
 
 
@@ -1372,6 +1485,15 @@ def _endpoint_supervision_label(
     if explicit_ambiguous:
         return None
     return None
+
+
+def _as_int(value: Any) -> Optional[int]:
+    try:
+        if value in (None, ""):
+            return None
+        return int(value)
+    except Exception:
+        return None
 
 
 def _as_float(value: Any) -> Optional[float]:
