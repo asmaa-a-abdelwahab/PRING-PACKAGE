@@ -123,6 +123,110 @@ class RunStore:
         path = self.run_dir / "manifest.json"
         path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
 
+    def _write_stage_marker(self, stage: str, status: str, payload: Optional[Dict[str, Any]] = None) -> None:
+        """Write a small stage status marker for resumability/QA."""
+        try:
+            markers_dir = self.graph_dir / "stage_markers"
+            markers_dir.mkdir(parents=True, exist_ok=True)
+            marker = {"stage": stage, "status": status}
+            if payload:
+                marker.update(payload)
+            (markers_dir / f"{stage}.{status}.json").write_text(json.dumps(marker, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            # Stage markers must never make a valid extraction fail.
+            pass
+
+    def write_run_quality_report(self, csv_summary: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Write graph/run_quality_report.json with import and GCN readiness checks."""
+        node_counts: Dict[str, int] = {}
+        unique_node_counts: Dict[str, int] = {}
+        node_refs: set[str] = set()
+        endpoint_label_distribution = {"positive": 0, "negative": 0, "ambiguous_or_unlabeled": 0}
+        interaction_label_distribution: Dict[str, int] = {}
+
+        for path in sorted(self.nodes_dir.glob("*.jsonl")):
+            refs_for_label: set[str] = set()
+            label_name = path.stem
+            for rec in _read_jsonl(path):
+                node_counts[label_name] = node_counts.get(label_name, 0) + 1
+                rec = normalize_metadata_node_record(normalize_endpoint_node_record(normalize_node_record(rec)))
+                label = str(rec.get("label") or label_name)
+                ref = _node_ref(label, rec.get("key") or {})
+                refs_for_label.add(ref)
+                node_refs.add(ref)
+                props = rec.get("props") or {}
+                if label == "Endpoint":
+                    endpoint_label = _endpoint_supervision_label(props)
+                    if endpoint_label == 1:
+                        endpoint_label_distribution["positive"] += 1
+                    elif endpoint_label == 0:
+                        endpoint_label_distribution["negative"] += 1
+                    else:
+                        endpoint_label_distribution["ambiguous_or_unlabeled"] += 1
+                elif label == "Interaction":
+                    ilabel = _stringify_cell(props.get("label") or "missing")
+                    interaction_label_distribution[ilabel] = interaction_label_distribution.get(ilabel, 0) + 1
+            unique_node_counts[label_name] = len(refs_for_label)
+
+        relationship_counts: Dict[str, int] = {}
+        unique_relationship_counts: Dict[str, int] = {}
+        dangling_relationship_counts: Dict[str, int] = {}
+        for path in sorted(self.rels_dir.glob("*.jsonl")):
+            seen: set[tuple[str, str, str, str]] = set()
+            for rec in _read_jsonl(path):
+                schema_label = str(rec.get("schema_label") or rec.get("type") or path.stem)
+                relationship_counts[schema_label] = relationship_counts.get(schema_label, 0) + 1
+                start = rec.get("start") or {}
+                end = rec.get("end") or {}
+                start_ref = _node_ref(start.get("label"), start.get("key") or {})
+                end_ref = _node_ref(end.get("label"), end.get("key") or {})
+                seen.add((schema_label, start_ref, end_ref, _props_fingerprint(rec.get("props") or {})))
+                if start_ref not in node_refs or end_ref not in node_refs:
+                    dangling_relationship_counts[schema_label] = dangling_relationship_counts.get(schema_label, 0) + 1
+            unique_relationship_counts[path.stem] = len(seen)
+
+        stage_markers = {}
+        marker_dir = self.graph_dir / "stage_markers"
+        if marker_dir.exists():
+            for marker_path in sorted(marker_dir.glob("*.json")):
+                try:
+                    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+                    stage_markers[marker_path.stem] = marker
+                except Exception:
+                    pass
+
+        ml_summary = (csv_summary or {}).get("ml", {}) if isinstance(csv_summary, dict) else {}
+        report = {
+            "node_counts_raw": node_counts,
+            "node_counts_unique": unique_node_counts,
+            "duplicate_node_counts": {k: max(0, node_counts.get(k, 0) - unique_node_counts.get(k, 0)) for k in node_counts},
+            "relationship_counts_raw": relationship_counts,
+            "relationship_counts_unique_by_file": unique_relationship_counts,
+            "dangling_relationship_counts": dangling_relationship_counts,
+            "endpoint_label_distribution": endpoint_label_distribution,
+            "interaction_label_distribution_raw": interaction_label_distribution,
+            "observed_compound_target_pairs": ml_summary.get("observed_compound_target_pairs"),
+            "candidate_missing_compound_target_pairs": ml_summary.get("candidate_missing_compound_target_pairs"),
+            "positive_compound_target_pairs": ml_summary.get("positive_compound_target_pairs"),
+            "negative_compound_target_pairs": ml_summary.get("negative_compound_target_pairs"),
+            "neo4j_csv_written": bool((self.neo4j_csv_dir / "nodes").exists() and any((self.neo4j_csv_dir / "nodes").glob("*.csv"))),
+            "ml_export_written": bool(self.ml_dir.exists() and any(self.ml_dir.glob("*.csv"))),
+            "csv_summary": csv_summary or {},
+            "stage_markers": stage_markers,
+            "quality_flags": {
+                "has_dangling_relationships": bool(dangling_relationship_counts),
+                "all_interactions_unlabeled": (
+                    bool(interaction_label_distribution)
+                    and sum(v for k, v in interaction_label_distribution.items() if k != "curated_unlabeled") == 0
+                ),
+                "csv_export_complete": bool(stage_markers.get("csv_ml_export.complete")),
+                "derived_schema_complete": bool(stage_markers.get("derived_schema.complete")),
+            },
+        }
+        self.graph_dir.mkdir(parents=True, exist_ok=True)
+        (self.graph_dir / "run_quality_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+        return report
+
     def _ensure_graph_budget(self, extra_bytes: int, artifact_name: str) -> None:
         if self.max_graph_bytes is None:
             return
@@ -210,7 +314,14 @@ class RunStore:
         self._ensure_graph_budget(self._estimate_jsonl_size(r), f"relationship:{schema_label}")
         self.append_jsonl(self.rels_dir / f"{safe}.jsonl", r)
 
-    def materialize_schema_derived_graph(self, *, generate_interactions: bool = True, guard: Optional[Any] = None) -> Dict[str, Any]:
+    def materialize_schema_derived_graph(
+        self,
+        *,
+        generate_interactions: bool = True,
+        guard: Optional[Any] = None,
+        activity_threshold_um: Optional[float] = None,
+        weak_activity_as_negative: bool = False,
+    ) -> Dict[str, Any]:
         """Add schema-required derived relationships without changing extraction.
 
         This reads the canonical graph JSONL already produced by the extractors,
@@ -222,6 +333,7 @@ class RunStore:
             return {"enabled": False}
         if guard is not None:
             guard.checkpoint("derived-schema:start", force=True)
+        self._write_stage_marker("derived_schema", "running", {"generate_interactions": generate_interactions})
 
         existing_rel_keys: set[tuple[str, str, str, str]] = set()
         mg_to_aids: dict[str, set[str]] = {}
@@ -476,11 +588,28 @@ class RunStore:
                             bucket["references"].update(endpoint_to_refs.get(endpoint_ref, set()))
                             bucket["organisms"].update(mg_to_organisms.get(mg_ref, set()))
 
+            expected_interaction_pairs = len(interaction_support)
+            derived_interaction_label_counts = {
+                "curated_active": 0,
+                "curated_inactive": 0,
+                "curated_conflicting": 0,
+                "curated_unlabeled": 0,
+            }
+            numeric_endpoint_count = sum(
+                1
+                for props in existing_node_props_by_ref.values()
+                if props.get("endpoint_id") and (props.get("has_numeric_value") or props.get("value_float") or props.get("value_molar"))
+            )
+
             for (compound_ref, protein_ref), support in sorted(interaction_support.items()):
                 interaction_id = _stable_id(f"{compound_ref}|{protein_ref}", prefix="interaction")
                 interaction_ref = _node_ref("Interaction", {"interaction_id": interaction_id})
                 endpoint_labels = [
-                    _endpoint_supervision_label(existing_node_props_by_ref.get(endpoint_ref, {}))
+                    _endpoint_supervision_label(
+                        existing_node_props_by_ref.get(endpoint_ref, {}),
+                        activity_threshold_um=activity_threshold_um,
+                        weak_activity_as_negative=weak_activity_as_negative,
+                    )
                     for endpoint_ref in sorted(support["endpoints"])
                 ]
                 positive_endpoint_count = sum(1 for label in endpoint_labels if label == 1)
@@ -491,6 +620,7 @@ class RunStore:
                     negative_endpoint_count,
                     ambiguous_endpoint_count,
                 )
+                derived_interaction_label_counts[assertion_label] = derived_interaction_label_counts.get(assertion_label, 0) + 1
                 interaction_props = {
                     "interaction_id": interaction_id,
                     "label": assertion_label,
@@ -506,16 +636,19 @@ class RunStore:
                     "created_by": "PRING",
                 }
                 existing_props = existing_node_props_by_ref.get(interaction_ref, {})
-                if interaction_ref not in existing_nodes or "evidence_count" not in existing_props:
-                    self.save_node({
-                        "label": "Interaction",
-                        "key": {"interaction_id": interaction_id},
-                        "props": interaction_props,
-                    })
-                    existing_node_props_by_ref[interaction_ref] = _merge_nonempty(existing_props, interaction_props)
-                    if interaction_ref not in existing_nodes:
-                        existing_nodes.add(interaction_ref)
-                        added_nodes += 1
+                # Always append the current deterministic interaction record.
+                # CSV/Neo4j mirrors deduplicate by node key and prefer the latest
+                # non-empty values, which allows fixed label logic to repair older
+                # partial runs without deleting canonical JSONL history.
+                self.save_node({
+                    "label": "Interaction",
+                    "key": {"interaction_id": interaction_id},
+                    "props": interaction_props,
+                })
+                existing_node_props_by_ref[interaction_ref] = _merge_nonempty(existing_props, interaction_props)
+                if interaction_ref not in existing_nodes:
+                    existing_nodes.add(interaction_ref)
+                    added_nodes += 1
                 add_rel("ASSERTS_CHEMICAL", interaction_ref, compound_ref)
                 add_rel("ASSERTS_TARGET", interaction_ref, protein_ref)
                 for endpoint_ref in sorted(support["endpoints"]):
@@ -527,8 +660,34 @@ class RunStore:
                 for organism_ref in sorted(support["organisms"]):
                     add_rel("SCOPED_TO_ORGANISM", interaction_ref, organism_ref)
 
+        if generate_interactions:
+            expected_interaction_pairs = locals().get("expected_interaction_pairs", 0)
+            label_counts = locals().get("derived_interaction_label_counts", {})
+            numeric_endpoint_count = locals().get("numeric_endpoint_count", 0)
+            if expected_interaction_pairs and numeric_endpoint_count and not (
+                label_counts.get("curated_active", 0)
+                or label_counts.get("curated_inactive", 0)
+                or label_counts.get("curated_conflicting", 0)
+            ):
+                self._write_stage_marker("derived_schema", "failed", {
+                    "reason": "numeric endpoints exist but all derived interactions are unlabeled",
+                    "expected_interaction_pairs": expected_interaction_pairs,
+                    "numeric_endpoint_count": numeric_endpoint_count,
+                    "interaction_label_counts": label_counts,
+                })
+                raise RuntimeError(
+                    "Derived interaction label validation failed: numeric endpoints exist, "
+                    "but all interactions are curated_unlabeled. Check endpoint normalization/label rules."
+                )
+
         if guard is not None:
             guard.checkpoint("derived-schema:done", force=True)
+        self._write_stage_marker("derived_schema", "complete", {
+            "added_nodes": added_nodes,
+            "added_relationships": added_rels,
+            "expected_interaction_pairs": locals().get("expected_interaction_pairs", 0),
+            "interaction_label_counts": locals().get("derived_interaction_label_counts", {}),
+        })
 
         return {
             "enabled": True,
@@ -540,9 +699,17 @@ class RunStore:
             "derived_organisms": (self.nodes_dir / "Organism.jsonl").exists(),
             "derived_pathways": (self.nodes_dir / "Pathway.jsonl").exists(),
             "inferred_mg_organism_links": locals().get("inferred_mg_organism_links", 0),
+            "expected_interaction_pairs": locals().get("expected_interaction_pairs", 0),
+            "interaction_label_counts": locals().get("derived_interaction_label_counts", {}),
         }
 
-    def materialize_csv_mirrors(self, *, guard: Optional[Any] = None) -> Dict[str, Any]:
+    def materialize_csv_mirrors(
+        self,
+        *,
+        guard: Optional[Any] = None,
+        activity_threshold_um: Optional[float] = None,
+        weak_activity_as_negative: bool = False,
+    ) -> Dict[str, Any]:
         """Create readable CSV mirrors, Neo4j import CSVs, and ML/GCN tables.
 
         The canonical JSONL artifacts remain complete and lossless. CSV mirrors
@@ -553,6 +720,7 @@ class RunStore:
             return {"enabled": False}
         if guard is not None:
             guard.checkpoint("csv-ml:start", force=True)
+        self._write_stage_marker("csv_ml_export", "running", {})
 
         for d in [self.rows_csv_dir, self.nodes_csv_dir, self.rels_csv_dir, self.neo4j_csv_dir / "nodes", self.neo4j_csv_dir / "relationships", self.ml_dir]:
             _clear_dir(d)
@@ -723,7 +891,11 @@ class RunStore:
                 compound_ref = substance_to_compound.get(substance_ref or "")
                 if not compound_ref:
                     continue
-                endpoint_label = _endpoint_supervision_label(node_records_by_ref.get(endpoint_ref, {}))
+                endpoint_label = _endpoint_supervision_label(
+                    node_records_by_ref.get(endpoint_ref, {}),
+                    activity_threshold_um=activity_threshold_um,
+                    weak_activity_as_negative=weak_activity_as_negative,
+                )
                 for protein_ref in mg_to_proteins.get(mg_ref, set()):
                     key = (compound_ref, protein_ref)
                     rec = evidence_pairs.setdefault(key, {
@@ -899,8 +1071,10 @@ class RunStore:
         }
         summary_path = self.graph_dir / "csv_export_summary.json"
         summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+        self.write_run_quality_report(summary)
         if guard is not None:
             guard.checkpoint("csv-ml:done", force=True)
+        self._write_stage_marker("csv_ml_export", "complete", {"summary": summary.get("ml", {})})
         return summary
 
     def clear_extracted_artifacts(self) -> None:
@@ -1033,20 +1207,24 @@ def _stringify_row(row: dict[str, Any]) -> dict[str, str]:
 
 
 def _merge_nonempty(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
-    """Merge dictionaries while preserving existing non-empty values.
+    """Merge dictionaries while preferring later non-empty values.
 
-    This is used for deduplicated CSV mirrors. Canonical JSONL remains lossless,
-    but readable CSV/Neo4j bulk artifacts should contain one row per node key.
+    Canonical JSONL is append-only and lossless, but CSV/Neo4j mirrors must
+    present one final row per node key. Later derived/materialized records often
+    contain corrected labels or richer evidence counts, so non-empty values from
+    ``extra`` deliberately replace earlier scalar values. Lists are unioned.
     """
     out = dict(base or {})
     for k, v in (extra or {}).items():
         if v is None or v == "":
             continue
-        if k not in out or out.get(k) in (None, "", [], {}):
-            out[k] = v
-        elif isinstance(out.get(k), list) and isinstance(v, list):
+        if isinstance(out.get(k), list) and isinstance(v, list):
             seen = {_stringify_cell(x) for x in out[k]}
             out[k].extend(x for x in v if _stringify_cell(x) not in seen)
+        elif isinstance(out.get(k), dict) and isinstance(v, dict):
+            out[k] = _merge_nonempty(out[k], v)
+        else:
+            out[k] = v
     return out
 
 def _columns(rows: list[dict[str, Any]]) -> list[str]:
@@ -1131,38 +1309,78 @@ def _sanitize_filename(s: str) -> str:
 
 
 
-def _endpoint_supervision_label(endpoint_record: dict[str, Any]) -> Optional[int]:
-    """Infer a conservative supervised label from a flattened Endpoint CSV record.
+def _endpoint_supervision_label(
+    endpoint_record: dict[str, Any],
+    *,
+    activity_threshold_um: Optional[float] = None,
+    weak_activity_as_negative: bool = False,
+) -> Optional[int]:
+    """Infer a conservative supervised label from an Endpoint record.
 
-    Returns 1 for curated active/quantitative potency evidence, 0 for curated
-    inactive evidence, and None for ambiguous, unspecified, or unsupported
-    endpoints. This prevents every evidence path from becoming a positive label.
+    Accepts either flattened CSV-style keys (``props_activity_flag``) or raw
+    node props keys (``activity_flag``). Returns 1 for curated active/potency
+    evidence, 0 for curated inactive evidence, and None for ambiguous,
+    unspecified, or unsupported endpoints. If ``activity_threshold_um`` is set,
+    numeric molar potency values weaker than the threshold can be exported as
+    negative/weak evidence when ``weak_activity_as_negative`` is true.
     """
     if not endpoint_record:
         return None
+
+    def g(*keys: str) -> Any:
+        for key in keys:
+            if key in endpoint_record and endpoint_record.get(key) not in (None, "", [], {}):
+                return endpoint_record.get(key)
+        return None
+
     values = [
-        endpoint_record.get("props_activity_flag"),
-        endpoint_record.get("props_outcome_label_normalized"),
-        endpoint_record.get("props_outcome_label"),
-        endpoint_record.get("props_outcome_raw"),
-        endpoint_record.get("props_label"),
+        g("props_activity_flag", "activity_flag"),
+        g("props_outcome_label_normalized", "outcome_label_normalized"),
+        g("props_outcome_label", "outcome_label"),
+        g("props_outcome_raw", "outcome_raw"),
+        g("props_label", "label"),
     ]
     normalized_values = {_norm_label(v) for v in values if _norm_label(v)}
-    if normalized_values & {"inactive", "negative", "no_activity", "no_activity"}:
+    if normalized_values & {"inactive", "negative", "no_activity", "not_active"}:
         return 0
-    if normalized_values & {"inconclusive", "indeterminate", "ambiguous", "unspecified"}:
-        return None
+    if normalized_values & {"inconclusive", "indeterminate", "ambiguous", "unspecified", "unknown"}:
+        explicit_ambiguous = True
+    else:
+        explicit_ambiguous = False
+
+    endpoint_type = _norm_label(g("props_endpoint_type", "endpoint_type", "props_type", "type"))
+    outcome_type = _norm_label(g("props_outcome_label", "outcome_label", "props_label", "label"))
+    has_numeric = _truthy(g("props_has_numeric_value", "has_numeric_value")) or bool(g("props_value_float", "value_float", "props_value_molar", "value_molar"))
+    potency_types = {"ic50", "ec50", "ac50", "ki", "kd", "km", "inh", "potency", "activity"}
+
+    if has_numeric and ((endpoint_type in potency_types) or (outcome_type in potency_types)):
+        if activity_threshold_um is not None:
+            molar = _as_float(g("props_value_molar", "value_molar"))
+            if molar is not None:
+                threshold_molar = float(activity_threshold_um) * 1e-6
+                qualifier = _norm_label(g("props_qualifier_symbol", "qualifier_symbol", "props_qualifier", "qualifier"))
+                # <= IC50/Ki/Kd threshold => active. Values clearly above the
+                # threshold can be treated as weak/negative only when requested.
+                if molar <= threshold_molar or qualifier in {"<", "<=", "less_than", "le"}:
+                    return 1
+                if weak_activity_as_negative and molar > threshold_molar:
+                    return 0
+        return 1
+
     if normalized_values & {"active", "hit", "positive"}:
         return 1
-
-    endpoint_type = _norm_label(endpoint_record.get("props_endpoint_type") or endpoint_record.get("props_type"))
-    outcome_type = _norm_label(endpoint_record.get("props_outcome_label") or endpoint_record.get("props_label"))
-    has_numeric = _truthy(endpoint_record.get("props_has_numeric_value")) or bool(endpoint_record.get("props_value_float"))
-    potency_types = {"ic50", "ec50", "ac50", "ki", "kd", "km", "inh", "potency", "activity"}
-    if has_numeric and ((endpoint_type in potency_types) or (outcome_type in potency_types)):
-        return 1
+    if explicit_ambiguous:
+        return None
     return None
 
+
+def _as_float(value: Any) -> Optional[float]:
+    try:
+        if value in (None, ""):
+            return None
+        return float(str(value).strip())
+    except Exception:
+        return None
 
 def _interaction_assertion_label(positive_count: int, negative_count: int, ambiguous_count: int) -> tuple[str, float]:
     total = max(1, positive_count + negative_count + ambiguous_count)

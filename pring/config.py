@@ -159,6 +159,11 @@ class Settings:
     textmining_source: str = "auto"  # auto | pubchem | file
     compound_similarity_method: str = "2d"
     compound_similarity_threshold: int = 90
+    # Optional supervised-label controls for CYP450 GCN exports.
+    # None means any numeric potency endpoint is positive evidence; when set,
+    # values above the threshold can be handled as weak/negative if requested.
+    activity_threshold_um: Optional[float] = None
+    weak_activity_as_negative: bool = False
     enrichment_timeout_s: float = 45.0
     enrichment_max_retries: int = 1
     enrichment_min_delay_s: float = 0.25
@@ -266,6 +271,8 @@ class Settings:
             textmining_source=os.getenv("PRING_TEXTMINING_SOURCE", "auto").strip().lower() or "auto",
             compound_similarity_method=os.getenv("PRING_COMPOUND_SIMILARITY_METHOD", "2d"),
             compound_similarity_threshold=int(os.getenv("PRING_COMPOUND_SIMILARITY_THRESHOLD", "90")),
+            activity_threshold_um=_float_or_none(os.getenv("PRING_ACTIVITY_THRESHOLD_UM"), None),
+            weak_activity_as_negative=_parse_bool(os.getenv("PRING_WEAK_ACTIVITY_AS_NEGATIVE"), False),
             enrichment_timeout_s=float(os.getenv("PRING_ENRICHMENT_TIMEOUT_S", "45.0")),
             enrichment_max_retries=int(os.getenv("PRING_ENRICHMENT_MAX_RETRIES", "1")),
             enrichment_min_delay_s=float(os.getenv("PRING_ENRICHMENT_MIN_DELAY_S", "0.25")),

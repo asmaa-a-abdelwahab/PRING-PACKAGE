@@ -268,7 +268,7 @@ def _load_existing_run_to_neo4j(
         guard.checkpoint("load-run:start")
 
     if rematerialize_schema:
-        derived_summary = store.materialize_schema_derived_graph(guard=guard)
+        derived_summary = store.materialize_schema_derived_graph(guard=guard, activity_threshold_um=settings.activity_threshold_um, weak_activity_as_negative=settings.weak_activity_as_negative)
         if derived_summary.get("enabled"):
             log.info(
                 "Schema-derived graph checked/materialized: added_nodes=%d added_relationships=%d",
@@ -279,7 +279,7 @@ def _load_existing_run_to_neo4j(
             guard.checkpoint("load-run:derived-schema")
 
     if rematerialize_csv:
-        csv_summary = store.materialize_csv_mirrors(guard=guard)
+        csv_summary = store.materialize_csv_mirrors(guard=guard, activity_threshold_um=settings.activity_threshold_um, weak_activity_as_negative=settings.weak_activity_as_negative)
         if csv_summary.get("enabled"):
             log.info(
                 "Readable CSV/Neo4j/ML mirrors refreshed: node_labels=%d rel_types=%d ML_training_pairs=%d",
@@ -538,6 +538,10 @@ def _add_shared_args(parser: argparse.ArgumentParser, *, default_suppress: bool 
                         help="PubChem fast similarity method used when --include-compound-similarity=true.")
     parser.add_argument("--compound-similarity-threshold", type=int, default=default,
                         help="PubChem similarity threshold, usually 0-100. Default: 90.")
+    parser.add_argument("--activity-threshold-um", type=float, default=default,
+                        help="Optional potency threshold in micromolar for interaction labels/GCN exports, e.g. 10.")
+    parser.add_argument("--weak-activity-as-negative", type=str, choices=["true", "false"], default=default,
+                        help="When --activity-threshold-um is set, treat numeric activity weaker than the threshold as negative/weak evidence.")
     parser.add_argument("--include-optional-context", type=str, choices=["true", "false"], default=default)
     parser.add_argument("--include-endpoint-metadata", type=str, choices=["true", "false"], default=default,
                         help="Fetch endpoint label/value/unit/outcome metadata (default: true).")
@@ -946,8 +950,23 @@ def main(argv: Optional[List[str]] = None) -> None:
     similarity_threshold = settings.compound_similarity_threshold
     if getattr(args, "compound_similarity_threshold", None) is not None:
         similarity_threshold = int(args.compound_similarity_threshold)
+    activity_threshold_um = settings.activity_threshold_um
+    if getattr(args, "activity_threshold_um", None) is not None:
+        activity_threshold_um = float(args.activity_threshold_um)
+    weak_activity_as_negative = settings.weak_activity_as_negative
+    if getattr(args, "weak_activity_as_negative", None) is not None:
+        weak_activity_as_negative = args.weak_activity_as_negative == "true"
 
-    settings = settings.with_overrides(flags=flags, caps=caps, textmining_file=textmining_file, textmining_source=textmining_source, compound_similarity_method=similarity_method, compound_similarity_threshold=similarity_threshold)
+    settings = settings.with_overrides(
+        flags=flags,
+        caps=caps,
+        textmining_file=textmining_file,
+        textmining_source=textmining_source,
+        compound_similarity_method=similarity_method,
+        compound_similarity_threshold=similarity_threshold,
+        activity_threshold_um=activity_threshold_um,
+        weak_activity_as_negative=weak_activity_as_negative,
+    )
 
     # Plugins / external enrichment
     plugin_args = args.plugins or []
@@ -1042,10 +1061,10 @@ def main(argv: Optional[List[str]] = None) -> None:
             store.save_row(row.kind, row.data)
         store.save_nodes(nodes)
         store.save_relationships(rels)
-        derived_summary = store.materialize_schema_derived_graph(guard=guard)
+        derived_summary = store.materialize_schema_derived_graph(guard=guard, activity_threshold_um=settings.activity_threshold_um, weak_activity_as_negative=settings.weak_activity_as_negative)
         if derived_summary.get("enabled"):
             log.info("Schema-derived graph additions: nodes=%d rels=%d", derived_summary.get("added_nodes", 0), derived_summary.get("added_relationships", 0))
-        csv_summary = store.materialize_csv_mirrors(guard=guard)
+        csv_summary = store.materialize_csv_mirrors(guard=guard, activity_threshold_um=settings.activity_threshold_um, weak_activity_as_negative=settings.weak_activity_as_negative)
         if csv_summary.get("enabled"):
             log.info("Readable CSV/Neo4j/ML mirrors written under %s", store.graph_dir)
         if not load_neo4j:
@@ -1253,7 +1272,14 @@ def main(argv: Optional[List[str]] = None) -> None:
                         max_records_per_target=getattr(settings.caps, "max_textmine_records_per_target", 250),
                         max_references_per_pair=getattr(settings.caps, "max_textmine_references_per_pair", 5),
                     )
-                    textmine_rows, textmine_nodes, textmine_rels = _append_layer_rows(textmine_iter, store, guard)
+                    try:
+                        textmine_rows, textmine_nodes, textmine_rels = _append_layer_rows(textmine_iter, store, guard)
+                    except Exception:
+                        # Text mining is weak/additive evidence. It must not
+                        # invalidate a curated PubChem evidence run when the
+                        # public endpoint is unavailable or throttled.
+                        log.warning("PubChem text-mining endpoint failed; continuing without text-mining rows.", exc_info=True)
+                        textmine_rows = textmine_nodes = textmine_rels = 0
                 finally:
                     try:
                         text_client.close()
@@ -1302,7 +1328,11 @@ def main(argv: Optional[List[str]] = None) -> None:
             continue
         iter_rows = getattr(plugin, "iter_rows", None)
         if callable(iter_rows):
-            r_count, n_count, rel_count_plugin = _append_layer_rows(iter_rows(settings, store), store, guard)
+            try:
+                r_count, n_count, rel_count_plugin = _append_layer_rows(iter_rows(settings, store), store, guard)
+            except Exception:
+                log.warning("Plugin layer %s failed; continuing without this optional enrichment.", getattr(plugin, "name", "plugin"), exc_info=True)
+                continue
             plugin_row_count += r_count
             plugin_node_count += n_count
             plugin_rel_count += rel_count_plugin
@@ -1311,24 +1341,27 @@ def main(argv: Optional[List[str]] = None) -> None:
             rel_count += rel_count_plugin
             log.info("Plugin layer %s: rows=%d nodes=%d rels=%d", getattr(plugin, "name", "plugin"), r_count, n_count, rel_count_plugin)
             continue
-        for delta_idx, delta in enumerate(plugin.run(settings), start=1):
-            guard.checkpoint(f"plugin:{getattr(plugin, 'name', 'plugin')}:delta:{delta_idx}:before", force=True)
-            plugin_node_count += len(delta.nodes)
-            plugin_rel_count += len(delta.rels)
-            node_count += len(delta.nodes)
-            rel_count += len(delta.rels)
-            store.save_nodes(delta.nodes)
-            store.save_relationships(delta.rels)
-            guard.checkpoint(f"plugin:{getattr(plugin, 'name', 'plugin')}:delta:{delta_idx}:after", force=True)
+        try:
+            for delta_idx, delta in enumerate(plugin.run(settings), start=1):
+                guard.checkpoint(f"plugin:{getattr(plugin, 'name', 'plugin')}:delta:{delta_idx}:before", force=True)
+                plugin_node_count += len(delta.nodes)
+                plugin_rel_count += len(delta.rels)
+                node_count += len(delta.nodes)
+                rel_count += len(delta.rels)
+                store.save_nodes(delta.nodes)
+                store.save_relationships(delta.rels)
+                guard.checkpoint(f"plugin:{getattr(plugin, 'name', 'plugin')}:delta:{delta_idx}:after", force=True)
+        except Exception:
+            log.warning("Plugin layer %s failed; continuing without this optional enrichment.", getattr(plugin, "name", "plugin"), exc_info=True)
 
     if settings.enabled_plugins:
         log.info("Plugin additions: rows=%d nodes=%d rels=%d", plugin_row_count, plugin_node_count, plugin_rel_count)
 
-    derived_summary = store.materialize_schema_derived_graph(guard=guard)
+    derived_summary = store.materialize_schema_derived_graph(guard=guard, activity_threshold_um=settings.activity_threshold_um, weak_activity_as_negative=settings.weak_activity_as_negative)
     if derived_summary.get("enabled"):
         log.info("Schema-derived graph additions: nodes=%d rels=%d", derived_summary.get("added_nodes", 0), derived_summary.get("added_relationships", 0))
 
-    csv_summary = store.materialize_csv_mirrors(guard=guard)
+    csv_summary = store.materialize_csv_mirrors(guard=guard, activity_threshold_um=settings.activity_threshold_um, weak_activity_as_negative=settings.weak_activity_as_negative)
     if csv_summary.get("enabled"):
         log.info(
             "Readable CSV mirrors written: rows=%d node_labels=%d rel_types=%d; ML pairs=%d",

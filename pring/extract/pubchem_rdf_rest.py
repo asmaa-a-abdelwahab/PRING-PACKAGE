@@ -23,7 +23,7 @@ Notes on response format:
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import hashlib
 import json
@@ -365,6 +365,93 @@ class PubChemPugClient:
         inc = inchi.strip()
         data = self._get(f"compound/inchi/{quote(inc, safe='')}/cids/JSON")
         return self._extract_cids(data)
+
+
+    def compound_records(self, cids: Iterable[int], *, synonym_limit: int = 25) -> Iterator[Dict[str, Any]]:
+        """Return schema-ready compound rows from PUG-REST for one or more CIDs.
+
+        These rows are intentionally shaped like PRING ``compound`` extraction
+        rows so the normal graph materializer creates complete Compound,
+        Structure, Properties, Synonyms, and downstream MolGraph records.
+        """
+        cid_list: List[int] = []
+        seen: set[int] = set()
+        for raw in cids:
+            try:
+                cid = int(raw)
+            except Exception:
+                continue
+            if cid in seen:
+                continue
+            seen.add(cid)
+            cid_list.append(cid)
+        if not cid_list:
+            return
+
+        property_names = ",".join([
+            "Title",
+            "CanonicalSMILES",
+            "IsomericSMILES",
+            "InChI",
+            "InChIKey",
+            "MolecularFormula",
+            "MolecularWeight",
+            "ExactMass",
+            "XLogP",
+            "TPSA",
+            "HBondDonorCount",
+            "HBondAcceptorCount",
+            "RotatableBondCount",
+        ])
+        # PUG-REST accepts comma-separated CIDs for property retrieval. Keep
+        # batches small enough for public service reliability and local memory.
+        for batch_start in range(0, len(cid_list), 100):
+            batch = cid_list[batch_start:batch_start + 100]
+            data = self._get(f"compound/cid/{','.join(str(x) for x in batch)}/property/{property_names}/JSON")
+            props_rows = (((data or {}).get("PropertyTable") or {}).get("Properties") or [])
+            props_by_cid: Dict[int, Dict[str, Any]] = {}
+            for item in props_rows:
+                try:
+                    cid = int(item.get("CID"))
+                except Exception:
+                    continue
+                props_by_cid[cid] = item
+
+            for cid in batch:
+                item = props_by_cid.get(cid, {})
+                synonyms: List[str] = []
+                if synonym_limit and synonym_limit > 0:
+                    try:
+                        syn_data = self._get(f"compound/cid/{cid}/synonyms/JSON")
+                        info = (((syn_data or {}).get("InformationList") or {}).get("Information") or [])
+                        if info:
+                            raw_syns = info[0].get("Synonym") or []
+                            if isinstance(raw_syns, list):
+                                synonyms = [str(x) for x in raw_syns[:int(synonym_limit)] if str(x).strip()]
+                    except Exception:
+                        synonyms = []
+                title = item.get("Title") or (synonyms[0] if synonyms else f"CID {cid}")
+                yield {
+                    "cid": cid,
+                    "compound_term": f"compound:CID{cid}",
+                    "pubchem_uri": f"compound:CID{cid}",
+                    "preferred_name": title,
+                    "name": title,
+                    "smiles": item.get("CanonicalSMILES") or item.get("IsomericSMILES"),
+                    "canonical_smiles": item.get("CanonicalSMILES"),
+                    "inchi": item.get("InChI"),
+                    "inchikey": item.get("InChIKey"),
+                    "formula": item.get("MolecularFormula"),
+                    "molecular_weight": item.get("MolecularWeight"),
+                    "exact_mass": item.get("ExactMass"),
+                    "xlogp3": item.get("XLogP"),
+                    "tpsa": item.get("TPSA"),
+                    "hbond_donor_count": item.get("HBondDonorCount"),
+                    "hbond_acceptor_count": item.get("HBondAcceptorCount"),
+                    "rotatable_bond_count": item.get("RotatableBondCount"),
+                    "synonyms": synonyms or None,
+                    "retrieval_source": "PubChem PUG-REST property/synonym",
+                }
 
     def similar_cids(self, cid: int, *, method: str = "2d", threshold: int = 90, max_records: int = 10) -> List[int]:
         """Return PubChem fast similarity neighbors for a CID.
