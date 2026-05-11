@@ -28,6 +28,7 @@ _UNIPROT_TO_CYP = {
     "P08684": "CYP3A4",
     "P20815": "CYP3A5",
     "Q7Z449": "CYP2U1",
+    "Q96SQ9": "CYP2S1",
 }
 
 _GENE_ID_TO_CYP = {
@@ -38,6 +39,7 @@ _GENE_ID_TO_CYP = {
     "1576": "CYP3A4",
     "1577": "CYP3A5",
     "113612": "CYP2U1",
+    "29785": "CYP2S1",
 }
 
 _CYP_TO_GENE_ID = {v: k for k, v in _GENE_ID_TO_CYP.items()}

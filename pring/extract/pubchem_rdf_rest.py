@@ -552,7 +552,7 @@ class PubChemRdfRestExtractor:
             if m:
                 return {"kind": "gene", "gene_id": int(m.group(1)), "gene": term}
             return {"kind": "symbol", "symbol": term.split(":", 1)[1], "symbol_term": term}
-        if re.fullmatch(r"[A-NR-Z][0-9][A-Z0-9]{3}[0-9](?:-\d+)?", s):
+        if re.fullmatch(r"(?:[A-NR-Z][0-9][A-Z0-9]{3}[0-9]|[OPQ][0-9][A-Z0-9]{3}[0-9])(?:-\d+)?", s, flags=re.IGNORECASE):
             return {"kind": "protein", "uniprot": s, "protein": f"protein:ACC{s}"}
         if s.isdigit():
             gid = int(s)

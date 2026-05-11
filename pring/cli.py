@@ -75,6 +75,8 @@ def _apply_resource_profile(settings: Settings, profile: str, raw_argv: List[str
                 max_cpu_percent=resources.max_cpu_percent,
                 resource_check_interval_s=resources.resource_check_interval_s,
                 max_workers=resources.max_workers,
+                memory_safety_margin_mb=getattr(resources, "memory_safety_margin_mb", 1024),
+                reserve_system_memory_mb=getattr(resources, "reserve_system_memory_mb", 1024),
             )
         if not _flag_present(raw_argv, "--rest-min-delay-s"):
             rdf_rest = rdf_rest.__class__(
@@ -111,6 +113,8 @@ def _apply_resource_profile(settings: Settings, profile: str, raw_argv: List[str
                 max_cpu_percent=resources.max_cpu_percent,
                 resource_check_interval_s=resources.resource_check_interval_s,
                 max_workers=resources.max_workers,
+                memory_safety_margin_mb=getattr(resources, "memory_safety_margin_mb", 1024),
+                reserve_system_memory_mb=getattr(resources, "reserve_system_memory_mb", 1024),
             )
     else:
         resources = resources.__class__(
@@ -122,6 +126,8 @@ def _apply_resource_profile(settings: Settings, profile: str, raw_argv: List[str
             max_cpu_percent=resources.max_cpu_percent,
             resource_check_interval_s=resources.resource_check_interval_s,
             max_workers=resources.max_workers,
+            memory_safety_margin_mb=getattr(resources, "memory_safety_margin_mb", 1024),
+            reserve_system_memory_mb=getattr(resources, "reserve_system_memory_mb", 1024),
         )
 
     return settings.with_overrides(
@@ -262,7 +268,7 @@ def _load_existing_run_to_neo4j(
         guard.checkpoint("load-run:start")
 
     if rematerialize_schema:
-        derived_summary = store.materialize_schema_derived_graph()
+        derived_summary = store.materialize_schema_derived_graph(guard=guard)
         if derived_summary.get("enabled"):
             log.info(
                 "Schema-derived graph checked/materialized: added_nodes=%d added_relationships=%d",
@@ -273,7 +279,7 @@ def _load_existing_run_to_neo4j(
             guard.checkpoint("load-run:derived-schema")
 
     if rematerialize_csv:
-        csv_summary = store.materialize_csv_mirrors()
+        csv_summary = store.materialize_csv_mirrors(guard=guard)
         if csv_summary.get("enabled"):
             log.info(
                 "Readable CSV/Neo4j/ML mirrors refreshed: node_labels=%d rel_types=%d ML_training_pairs=%d",
@@ -583,6 +589,10 @@ def _add_shared_args(parser: argparse.ArgumentParser, *, default_suppress: bool 
                         help="Seconds between resource checks. Default: 5.")
     parser.add_argument("--max-workers", type=int, default=default,
                         help="Maximum worker/thread hint for current/future optional layers. Default: 1.")
+    parser.add_argument("--memory-safety-margin-mb", type=int, default=default,
+                        help="Stop this many MB before --max-memory-mb to avoid temporary-allocation spikes. Default: 1024.")
+    parser.add_argument("--reserve-system-memory-mb", type=int, default=default,
+                        help="Stop if total available system memory drops below this reserve. Default: 1024.")
     parser.add_argument("--write-csv-mirrors", type=str, choices=["true", "false"], default=default,
                         help="Write thesis-friendly CSV mirrors alongside JSONL graph artifacts (default: true). Disable to reduce disk and I/O.")
     parser.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS if default_suppress else False, help="Plan + fetch (optional), but do not write to Neo4j.")
@@ -690,6 +700,8 @@ def main(argv: Optional[List[str]] = None) -> None:
             max_cpu_percent=settings.resources.max_cpu_percent,
             resource_check_interval_s=settings.resources.resource_check_interval_s,
             max_workers=settings.resources.max_workers,
+            memory_safety_margin_mb=getattr(settings.resources, "memory_safety_margin_mb", 1024),
+            reserve_system_memory_mb=getattr(settings.resources, "reserve_system_memory_mb", 1024),
         ))
     if _flag_present(raw_argv, "--max-http-cache-mb") or _flag_present(raw_argv, "--max-graph-artifact-mb"):
         settings = settings.with_overrides(resources=settings.resources.__class__(
@@ -701,9 +713,11 @@ def main(argv: Optional[List[str]] = None) -> None:
             max_cpu_percent=settings.resources.max_cpu_percent,
             resource_check_interval_s=settings.resources.resource_check_interval_s,
             max_workers=settings.resources.max_workers,
+            memory_safety_margin_mb=getattr(settings.resources, "memory_safety_margin_mb", 1024),
+            reserve_system_memory_mb=getattr(settings.resources, "reserve_system_memory_mb", 1024),
         ))
 
-    if any(_flag_present(raw_argv, f) for f in ["--max-memory-mb", "--max-cpu-percent", "--resource-check-interval", "--max-workers"]):
+    if any(_flag_present(raw_argv, f) for f in ["--max-memory-mb", "--max-cpu-percent", "--resource-check-interval", "--max-workers", "--memory-safety-margin-mb", "--reserve-system-memory-mb"]):
         settings = settings.with_overrides(resources=settings.resources.__class__(
             profile=settings.resources.profile,
             write_csv_mirrors=settings.resources.write_csv_mirrors,
@@ -713,6 +727,8 @@ def main(argv: Optional[List[str]] = None) -> None:
             max_cpu_percent=settings.resources.max_cpu_percent if getattr(args, "max_cpu_percent", None) is None else float(args.max_cpu_percent),
             resource_check_interval_s=settings.resources.resource_check_interval_s if getattr(args, "resource_check_interval", None) is None else float(args.resource_check_interval),
             max_workers=settings.resources.max_workers if getattr(args, "max_workers", None) is None else int(args.max_workers),
+            memory_safety_margin_mb=settings.resources.memory_safety_margin_mb if getattr(args, "memory_safety_margin_mb", None) is None else int(args.memory_safety_margin_mb),
+            reserve_system_memory_mb=settings.resources.reserve_system_memory_mb if getattr(args, "reserve_system_memory_mb", None) is None else int(args.reserve_system_memory_mb),
         ))
 
     load_neo4j = (args.load_neo4j == "true") and (not args.dry_run)
@@ -951,8 +967,11 @@ def main(argv: Optional[List[str]] = None) -> None:
         enrichment_overrides["drugbank_file"] = Path(args.drugbank_file)
     settings = settings.with_overrides(**enrichment_overrides)
 
+    guard = ResourceGuard.from_settings(settings)
+    log.info("Resource guard: %s", guard.describe())
+    guard.checkpoint("configured", force=True)
+
     if args.cmd == "load-run":
-        guard = ResourceGuard.from_settings(settings)
         _load_existing_run_to_neo4j(
             source_run_dir=Path(args.run_dir),
             store=store,
@@ -997,6 +1016,8 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "max_cpu_percent": settings.resources.max_cpu_percent,
                 "resource_check_interval_s": settings.resources.resource_check_interval_s,
                 "max_workers": settings.resources.max_workers,
+                "memory_safety_margin_mb": getattr(settings.resources, "memory_safety_margin_mb", 1024),
+                "reserve_system_memory_mb": getattr(settings.resources, "reserve_system_memory_mb", 1024),
                 "save_raw_http_cache": settings.save_raw_http_cache,
                 "save_extracted_artifacts": settings.save_extracted_artifacts,
                 "batch_size": settings.batch_size,
@@ -1021,10 +1042,10 @@ def main(argv: Optional[List[str]] = None) -> None:
             store.save_row(row.kind, row.data)
         store.save_nodes(nodes)
         store.save_relationships(rels)
-        derived_summary = store.materialize_schema_derived_graph()
+        derived_summary = store.materialize_schema_derived_graph(guard=guard)
         if derived_summary.get("enabled"):
             log.info("Schema-derived graph additions: nodes=%d rels=%d", derived_summary.get("added_nodes", 0), derived_summary.get("added_relationships", 0))
-        csv_summary = store.materialize_csv_mirrors()
+        csv_summary = store.materialize_csv_mirrors(guard=guard)
         if csv_summary.get("enabled"):
             log.info("Readable CSV/Neo4j/ML mirrors written under %s", store.graph_dir)
         if not load_neo4j:
@@ -1075,6 +1096,8 @@ def main(argv: Optional[List[str]] = None) -> None:
             "max_cpu_percent": settings.resources.max_cpu_percent,
             "resource_check_interval_s": settings.resources.resource_check_interval_s,
             "max_workers": settings.resources.max_workers,
+            "memory_safety_margin_mb": getattr(settings.resources, "memory_safety_margin_mb", 1024),
+            "reserve_system_memory_mb": getattr(settings.resources, "reserve_system_memory_mb", 1024),
             "save_raw_http_cache": settings.save_raw_http_cache,
             "save_extracted_artifacts": settings.save_extracted_artifacts,
             "batch_size": settings.batch_size,
@@ -1098,8 +1121,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     log.info("Run dir: %s", run_dir)
     log.info("Log file: %s", log_path)
 
-    guard = ResourceGuard.from_settings(settings)
-    guard.checkpoint("start")
+    guard.checkpoint("start", force=True)
 
     # Extraction (streamed)
     row_count = 0
@@ -1289,22 +1311,24 @@ def main(argv: Optional[List[str]] = None) -> None:
             rel_count += rel_count_plugin
             log.info("Plugin layer %s: rows=%d nodes=%d rels=%d", getattr(plugin, "name", "plugin"), r_count, n_count, rel_count_plugin)
             continue
-        for delta in plugin.run(settings):
+        for delta_idx, delta in enumerate(plugin.run(settings), start=1):
+            guard.checkpoint(f"plugin:{getattr(plugin, 'name', 'plugin')}:delta:{delta_idx}:before", force=True)
             plugin_node_count += len(delta.nodes)
             plugin_rel_count += len(delta.rels)
             node_count += len(delta.nodes)
             rel_count += len(delta.rels)
             store.save_nodes(delta.nodes)
             store.save_relationships(delta.rels)
+            guard.checkpoint(f"plugin:{getattr(plugin, 'name', 'plugin')}:delta:{delta_idx}:after", force=True)
 
     if settings.enabled_plugins:
         log.info("Plugin additions: rows=%d nodes=%d rels=%d", plugin_row_count, plugin_node_count, plugin_rel_count)
 
-    derived_summary = store.materialize_schema_derived_graph()
+    derived_summary = store.materialize_schema_derived_graph(guard=guard)
     if derived_summary.get("enabled"):
         log.info("Schema-derived graph additions: nodes=%d rels=%d", derived_summary.get("added_nodes", 0), derived_summary.get("added_relationships", 0))
 
-    csv_summary = store.materialize_csv_mirrors()
+    csv_summary = store.materialize_csv_mirrors(guard=guard)
     if csv_summary.get("enabled"):
         log.info(
             "Readable CSV mirrors written: rows=%d node_labels=%d rel_types=%d; ML pairs=%d",
@@ -1325,8 +1349,10 @@ def main(argv: Optional[List[str]] = None) -> None:
 
         # Stream nodes and relationships from disk to bound memory use.
         for node_file in sorted(store.nodes_dir.glob("*.jsonl")):
+            guard.checkpoint(f"neo4j:nodes:{node_file.stem}", force=True)
             loader.upsert_nodes_iter(_iter_jsonl(node_file))
         for rel_file in sorted(store.rels_dir.glob("*.jsonl")):
+            guard.checkpoint(f"neo4j:rels:{rel_file.stem}", force=True)
             loader.upsert_relationships_iter(_iter_jsonl(rel_file))
 
     log.info("✅ Loaded (streamed): rows=%d nodes=%d rels=%d (+plugins nodes=%d rels=%d).",

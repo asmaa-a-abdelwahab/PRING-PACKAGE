@@ -60,6 +60,12 @@ class ResourceProfile:
     max_cpu_percent: Optional[float] = None
     resource_check_interval_s: float = 5.0
     max_workers: int = 1
+    # Stop before the configured memory ceiling to leave room for the OS,
+    # Python temporary allocations, CSV buffering, and Windows filesystem caches.
+    memory_safety_margin_mb: int = 1024
+    # Also stop when total system memory gets too low, even if this Python
+    # process is still below its own RSS budget. This prevents laptop freezes.
+    reserve_system_memory_mb: int = 1024
 
 
 @dataclass(frozen=True)
@@ -233,6 +239,8 @@ class Settings:
             max_cpu_percent=_float_or_none(os.getenv("PRING_MAX_CPU_PERCENT"), None),
             resource_check_interval_s=float(os.getenv("PRING_RESOURCE_CHECK_INTERVAL_S", "5.0")),
             max_workers=int(os.getenv("PRING_MAX_WORKERS", "1")),
+            memory_safety_margin_mb=int(os.getenv("PRING_MEMORY_SAFETY_MARGIN_MB", "1024")),
+            reserve_system_memory_mb=int(os.getenv("PRING_RESERVE_SYSTEM_MEMORY_MB", "1024")),
         )
         textmining_file = os.getenv("PRING_TEXTMINING_FILE")
         bindingdb_file = os.getenv("PRING_BINDINGDB_FILE")

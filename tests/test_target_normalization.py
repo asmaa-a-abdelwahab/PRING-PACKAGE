@@ -53,3 +53,38 @@ def test_normalize_gene_node_by_ncbi_gene_id():
     normalized = normalize_node_record(old_gene)
     assert normalized["props"]["ncbi_gene_id"] == "1576"
     assert normalized["props"]["symbol"] == "CYP3A4"
+
+
+def test_classic_uniprot_accessions_parse_as_protein_targets_sparql_and_rdf_rest():
+    from pring.config import RdfRestConfig, SparqlConfig
+    from pring.extract.pubchem_rdf_rest import PubChemRdfRestClient, PubChemRdfRestExtractor
+    from pring.extract.pubchem_sparql_mirror import PubChemSparqlMirrorExtractor, SparqlMirrorClient
+
+    class DummyClient(SparqlMirrorClient):
+        def __init__(self):
+            self.cfg = SparqlConfig()
+        def select(self, *args, **kwargs):
+            return []
+
+    sparql = PubChemSparqlMirrorExtractor(DummyClient())
+    proteins, genes = sparql._parse_targets(["P05177", "P11712", "P33261", "P10635", "P08684", "Q96SQ9"])
+    assert proteins == [
+        "protein:ACCP05177",
+        "protein:ACCP11712",
+        "protein:ACCP33261",
+        "protein:ACCP10635",
+        "protein:ACCP08684",
+        "protein:ACCQ96SQ9",
+    ]
+    assert genes == []
+
+    rdf = PubChemRdfRestExtractor(PubChemRdfRestClient(RdfRestConfig()))
+    parsed = [rdf.parse_target_seed(x) for x in ["P05177", "P11712", "P33261", "P10635", "P08684", "Q96SQ9"]]
+    assert [p["kind"] for p in parsed] == ["protein"] * 6
+    assert parsed[0]["protein"] == "protein:ACCP05177"
+    rdf.close()
+
+
+def test_infer_cyp_symbol_for_cyp2s1():
+    assert infer_cyp_symbol("Q96SQ9") == "CYP2S1"
+    assert infer_cyp_symbol("gene:GID29785") == "CYP2S1"

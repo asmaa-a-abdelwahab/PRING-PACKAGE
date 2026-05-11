@@ -76,8 +76,8 @@ def test_sparql_seed_parsers_normalize_and_deduplicate_supported_inputs():
         "SYMBOL:CYP3A4",
         "BRCA1",
     ])
-    assert prots == ["protein:ACCQ9Y6K9", "protein:ACCP08684"]
-    assert genes == ["gene:P08684", "gene:GID1576", "gene:GID1017", "gene:CYP3A4", "gene:BRCA1"]
+    assert prots == ["protein:ACCP08684", "protein:ACCQ9Y6K9"]
+    assert genes == ["gene:GID1576", "gene:GID1017", "gene:CYP3A4", "gene:BRCA1"]
 
 
 @pytest.mark.parametrize(

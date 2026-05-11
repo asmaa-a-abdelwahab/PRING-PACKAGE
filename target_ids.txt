@@ -1,8 +1,8 @@
 ## Test1
 #GeneID:113612
 ## Test2
-UniProt:Q7Z449
-UniProt:Q96SQ9
+#UniProt:Q7Z449
+#UniProt:Q96SQ9
 ## Test3
 P05177
 P11712

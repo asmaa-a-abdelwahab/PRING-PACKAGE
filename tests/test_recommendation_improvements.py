@@ -58,3 +58,55 @@ def test_materialization_deduplicates_nodes_derives_has_source_and_endpoint_csv(
 
     training = (store.ml_dir / "compound_target_training_pairs.csv").read_text(encoding="utf-8-sig")
     assert "compound_similarity_component_holdout" in training
+
+
+def test_ml_export_filters_dangling_similarity_and_exports_curated_negative(tmp_path):
+    import csv
+
+    store = RunStore(tmp_path / "run2", save_raw=False, save_extracted=True, save_csv_mirrors=True)
+    store.save_node({"label": "Compound", "key": {"cid": 1}, "props": {"cid": 1, "preferred_name": "C1"}})
+    store.save_node({"label": "Compound", "key": {"cid": 2}, "props": {"cid": 2, "preferred_name": "C2"}})
+    store.save_node({"label": "Substance", "key": {"sid": 11}, "props": {"sid": 11}})
+    store.save_node({"label": "Substance", "key": {"sid": 22}, "props": {"sid": 22}})
+    store.save_node({"label": "MeasureGrp", "key": {"mg_id": "MG1"}, "props": {"mg_id": "MG1"}})
+    store.save_node({"label": "MeasureGrp", "key": {"mg_id": "MG2"}, "props": {"mg_id": "MG2"}})
+    store.save_node({"label": "Protein", "key": {"protein_id": "P08684"}, "props": {"protein_id": "P08684", "name": "Cytochrome P450 3A4"}})
+    store.save_node({"label": "Protein", "key": {"protein_id": "P10635"}, "props": {"protein_id": "P10635", "name": "Cytochrome P450 2D6"}})
+    store.save_node({"label": "Endpoint", "key": {"endpoint_id": "E_active"}, "props": {"endpoint_id": "E_active", "value": "1", "unit": "uM", "outcome_label": "IC50"}})
+    store.save_node({"label": "Endpoint", "key": {"endpoint_id": "E_inactive"}, "props": {"endpoint_id": "E_inactive", "outcome_label": "inactive"}})
+
+    def rel(t, sl, sk, el, ek, props=None):
+        store.save_relationship({"schema_label": t, "type": t, "start": {"label": sl, "key": sk}, "end": {"label": el, "key": ek}, "props": props or {}})
+
+    rel("SIMILAR_TO", "Compound", {"cid": 1}, "Compound", {"cid": 2}, {"score": 0.95})
+    rel("SIMILAR_TO", "Compound", {"cid": 1}, "Compound", {"cid": 999}, {"score": 0.90})
+    rel("STANDARDIZED_TO", "Substance", {"sid": 11}, "Compound", {"cid": 1})
+    rel("STANDARDIZED_TO", "Substance", {"sid": 22}, "Compound", {"cid": 2})
+    rel("ABOUT_SUBSTANCE", "Endpoint", {"endpoint_id": "E_active"}, "Substance", {"sid": 11})
+    rel("ABOUT_SUBSTANCE", "Endpoint", {"endpoint_id": "E_inactive"}, "Substance", {"sid": 22})
+    rel("HAS_ENDPOINT", "MeasureGrp", {"mg_id": "MG1"}, "Endpoint", {"endpoint_id": "E_active"})
+    rel("HAS_ENDPOINT", "MeasureGrp", {"mg_id": "MG2"}, "Endpoint", {"endpoint_id": "E_inactive"})
+    rel("TESTED_ON", "MeasureGrp", {"mg_id": "MG1"}, "Protein", {"protein_id": "P08684"})
+    rel("TESTED_ON", "MeasureGrp", {"mg_id": "MG2"}, "Protein", {"protein_id": "P08684"})
+
+    summary = store.materialize_csv_mirrors()
+    assert summary["ml"]["skipped_relationships_missing_nodes"].get("SIMILAR_TO") == 1
+
+    with (store.ml_dir / "edge_index.csv").open(encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert all(r["source_node_id"] and r["target_node_id"] for r in rows)
+    assert not any("cid=999" in r["end_node_ref"] for r in rows)
+
+    with (store.ml_dir / "positive_compound_target_pairs.csv").open(encoding="utf-8-sig", newline="") as f:
+        pos = list(csv.DictReader(f))
+    with (store.ml_dir / "negative_compound_target_pairs.csv").open(encoding="utf-8-sig", newline="") as f:
+        neg = list(csv.DictReader(f))
+    with (store.ml_dir / "candidate_missing_compound_target_pairs.csv").open(encoding="utf-8-sig", newline="") as f:
+        cand = list(csv.DictReader(f))
+
+    assert len(pos) == 1
+    assert pos[0]["label"] == "1"
+    assert len(neg) == 1
+    assert neg[0]["label"] == "0"
+    assert neg[0]["negative_source"] == "curated inactive endpoint evidence"
+    assert len(cand) == 2

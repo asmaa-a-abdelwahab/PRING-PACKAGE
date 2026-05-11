@@ -7,6 +7,7 @@ import random
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Iterator
+import gc
 
 from pring.transform.target_normalization import normalize_node_record
 from pring.transform.endpoint_normalization import normalize_endpoint_node_record
@@ -25,6 +26,10 @@ ML_PAIR_COLUMNS = [
     "evidence_measuregroups",
     "evidence_endpoints",
     "evidence_count",
+    "positive_endpoint_count",
+    "negative_endpoint_count",
+    "ambiguous_endpoint_count",
+    "label_rule",
 ]
 
 ML_CANDIDATE_COLUMNS = [
@@ -50,7 +55,13 @@ ML_NEGATIVE_COLUMNS = [
     "split_group",
     "split_strategy",
     "negative_source",
+    "evidence_measuregroups",
+    "evidence_endpoints",
     "evidence_count",
+    "positive_endpoint_count",
+    "negative_endpoint_count",
+    "ambiguous_endpoint_count",
+    "label_rule",
 ]
 
 
@@ -199,7 +210,7 @@ class RunStore:
         self._ensure_graph_budget(self._estimate_jsonl_size(r), f"relationship:{schema_label}")
         self.append_jsonl(self.rels_dir / f"{safe}.jsonl", r)
 
-    def materialize_schema_derived_graph(self, *, generate_interactions: bool = True) -> Dict[str, Any]:
+    def materialize_schema_derived_graph(self, *, generate_interactions: bool = True, guard: Optional[Any] = None) -> Dict[str, Any]:
         """Add schema-required derived relationships without changing extraction.
 
         This reads the canonical graph JSONL already produced by the extractors,
@@ -209,6 +220,8 @@ class RunStore:
         """
         if not self.save_extracted:
             return {"enabled": False}
+        if guard is not None:
+            guard.checkpoint("derived-schema:start", force=True)
 
         existing_rel_keys: set[tuple[str, str, str, str]] = set()
         mg_to_aids: dict[str, set[str]] = {}
@@ -230,7 +243,9 @@ class RunStore:
         default_taxids = _default_taxids_from_manifest(self.run_dir)
 
         for path in sorted(self.nodes_dir.glob("*.jsonl")):
-            for rec in _read_jsonl(path):
+            for idx, rec in enumerate(_read_jsonl(path), start=1):
+                if guard is not None and idx % 100 == 0:
+                    guard.checkpoint(f"derived-schema:scan-nodes:{path.stem}:{idx}", force=True)
                 rec = normalize_metadata_node_record(normalize_endpoint_node_record(normalize_node_record(rec)))
                 label = rec.get("label") or path.stem
                 ref = _node_ref(label, rec.get("key") or {})
@@ -269,7 +284,9 @@ class RunStore:
                         }
 
         for path in sorted(self.rels_dir.glob("*.jsonl")):
-            for rec in _read_jsonl(path):
+            for idx, rec in enumerate(_read_jsonl(path), start=1):
+                if guard is not None and idx % 100 == 0:
+                    guard.checkpoint(f"derived-schema:scan-rels:{path.stem}:{idx}", force=True)
                 schema_label = str(rec.get("schema_label") or rec.get("type") or path.stem)
                 start = rec.get("start") or {}
                 end = rec.get("end") or {}
@@ -319,6 +336,8 @@ class RunStore:
             })
             existing_rel_keys.add(key)
             added_rels += 1
+            if guard is not None and added_rels % 100 == 0:
+                guard.checkpoint(f"derived-schema:add-rel:{schema_label}:{added_rels}", force=True)
             return True
 
         # BioAssay -> Reference is implied by BioAssay -> MeasureGrp -> Endpoint -> Reference.
@@ -333,7 +352,9 @@ class RunStore:
         # RDKit/fingerprint exporters later without changing the schema.
         existing_node_props_by_ref: dict[str, dict[str, Any]] = {}
         for path in sorted(self.nodes_dir.glob("*.jsonl")):
-            for rec in _read_jsonl(path):
+            for idx, rec in enumerate(_read_jsonl(path), start=1):
+                if guard is not None and idx % 100 == 0:
+                    guard.checkpoint(f"derived-schema:node-props:{path.stem}:{idx}", force=True)
                 rec = normalize_metadata_node_record(normalize_endpoint_node_record(normalize_node_record(rec)))
                 ref = _node_ref((rec.get("label") or path.stem), rec.get("key") or {})
                 props = dict(rec.get("props") or {})
@@ -458,15 +479,30 @@ class RunStore:
             for (compound_ref, protein_ref), support in sorted(interaction_support.items()):
                 interaction_id = _stable_id(f"{compound_ref}|{protein_ref}", prefix="interaction")
                 interaction_ref = _node_ref("Interaction", {"interaction_id": interaction_id})
+                endpoint_labels = [
+                    _endpoint_supervision_label(existing_node_props_by_ref.get(endpoint_ref, {}))
+                    for endpoint_ref in sorted(support["endpoints"])
+                ]
+                positive_endpoint_count = sum(1 for label in endpoint_labels if label == 1)
+                negative_endpoint_count = sum(1 for label in endpoint_labels if label == 0)
+                ambiguous_endpoint_count = max(0, len(endpoint_labels) - positive_endpoint_count - negative_endpoint_count)
+                assertion_label, assertion_confidence = _interaction_assertion_label(
+                    positive_endpoint_count,
+                    negative_endpoint_count,
+                    ambiguous_endpoint_count,
+                )
                 interaction_props = {
                     "interaction_id": interaction_id,
-                    "label": "curated_positive",
-                    "confidence": 1.0,
+                    "label": assertion_label,
+                    "confidence": assertion_confidence,
                     "evidence_count": len(support["endpoints"]),
+                    "positive_endpoint_count": positive_endpoint_count,
+                    "negative_endpoint_count": negative_endpoint_count,
+                    "ambiguous_endpoint_count": ambiguous_endpoint_count,
                     "measuregroup_count": len(support["measuregroups"]),
                     "assay_count": len(support["assays"]),
                     "reference_count": len(support["references"]),
-                    "aggregation_rule": "PubChem evidence path: Compound<-Substance<-Endpoint<-MeasureGrp->Protein",
+                    "aggregation_rule": "PubChem evidence path: Compound<-Substance<-Endpoint<-MeasureGrp->Protein; label inferred from normalized endpoint outcome/type",
                     "created_by": "PRING",
                 }
                 existing_props = existing_node_props_by_ref.get(interaction_ref, {})
@@ -491,6 +527,9 @@ class RunStore:
                 for organism_ref in sorted(support["organisms"]):
                     add_rel("SCOPED_TO_ORGANISM", interaction_ref, organism_ref)
 
+        if guard is not None:
+            guard.checkpoint("derived-schema:done", force=True)
+
         return {
             "enabled": True,
             "added_nodes": added_nodes,
@@ -503,7 +542,7 @@ class RunStore:
             "inferred_mg_organism_links": locals().get("inferred_mg_organism_links", 0),
         }
 
-    def materialize_csv_mirrors(self) -> Dict[str, Any]:
+    def materialize_csv_mirrors(self, *, guard: Optional[Any] = None) -> Dict[str, Any]:
         """Create readable CSV mirrors, Neo4j import CSVs, and ML/GCN tables.
 
         The canonical JSONL artifacts remain complete and lossless. CSV mirrors
@@ -512,6 +551,8 @@ class RunStore:
         """
         if not (self.save_extracted and self.save_csv_mirrors):
             return {"enabled": False}
+        if guard is not None:
+            guard.checkpoint("csv-ml:start", force=True)
 
         for d in [self.rows_csv_dir, self.nodes_csv_dir, self.rels_csv_dir, self.neo4j_csv_dir / "nodes", self.neo4j_csv_dir / "relationships", self.ml_dir]:
             _clear_dir(d)
@@ -521,7 +562,9 @@ class RunStore:
 
         for path in sorted(self.rows_dir.glob("*.jsonl")):
             rows: list[dict[str, Any]] = []
-            for rec in _read_jsonl(path):
+            for idx, rec in enumerate(_read_jsonl(path), start=1):
+                if guard is not None and idx % 100 == 0:
+                    guard.checkpoint(f"csv-rows:{path.stem}:{idx}", force=True)
                 kind = _stringify_cell(rec.get("kind") or path.stem)
                 flat = {"kind": kind}
                 flat.update(_flatten(rec.get("data") or {}))
@@ -529,8 +572,11 @@ class RunStore:
             out = self.rows_csv_dir / f"{path.stem}.csv"
             _write_rows_csv(out, rows)
             summary["rows"][path.stem] = {"records": len(rows), "columns": _columns(rows)}
+            del rows
+            gc.collect()
+            if guard is not None:
+                guard.checkpoint(f"csv-rows:{path.stem}:written", force=True)
 
-        all_nodes: list[dict[str, Any]] = []
         node_id_by_ref: dict[str, int] = {}
         node_ref_by_key: dict[str, str] = {}
         node_records_by_ref: dict[str, dict[str, str]] = {}
@@ -541,7 +587,9 @@ class RunStore:
             # safe for direct import and easier to inspect. Later records merge
             # non-empty properties into earlier records for the same node_ref.
             merged_by_ref: dict[str, dict[str, Any]] = {}
-            for rec in _read_jsonl(path):
+            for idx, rec in enumerate(_read_jsonl(path), start=1):
+                if guard is not None and idx % 100 == 0:
+                    guard.checkpoint(f"csv-nodes:merge:{path.stem}:{idx}", force=True)
                 rec = normalize_metadata_node_record(normalize_endpoint_node_record(normalize_node_record(rec)))
                 label = _stringify_cell(rec.get("label") or path.stem)
                 key = rec.get("key") or {}
@@ -555,7 +603,9 @@ class RunStore:
 
             label_rows: list[dict[str, Any]] = []
             neo_rows: list[dict[str, Any]] = []
-            for ref, merged in sorted(merged_by_ref.items()):
+            for idx, (ref, merged) in enumerate(sorted(merged_by_ref.items()), start=1):
+                if guard is not None and idx % 100 == 0:
+                    guard.checkpoint(f"csv-nodes:{path.stem}:{idx}", force=True)
                 label = _stringify_cell(merged.get("label") or path.stem)
                 key = merged.get("key") or {}
                 props = merged.get("props") or {}
@@ -575,16 +625,20 @@ class RunStore:
 
                 node_ref_by_key[ref] = label
                 node_records_by_ref[ref] = dict(flat)
-                all_nodes.append({"node_id": node_id_by_ref[ref], "node_ref": ref, "label": label, **flat})
 
             out = self.nodes_csv_dir / f"{path.stem}.csv"
             _write_rows_csv(out, label_rows)
             neo_out = self.neo4j_csv_dir / "nodes" / f"{path.stem}.csv"
             _write_rows_csv(neo_out, neo_rows)
             summary["nodes"][path.stem] = {"records": len(label_rows), "columns": _columns(label_rows), "deduplicated": True}
+            del label_rows, neo_rows, merged_by_ref
+            gc.collect()
+            if guard is not None:
+                guard.checkpoint(f"csv-nodes:{path.stem}:written", force=True)
 
         edge_rows: list[dict[str, Any]] = []
-        positive_pairs: dict[tuple[str, str], dict[str, Any]] = {}
+        evidence_pairs: dict[tuple[str, str], dict[str, Any]] = {}
+        skipped_relationships_missing_nodes: dict[str, int] = {}
         endpoint_to_substance: dict[str, str] = {}
         substance_to_compound: dict[str, str] = {}
         mg_to_endpoints: dict[str, set[str]] = {}
@@ -595,7 +649,9 @@ class RunStore:
         for path in sorted(self.rels_dir.glob("*.jsonl")):
             rel_rows: list[dict[str, Any]] = []
             neo_rows: list[dict[str, Any]] = []
-            for rec in _read_jsonl(path):
+            for idx, rec in enumerate(_read_jsonl(path), start=1):
+                if guard is not None and idx % 100 == 0:
+                    guard.checkpoint(f"csv-rels:{path.stem}:{idx}", force=True)
                 rel_type = _stringify_cell(rec.get("type") or rec.get("schema_label") or path.stem)
                 schema_label = _stringify_cell(rec.get("schema_label") or rel_type)
                 start = rec.get("start") or {}
@@ -607,6 +663,9 @@ class RunStore:
                 if edge_sig in seen_edge_keys:
                     continue
                 seen_edge_keys.add(edge_sig)
+                if start_ref not in node_id_by_ref or end_ref not in node_id_by_ref:
+                    skipped_relationships_missing_nodes[schema_label] = skipped_relationships_missing_nodes.get(schema_label, 0) + 1
+                    continue
                 flat = {
                     "edge_id": len(edge_rows),
                     "schema_label": schema_label,
@@ -651,26 +710,41 @@ class RunStore:
             neo_out = self.neo4j_csv_dir / "relationships" / f"{path.stem}.csv"
             _write_rows_csv(neo_out, neo_rows)
             summary["relationships"][path.stem] = {"records": len(rel_rows), "columns": _columns(rel_rows)}
+            del rel_rows, neo_rows
+            gc.collect()
+            if guard is not None:
+                guard.checkpoint(f"csv-rels:{path.stem}:written", force=True)
 
-        for mg_ref, endpoint_refs in mg_to_endpoints.items():
+        for mg_idx, (mg_ref, endpoint_refs) in enumerate(mg_to_endpoints.items(), start=1):
+            if guard is not None and mg_idx % 100 == 0:
+                guard.checkpoint(f"ml:evidence-pairs:{mg_idx}", force=True)
             for endpoint_ref in endpoint_refs:
                 substance_ref = endpoint_to_substance.get(endpoint_ref)
                 compound_ref = substance_to_compound.get(substance_ref or "")
                 if not compound_ref:
                     continue
+                endpoint_label = _endpoint_supervision_label(node_records_by_ref.get(endpoint_ref, {}))
                 for protein_ref in mg_to_proteins.get(mg_ref, set()):
                     key = (compound_ref, protein_ref)
-                    rec = positive_pairs.setdefault(key, {
+                    rec = evidence_pairs.setdefault(key, {
                         "compound_node_ref": compound_ref,
                         "protein_node_ref": protein_ref,
                         "compound_node_id": node_id_by_ref.get(compound_ref, ""),
                         "protein_node_id": node_id_by_ref.get(protein_ref, ""),
-                        "label": 1,
                         "evidence_measuregroups": set(),
                         "evidence_endpoints": set(),
+                        "positive_endpoints": set(),
+                        "negative_endpoints": set(),
+                        "ambiguous_endpoints": set(),
                     })
                     rec["evidence_measuregroups"].add(mg_ref)
                     rec["evidence_endpoints"].add(endpoint_ref)
+                    if endpoint_label == 1:
+                        rec["positive_endpoints"].add(endpoint_ref)
+                    elif endpoint_label == 0:
+                        rec["negative_endpoints"].add(endpoint_ref)
+                    else:
+                        rec["ambiguous_endpoints"].add(endpoint_ref)
 
         node_mapping_rows = [
             {"node_id": node_id, "node_ref": ref, "label": node_ref_by_key.get(ref, "")}
@@ -695,38 +769,75 @@ class RunStore:
             similarity_components.find(compound_ref)
 
         pair_rows = []
+        negative_rows: list[dict[str, Any]] = []
+        observed_pair_keys: set[tuple[str, str]] = set()
         positive_pair_keys: set[tuple[str, str]] = set()
-        for (_, _), rec in sorted(positive_pairs.items()):
-            positive_pair_keys.add((rec["compound_node_ref"], rec["protein_node_ref"]))
+        negative_pair_keys: set[tuple[str, str]] = set()
+        ambiguous_pair_keys: set[tuple[str, str]] = set()
+        for pair_idx, ((_, _), rec) in enumerate(sorted(evidence_pairs.items()), start=1):
+            if guard is not None and pair_idx % 100 == 0:
+                guard.checkpoint(f"ml:label-pairs:{pair_idx}", force=True)
+            pair_key = (rec["compound_node_ref"], rec["protein_node_ref"])
+            observed_pair_keys.add(pair_key)
+            pos_n = len(rec.get("positive_endpoints", set()))
+            neg_n = len(rec.get("negative_endpoints", set()))
+            amb_n = len(rec.get("ambiguous_endpoints", set()))
             split_group = similarity_components.find(rec["compound_node_ref"])
             split = _deterministic_split(split_group)
-            pair_rows.append({
+            base_row = {
                 "compound_node_id": rec["compound_node_id"],
                 "protein_node_id": rec["protein_node_id"],
                 "compound_node_ref": rec["compound_node_ref"],
                 "protein_node_ref": rec["protein_node_ref"],
-                "label": 1,
                 "split": split,
                 "split_group": split_group,
                 "split_strategy": "compound_similarity_component_holdout",
                 "evidence_measuregroups": " | ".join(sorted(rec["evidence_measuregroups"])),
                 "evidence_endpoints": " | ".join(sorted(rec["evidence_endpoints"])),
                 "evidence_count": len(rec["evidence_endpoints"]),
-            })
+                "positive_endpoint_count": pos_n,
+                "negative_endpoint_count": neg_n,
+                "ambiguous_endpoint_count": amb_n,
+            }
+            if pos_n > 0 and neg_n == 0:
+                positive_pair_keys.add(pair_key)
+                pair_rows.append({**base_row, "label": 1, "label_rule": "positive endpoint evidence only"})
+            elif neg_n > 0 and pos_n == 0:
+                negative_pair_keys.add(pair_key)
+                negative_rows.append({
+                    **base_row,
+                    "label": 0,
+                    "negative_source": "curated inactive endpoint evidence",
+                    "label_rule": "negative endpoint evidence only",
+                })
+            elif pos_n > 0 and neg_n > 0:
+                ambiguous_pair_keys.add(pair_key)
+                # Conflicting curated evidence is deliberately excluded from the
+                # supervised training files. It remains represented in the KG
+                # via Endpoint and Interaction evidence for downstream review.
+                continue
+            else:
+                ambiguous_pair_keys.add(pair_key)
+                continue
 
         # For CYP450 link prediction, absence of a curated PubChem evidence path
         # does NOT mean a true negative interaction. Keep unobserved compound-target
         # pairs as prediction candidates/unknown labels. Downstream supervised GCN
         # training can add its own experimentally confirmed negatives if available.
-        unknown_candidates = [
-            (c, p) for c in compound_refs for p in protein_refs
-            if (c, p) not in positive_pair_keys
-        ]
+        unknown_candidates = []
+        for c_idx, c in enumerate(compound_refs, start=1):
+            if guard is not None and c_idx % 100 == 0:
+                guard.checkpoint(f"ml:unknown-candidates:{c_idx}", force=True)
+            for p in protein_refs:
+                if (c, p) not in observed_pair_keys:
+                    unknown_candidates.append((c, p))
         rng = random.Random(13)
         rng.shuffle(unknown_candidates)
         candidate_limit = min(len(unknown_candidates), max(1000, len(pair_rows) * 10 if pair_rows else 1000))
         candidate_rows = []
-        for compound_ref, protein_ref in unknown_candidates[:candidate_limit]:
+        for cand_idx, (compound_ref, protein_ref) in enumerate(unknown_candidates[:candidate_limit], start=1):
+            if guard is not None and cand_idx % 100 == 0:
+                guard.checkpoint(f"ml:candidate-rows:{cand_idx}", force=True)
             split_group = similarity_components.find(compound_ref)
             split = _deterministic_split(split_group)
             candidate_rows.append({
@@ -741,13 +852,20 @@ class RunStore:
                 "candidate_sampling_method": "unobserved_within_extracted_scope",
                 "evidence_count": 0,
             })
-        negative_rows: list[dict[str, Any]] = []
-        training_pair_rows = pair_rows
-        link_prediction_pair_rows = pair_rows + candidate_rows
+        training_pair_rows = pair_rows + negative_rows
+        link_prediction_pair_rows = training_pair_rows + candidate_rows
 
+        if guard is not None:
+            guard.checkpoint("ml:features:before", force=True)
         compound_feature_rows = _build_compound_feature_rows(node_records_by_ref, node_id_by_ref)
+        if guard is not None:
+            guard.checkpoint("ml:features:compound", force=True)
         protein_feature_rows = _build_protein_feature_rows(node_records_by_ref, node_id_by_ref)
+        if guard is not None:
+            guard.checkpoint("ml:features:protein", force=True)
         endpoint_feature_rows = _build_endpoint_feature_rows(node_records_by_ref, node_id_by_ref)
+        if guard is not None:
+            guard.checkpoint("ml:features:endpoint", force=True)
 
         _write_rows_csv(self.ml_dir / "node_mapping.csv", node_mapping_rows)
         _write_rows_csv(self.ml_dir / "relation_mapping.csv", relation_mapping_rows)
@@ -759,7 +877,7 @@ class RunStore:
         _write_rows_csv(self.ml_dir / "negative_compound_target_pairs.csv", negative_rows, columns=ML_NEGATIVE_COLUMNS)
         _write_rows_csv(self.ml_dir / "candidate_missing_compound_target_pairs.csv", candidate_rows, columns=ML_CANDIDATE_COLUMNS)
         _write_rows_csv(self.ml_dir / "compound_target_training_pairs.csv", training_pair_rows, columns=ML_PAIR_COLUMNS)
-        _write_rows_csv(self.ml_dir / "compound_target_link_prediction_pairs.csv", link_prediction_pair_rows, columns=_columns(pair_rows + candidate_rows) or list(dict.fromkeys(ML_PAIR_COLUMNS + ML_CANDIDATE_COLUMNS)))
+        _write_rows_csv(self.ml_dir / "compound_target_link_prediction_pairs.csv", link_prediction_pair_rows, columns=_columns(link_prediction_pair_rows) or list(dict.fromkeys(ML_PAIR_COLUMNS + ML_NEGATIVE_COLUMNS + ML_CANDIDATE_COLUMNS)))
 
         summary["ml"] = {
             "node_mapping_records": len(node_mapping_rows),
@@ -771,13 +889,18 @@ class RunStore:
             "positive_compound_target_pairs": len(pair_rows),
             "negative_compound_target_pairs": len(negative_rows),
             "candidate_missing_compound_target_pairs": len(candidate_rows),
+            "ambiguous_or_unlabeled_observed_pairs": len(ambiguous_pair_keys),
+            "observed_compound_target_pairs": len(observed_pair_keys),
             "training_pair_records": len(training_pair_rows),
             "link_prediction_pair_records": len(link_prediction_pair_rows),
+            "skipped_relationships_missing_nodes": skipped_relationships_missing_nodes,
             "split_strategy": "compound_similarity_component_holdout",
-            "label_semantics": "unobserved compound-target pairs are exported as unknown candidates, not true negatives",
+            "label_semantics": "supervised labels use normalized endpoint evidence; unobserved compound-target pairs are exported as unknown candidates, not true negatives",
         }
         summary_path = self.graph_dir / "csv_export_summary.json"
         summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+        if guard is not None:
+            guard.checkpoint("csv-ml:done", force=True)
         return summary
 
     def clear_extracted_artifacts(self) -> None:
@@ -1005,6 +1128,66 @@ def _sanitize_filename(s: str) -> str:
     s = s.replace('"', "-").replace("<", "-").replace(">", "-").replace("|", "-")
     return "_".join(s.split())[:120]
 
+
+
+
+def _endpoint_supervision_label(endpoint_record: dict[str, Any]) -> Optional[int]:
+    """Infer a conservative supervised label from a flattened Endpoint CSV record.
+
+    Returns 1 for curated active/quantitative potency evidence, 0 for curated
+    inactive evidence, and None for ambiguous, unspecified, or unsupported
+    endpoints. This prevents every evidence path from becoming a positive label.
+    """
+    if not endpoint_record:
+        return None
+    values = [
+        endpoint_record.get("props_activity_flag"),
+        endpoint_record.get("props_outcome_label_normalized"),
+        endpoint_record.get("props_outcome_label"),
+        endpoint_record.get("props_outcome_raw"),
+        endpoint_record.get("props_label"),
+    ]
+    normalized_values = {_norm_label(v) for v in values if _norm_label(v)}
+    if normalized_values & {"inactive", "negative", "no_activity", "no_activity"}:
+        return 0
+    if normalized_values & {"inconclusive", "indeterminate", "ambiguous", "unspecified"}:
+        return None
+    if normalized_values & {"active", "hit", "positive"}:
+        return 1
+
+    endpoint_type = _norm_label(endpoint_record.get("props_endpoint_type") or endpoint_record.get("props_type"))
+    outcome_type = _norm_label(endpoint_record.get("props_outcome_label") or endpoint_record.get("props_label"))
+    has_numeric = _truthy(endpoint_record.get("props_has_numeric_value")) or bool(endpoint_record.get("props_value_float"))
+    potency_types = {"ic50", "ec50", "ac50", "ki", "kd", "km", "inh", "potency", "activity"}
+    if has_numeric and ((endpoint_type in potency_types) or (outcome_type in potency_types)):
+        return 1
+    return None
+
+
+def _interaction_assertion_label(positive_count: int, negative_count: int, ambiguous_count: int) -> tuple[str, float]:
+    total = max(1, positive_count + negative_count + ambiguous_count)
+    if positive_count > 0 and negative_count == 0:
+        return "curated_active", positive_count / total
+    if negative_count > 0 and positive_count == 0:
+        return "curated_inactive", negative_count / total
+    if positive_count > 0 and negative_count > 0:
+        return "curated_conflicting", max(positive_count, negative_count) / total
+    return "curated_unlabeled", ambiguous_count / total
+
+
+def _norm_label(value: Any) -> str:
+    text = _stringify_cell(value).strip().lower()
+    if not text:
+        return ""
+    text = text.rsplit("#", 1)[-1].rsplit("/", 1)[-1]
+    return text.replace("-", "_").replace(" ", "_")
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = _stringify_cell(value).strip().lower()
+    return text in {"1", "true", "yes", "y"}
 
 def _deterministic_split(seed: str) -> str:
     bucket = int(hashlib.sha1(str(seed).encode("utf-8")).hexdigest()[:8], 16) % 10

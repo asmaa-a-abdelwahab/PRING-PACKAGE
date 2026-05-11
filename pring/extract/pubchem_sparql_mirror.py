@@ -208,7 +208,7 @@ class PubChemSparqlMirrorExtractor:
                 acc = s.split(":", 1)[1].strip()
                 prots.append(f"protein:ACC{acc}")
                 continue
-            if re.fullmatch(r"[A-NR-Z][0-9][A-Z0-9]{3}[0-9](?:-\d+)?", s):
+            if re.fullmatch(r"(?:[A-NR-Z][0-9][A-Z0-9]{3}[0-9]|[OPQ][0-9][A-Z0-9]{3}[0-9])(?:-\d+)?", s, flags=re.IGNORECASE):
                 prots.append(f"protein:ACC{s}")
                 continue
             if u.startswith("GENEID:"):
