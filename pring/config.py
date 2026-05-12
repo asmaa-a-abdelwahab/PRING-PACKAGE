@@ -156,7 +156,8 @@ class Settings:
     save_extracted_artifacts: bool = True
     resources: ResourceProfile = field(default_factory=ResourceProfile)
     textmining_file: Optional[Path] = None
-    textmining_source: str = "auto"  # auto | pubchem | file
+    textmining_source: str = "auto"  # auto | pubchem | pubmed | file
+    textmining_pubmed_fallback: bool = True
     compound_similarity_method: str = "2d"
     compound_similarity_threshold: int = 90
     # Optional supervised-label controls for CYP450 GCN exports.
@@ -164,6 +165,8 @@ class Settings:
     # values above the threshold can be handled as weak/negative if requested.
     activity_threshold_um: Optional[float] = None
     weak_activity_as_negative: bool = False
+    max_candidate_missing_pairs: Optional[int] = None
+    candidate_pair_mode: str = "sampled"  # sampled | all
     enrichment_timeout_s: float = 45.0
     enrichment_max_retries: int = 1
     enrichment_min_delay_s: float = 0.25

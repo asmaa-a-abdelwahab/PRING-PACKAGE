@@ -406,28 +406,12 @@ def _alphafold_rows(client: HttpClient, protein_id: str, acc: str, *, max_record
             }
         return
 
-    # Conservative fallback: create a marked, unverified node so the schema layer
-    # is still materialized when the public API is unreachable from the Python
-    # runtime. Downstream code can filter model_status=url_pattern_unverified.
-    if max_records is not None and max_records <= 0:
-        return
-    model_id = f"AF-{acc}-F1"
-    log.warning("AlphaFold API returned no usable record for %s; writing unverified fallback model links.", acc)
-    yield {
-        "protein_id": protein_id,
-        "uniprot_acc": acc,
-        "alphafold_id": model_id,
-        "model_version": None,
-        "confidence_summary": None,
-        "average_plddt": None,
-        "pdb_url": None,
-        "cif_url": None,
-        "pae_url": None,
-        "storage_uri": None,
-        "source_url": f"https://alphafold.ebi.ac.uk/entry/{model_id}",
-        "model_status": "url_pattern_unverified",
-        "source": "AlphaFold API fallback placeholder",
-    }
+    # Do not create URL-pattern placeholders. For GCN/Neo4j QA, an AlphaFold
+    # node should mean that the AlphaFold API returned a real model record. If
+    # the API is unreachable or the accession has no model, leave the layer empty
+    # and let graph/run_quality_report.json show it as missing.
+    log.warning("AlphaFold API returned no usable confirmed model for %s; no AlphaFold node was written.", acc)
+    return
 
 def _protein_embedding_row(protein_id: str, acc: str, rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     seq = ((rec.get("sequence") or {}).get("value") or "").upper()

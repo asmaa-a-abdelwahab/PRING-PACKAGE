@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import shutil
 import sys
 from datetime import datetime
@@ -17,10 +18,11 @@ from pring.extract.pubchem_core import PubChemRow, iter_graph_records, to_graph_
 from pring.neo4j.driver import Neo4jDriver
 from pring.neo4j.loader import Neo4jLoader
 from pring.plugins import load_plugins, normalize_plugin_list
-from pring.extract.textmining_import import iter_textmining_csv_rows, iter_pubchem_textmining_sparql_rows
+from pring.extract.textmining_import import iter_textmining_csv_rows, iter_pubchem_textmining_sparql_rows, iter_pubmed_textmining_rows
 from pring.enrich.compound_similarity import iter_compound_similarity_rows
 from pring.utils import setup_logging, RunStore
 from pring.utils.resource_control import ResourceGuard, ResourceLimitExceeded
+from pring.io.http import HttpClient
 
 log = logging.getLogger("pring")
 
@@ -218,6 +220,13 @@ def _iter_jsonl(path: Path) -> Iterator[dict]:
             if not line:
                 continue
             yield json.loads(line)
+
+
+def _count_jsonl_records(path: Path) -> int:
+    if not path.exists():
+        return 0
+    with path.open("r", encoding="utf-8") as f:
+        return sum(1 for line in f if line.strip())
 
 
 def _count_jsonl_files(folder: Path) -> int:
@@ -436,7 +445,7 @@ def _load_existing_run_to_neo4j(
             guard.checkpoint("load-run:derived-schema")
 
     if rematerialize_csv:
-        csv_summary = store.materialize_csv_mirrors(guard=guard, activity_threshold_um=settings.activity_threshold_um, weak_activity_as_negative=settings.weak_activity_as_negative)
+        csv_summary = store.materialize_csv_mirrors(guard=guard, activity_threshold_um=settings.activity_threshold_um, weak_activity_as_negative=settings.weak_activity_as_negative, max_candidate_missing_pairs=settings.max_candidate_missing_pairs, candidate_pair_mode=settings.candidate_pair_mode)
         if csv_summary.get("enabled"):
             log.info(
                 "Readable CSV/Neo4j/ML mirrors refreshed: node_labels=%d rel_types=%d ML_training_pairs=%d",
@@ -536,7 +545,7 @@ def _target_terms_from_artifacts(store: RunStore) -> Tuple[List[str], List[str]]
             key = rec.get("key") or {}
             props = rec.get("props") or {}
             raw = key.get("protein_id") or props.get("protein_id") or props.get("uniprot_id") or props.get("accession")
-            uri = props.get("pubchem_uri")
+            uri = props.get("pubchem_uri") or props.get("protein_term")
             term = _pubchem_term("protein", raw, uri)
             if term:
                 proteins.add(term)
@@ -546,7 +555,7 @@ def _target_terms_from_artifacts(store: RunStore) -> Tuple[List[str], List[str]]
             key = rec.get("key") or {}
             props = rec.get("props") or {}
             raw = key.get("gene_id") or props.get("gene_id") or props.get("ncbi_gene_id")
-            uri = props.get("pubchem_uri")
+            uri = props.get("pubchem_uri") or props.get("gene_term")
             term = _pubchem_term("gene", raw, uri)
             if term:
                 genes.add(term)
@@ -555,6 +564,86 @@ def _target_terms_from_artifacts(store: RunStore) -> Tuple[List[str], List[str]]
 
 def _compound_terms_from_artifacts(store: RunStore, fallback_chem_ids: List[str]) -> List[str]:
     return [f"compound:CID{cid}" for cid in _compound_cids_from_artifacts(store, fallback_chem_ids)]
+
+
+def _compound_entities_from_artifacts(store: RunStore, fallback_chem_ids: List[str]) -> List[Dict[str, object]]:
+    """Return compound metadata used by PubMed fallback text mining."""
+    out: Dict[int, Dict[str, object]] = {}
+    compound_file = store.nodes_dir / "Compound.jsonl"
+    if compound_file.exists():
+        for rec in _iter_jsonl(compound_file):
+            key = rec.get("key") or {}
+            props = rec.get("props") or {}
+            cid = key.get("cid") or props.get("cid")
+            try:
+                cid_int = int(cid)
+            except Exception:
+                continue
+            item = out.setdefault(cid_int, {"cid": cid_int})
+            for src_key, dst_key in [
+                ("preferred_name", "preferred_name"), ("name", "name"), ("title", "title"),
+            ]:
+                if props.get(src_key) and not item.get(dst_key):
+                    item[dst_key] = props.get(src_key)
+    syn_file = store.nodes_dir / "Synonyms.jsonl"
+    if syn_file.exists():
+        for rec in _iter_jsonl(syn_file):
+            key = rec.get("key") or {}
+            props = rec.get("props") or {}
+            try:
+                cid_int = int(key.get("cid") or props.get("cid"))
+            except Exception:
+                continue
+            item = out.setdefault(cid_int, {"cid": cid_int})
+            if props.get("synonyms"):
+                item["synonyms"] = props.get("synonyms")
+    # fallback seeds for chem-id based runs where compound nodes were not yet rich
+    for raw in fallback_chem_ids:
+        txt = str(raw or "").strip()
+        m = re.search(r"CID[:=]?(\d+)$", txt, flags=re.IGNORECASE) or re.search(r"^(\d+)$", txt)
+        if m:
+            cid_int = int(m.group(1))
+            out.setdefault(cid_int, {"cid": cid_int, "preferred_name": f"CID {cid_int}"})
+    return [out[k] for k in sorted(out)]
+
+
+def _target_entities_from_artifacts(store: RunStore) -> List[Dict[str, object]]:
+    """Return protein/gene metadata used by PubMed fallback text mining."""
+    out: Dict[str, Dict[str, object]] = {}
+    protein_file = store.nodes_dir / "Protein.jsonl"
+    if protein_file.exists():
+        for rec in _iter_jsonl(protein_file):
+            key = rec.get("key") or {}
+            props = rec.get("props") or {}
+            protein_id = str(key.get("protein_id") or props.get("protein_id") or "").strip()
+            if not protein_id:
+                continue
+            item = out.setdefault(f"protein:{protein_id}", {"protein_id": protein_id})
+            for src_key, dst_key in [("name", "protein_name"), ("preferred_name", "protein_name"), ("gene_symbol", "gene_symbol"), ("symbol", "gene_symbol")]:
+                if props.get(src_key) and not item.get(dst_key):
+                    item[dst_key] = props.get(src_key)
+    gene_file = store.nodes_dir / "Gene.jsonl"
+    if gene_file.exists():
+        for rec in _iter_jsonl(gene_file):
+            key = rec.get("key") or {}
+            props = rec.get("props") or {}
+            gene_id = str(key.get("gene_id") or props.get("gene_id") or "").strip()
+            if not gene_id:
+                continue
+            item = out.setdefault(f"gene:{gene_id}", {"gene_id": gene_id})
+            for src_key, dst_key in [("symbol", "gene_symbol"), ("name", "gene_name"), ("gene_symbol", "gene_symbol")]:
+                if props.get(src_key) and not item.get(dst_key):
+                    item[dst_key] = props.get(src_key)
+    # Add CYP symbols from known protein accessions when PubChem did not expose Gene nodes.
+    accession_to_symbol = {
+        "P08684": "CYP3A4", "P20815": "CYP3A5", "P05177": "CYP1A2", "P11712": "CYP2C9",
+        "P33261": "CYP2C19", "P10635": "CYP2D6", "P04798": "CYP1A1", "P05181": "CYP2E1",
+    }
+    for item in out.values():
+        pid = str(item.get("protein_id") or "").upper().removeprefix("ACC")
+        if pid in accession_to_symbol and not item.get("gene_symbol"):
+            item["gene_symbol"] = accession_to_symbol[pid]
+    return list(out.values())
 
 
 def _pubchem_term(kind: str, raw: object, uri: object = None) -> Optional[str]:
@@ -572,9 +661,13 @@ def _pubchem_term(kind: str, raw: object, uri: object = None) -> Optional[str]:
     if not text:
         return None
     if kind == "protein":
-        return text if text.startswith("protein:") else f"protein:{text}"
+        if text.startswith("protein:"):
+            return text
+        return f"protein:ACC{text.upper().removeprefix('ACC')}"
     if kind == "gene":
-        return text if text.startswith("gene:") else f"gene:{text}"
+        if text.startswith("gene:"):
+            return text
+        return f"gene:GID{text.removeprefix('GID')}"
     return None
 
 
@@ -685,8 +778,10 @@ def _add_shared_args(parser: argparse.ArgumentParser, *, default_suppress: bool 
     # Flags
     parser.add_argument("--include-textmining", type=str, choices=["true", "false"], default=default,
                         help="Add the separate text-mined co-occurrence layer. Default source is auto: local file if present, otherwise PubChem SPARQL endpoint.")
-    parser.add_argument("--textmining-source", type=str, choices=["auto", "pubchem", "file"], default=default,
-                        help="Text-mining source: auto, pubchem endpoint, or local file. Default: auto.")
+    parser.add_argument("--textmining-source", type=str, choices=["auto", "pubchem", "pubmed", "file"], default=default,
+                        help="Text-mining source: auto, pubchem endpoint with PubMed fallback, PubMed-only fallback, or local file. Default: auto.")
+    parser.add_argument("--textmining-pubmed-fallback", type=str, choices=["true", "false"], default=default,
+                        help="When source=auto/pubchem and PubChemRDF co-occurrence returns no rows, query PubMed title/abstract co-mentions. Default: true.")
     parser.add_argument("--textmining-file", type=str, default=default,
                         help="Optional CSV/TSV file for text-mined co-occurrences, or 'auto' to search common paths. Used when source=file or auto with a file present.")
     parser.add_argument("--include-compound-similarity", type=str, choices=["true", "false"], default=default,
@@ -726,6 +821,10 @@ def _add_shared_args(parser: argparse.ArgumentParser, *, default_suppress: bool 
                         help="Maximum PubChem text-mining co-occurrence rows per target/gene. Default: 250.")
     parser.add_argument("--max-textmine-references-per-pair", type=str, default=default,
                         help="Maximum references/snippets kept per compound-target text-mining pair when the endpoint exposes them. Default: 5.")
+    parser.add_argument("--max-candidate-missing-pairs", type=str, default=default,
+                        help="Maximum unobserved compound-target pairs exported as unknown link-prediction candidates. Use none for all. Default: 1000 or 10x observed pairs.")
+    parser.add_argument("--candidate-pair-mode", type=str, choices=["sampled", "all"], default=default,
+                        help="Export unknown candidate pairs as deterministic sampled subset or all unobserved pairs. Default: sampled.")
 
     # Cache + runtime
     parser.add_argument("--cache-dir", type=str, default=default, help="Cache directory for downloads/HTTP responses.")
@@ -1132,6 +1231,9 @@ def main(argv: Optional[List[str]] = None) -> None:
         compound_similarity_threshold=similarity_threshold,
         activity_threshold_um=activity_threshold_um,
         weak_activity_as_negative=weak_activity_as_negative,
+        textmining_pubmed_fallback=(getattr(args, "textmining_pubmed_fallback", None) != "false"),
+        max_candidate_missing_pairs=(settings.max_candidate_missing_pairs if getattr(args, "max_candidate_missing_pairs", None) is None else _parse_int_or_none(args.max_candidate_missing_pairs)),
+        candidate_pair_mode=(settings.candidate_pair_mode if getattr(args, "candidate_pair_mode", None) is None else args.candidate_pair_mode),
     )
 
     # Plugins / external enrichment
@@ -1208,6 +1310,8 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "save_raw_http_cache": settings.save_raw_http_cache,
                 "save_extracted_artifacts": settings.save_extracted_artifacts,
                 "batch_size": settings.batch_size,
+                "candidate_pair_mode": getattr(settings, "candidate_pair_mode", "sampled"),
+                "max_candidate_missing_pairs": getattr(settings, "max_candidate_missing_pairs", None),
             },
             "neo4j": {
                 "load_enabled": load_neo4j,
@@ -1220,6 +1324,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "log_file": str(log_path),
                 "cache_dir": str(settings.cache_dir),
                 "textmining_source": getattr(settings, "textmining_source", "auto"),
+            "textmining_pubmed_fallback": getattr(settings, "textmining_pubmed_fallback", True),
             "textmining_file": str(settings.textmining_file) if settings.textmining_file else None,
                 "bindingdb_file": str(settings.bindingdb_file) if getattr(settings, "bindingdb_file", None) else None,
                 "drugbank_file": str(settings.drugbank_file) if getattr(settings, "drugbank_file", None) else None,
@@ -1232,7 +1337,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         derived_summary = store.materialize_schema_derived_graph(guard=guard, activity_threshold_um=settings.activity_threshold_um, weak_activity_as_negative=settings.weak_activity_as_negative)
         if derived_summary.get("enabled"):
             log.info("Schema-derived graph additions: nodes=%d rels=%d", derived_summary.get("added_nodes", 0), derived_summary.get("added_relationships", 0))
-        csv_summary = store.materialize_csv_mirrors(guard=guard, activity_threshold_um=settings.activity_threshold_um, weak_activity_as_negative=settings.weak_activity_as_negative)
+        csv_summary = store.materialize_csv_mirrors(guard=guard, activity_threshold_um=settings.activity_threshold_um, weak_activity_as_negative=settings.weak_activity_as_negative, max_candidate_missing_pairs=settings.max_candidate_missing_pairs, candidate_pair_mode=settings.candidate_pair_mode)
         if csv_summary.get("enabled"):
             log.info("Readable CSV/Neo4j/ML mirrors written under %s", store.graph_dir)
         if not load_neo4j:
@@ -1288,6 +1393,8 @@ def main(argv: Optional[List[str]] = None) -> None:
             "save_raw_http_cache": settings.save_raw_http_cache,
             "save_extracted_artifacts": settings.save_extracted_artifacts,
             "batch_size": settings.batch_size,
+            "candidate_pair_mode": getattr(settings, "candidate_pair_mode", "sampled"),
+            "max_candidate_missing_pairs": getattr(settings, "max_candidate_missing_pairs", None),
         },
         "neo4j": {
             "load_enabled": load_neo4j,
@@ -1300,6 +1407,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             "log_file": str(log_path),
             "cache_dir": str(settings.cache_dir),
             "textmining_source": getattr(settings, "textmining_source", "auto"),
+            "textmining_pubmed_fallback": getattr(settings, "textmining_pubmed_fallback", True),
             "textmining_file": str(settings.textmining_file) if settings.textmining_file else None,
             "bindingdb_file": str(settings.bindingdb_file) if getattr(settings, "bindingdb_file", None) else None,
             "drugbank_file": str(settings.drugbank_file) if getattr(settings, "drugbank_file", None) else None,
@@ -1409,10 +1517,16 @@ def main(argv: Optional[List[str]] = None) -> None:
     if settings.flags.include_textmining:
         source = str(getattr(settings, "textmining_source", "auto") or "auto").lower()
         use_file = settings.textmining_file is not None and settings.textmining_file.exists()
+        before_cooc = _count_jsonl_records(store.nodes_dir / "Cooc.jsonl")
+
         if source == "file" and not use_file:
             template = _write_textmining_template(run_dir)
-            log.warning("Text-mining source=file but file was not found: %s; skipping text-mining rows. A template was written to %s", settings.textmining_file, template)
-        elif use_file:
+            log.warning(
+                "Text-mining source=file but file was not found: %s; skipping text-mining rows. A template was written to %s",
+                settings.textmining_file,
+                template,
+            )
+        elif use_file and source in {"auto", "file"}:
             textmine_iter = iter_textmining_csv_rows(settings.textmining_file, max_records=settings.caps.max_textmine_records)
             textmine_rows, textmine_nodes, textmine_rels = _append_layer_rows(textmine_iter, store, guard)
             node_count += textmine_nodes
@@ -1420,43 +1534,96 @@ def main(argv: Optional[List[str]] = None) -> None:
             row_count += textmine_rows
             log.info("Text-mining file layer: rows=%d nodes=%d rels=%d", textmine_rows, textmine_nodes, textmine_rels)
         else:
-            # Endpoint-backed text mining: read target/compound terms from the
-            # already extracted graph and query PubChemRDF through the same
-            # SPARQL mirror. No local template/file is required.
             protein_terms, gene_terms = _target_terms_from_artifacts(store)
             compound_terms = _compound_terms_from_artifacts(store, chem_ids)
-            if not (protein_terms or gene_terms):
-                log.warning("Text-mining endpoint requested, but no Protein/Gene nodes were available from the extracted graph; skipping.")
-            else:
-                sparql_cache = (settings.cache_dir / "sparql_textmining") if settings.save_raw_http_cache else None
-                text_client = _make_sparql_client(settings, sparql_cache)
-                try:
-                    textmine_iter = iter_pubchem_textmining_sparql_rows(
-                        text_client,
-                        compound_terms=compound_terms,
-                        protein_terms=protein_terms,
-                        gene_terms=gene_terms,
-                        max_records=settings.caps.max_textmine_records,
-                        max_records_per_target=getattr(settings.caps, "max_textmine_records_per_target", 250),
-                        max_references_per_pair=getattr(settings.caps, "max_textmine_references_per_pair", 5),
+
+            # 1) PubChemRDF co-occurrence endpoint path.
+            if source in {"auto", "pubchem"}:
+                if not (protein_terms or gene_terms):
+                    log.warning("Text-mining endpoint requested, but no Protein/Gene nodes were available from the extracted graph; skipping PubChemRDF text-mining query.")
+                else:
+                    sparql_cache = (settings.cache_dir / "sparql_textmining") if settings.save_raw_http_cache else None
+                    text_client = _make_sparql_client(settings, sparql_cache)
+                    try:
+                        textmine_iter = iter_pubchem_textmining_sparql_rows(
+                            text_client,
+                            compound_terms=compound_terms,
+                            protein_terms=protein_terms,
+                            gene_terms=gene_terms,
+                            max_records=settings.caps.max_textmine_records,
+                            max_records_per_target=getattr(settings.caps, "max_textmine_records_per_target", 250),
+                            max_references_per_pair=getattr(settings.caps, "max_textmine_references_per_pair", 5),
+                        )
+                        try:
+                            r, n, e = _append_layer_rows(textmine_iter, store, guard)
+                            textmine_rows += r
+                            textmine_nodes += n
+                            textmine_rels += e
+                        except Exception:
+                            # Text mining is weak/additive evidence. It must not
+                            # invalidate a curated PubChem evidence run when the
+                            # public endpoint is unavailable or throttled.
+                            log.warning("PubChem text-mining endpoint failed; will try configured fallback if enabled.", exc_info=True)
+                    finally:
+                        try:
+                            text_client.close()
+                        except Exception:
+                            pass
+                    log.info("PubChem text-mining endpoint layer: rows=%d nodes=%d rels=%d", textmine_rows, textmine_nodes, textmine_rels)
+
+            after_pubchem_cooc = _count_jsonl_records(store.nodes_dir / "Cooc.jsonl")
+            needs_pubmed = (
+                source == "pubmed"
+                or (source in {"auto", "pubchem"} and getattr(settings, "textmining_pubmed_fallback", True) and after_pubchem_cooc <= before_cooc)
+            )
+
+            # 2) PubMed title/abstract fallback path.
+            if needs_pubmed:
+                compound_entities = _compound_entities_from_artifacts(store, chem_ids)
+                target_entities = _target_entities_from_artifacts(store)
+                if not compound_entities or not target_entities:
+                    log.warning(
+                        "PubMed text-mining fallback skipped because compound_entities=%d target_entities=%d.",
+                        len(compound_entities),
+                        len(target_entities),
+                    )
+                else:
+                    pubmed_cache = (settings.cache_dir / "pubmed_textmining") if settings.save_raw_http_cache else None
+                    pubmed_client = HttpClient(
+                        timeout_s=max(30.0, float(settings.enrichment_timeout_s)),
+                        max_retries=max(0, int(settings.enrichment_max_retries)),
+                        headers={"User-Agent": settings.sparql.user_agent},
+                        cache_dir=pubmed_cache,
+                        min_delay_s=max(0.34, float(settings.enrichment_min_delay_s or 0.0)),
+                        max_delay_s=5.0,
+                        honor_throttling_headers=True,
+                        max_cache_bytes=_mb_to_bytes(settings.resources.max_http_cache_mb),
                     )
                     try:
-                        textmine_rows, textmine_nodes, textmine_rels = _append_layer_rows(textmine_iter, store, guard)
+                        textmine_iter = iter_pubmed_textmining_rows(
+                            pubmed_client,
+                            compound_entities=compound_entities,
+                            target_entities=target_entities,
+                            max_records=settings.caps.max_textmine_records,
+                            max_records_per_target=getattr(settings.caps, "max_textmine_records_per_target", 250),
+                            max_references_per_pair=getattr(settings.caps, "max_textmine_references_per_pair", 5),
+                        )
+                        r, n, e = _append_layer_rows(textmine_iter, store, guard)
+                        textmine_rows += r
+                        textmine_nodes += n
+                        textmine_rels += e
+                        log.info("PubMed fallback text-mining layer: rows=%d nodes=%d rels=%d", r, n, e)
                     except Exception:
-                        # Text mining is weak/additive evidence. It must not
-                        # invalidate a curated PubChem evidence run when the
-                        # public endpoint is unavailable or throttled.
-                        log.warning("PubChem text-mining endpoint failed; continuing without text-mining rows.", exc_info=True)
-                        textmine_rows = textmine_nodes = textmine_rels = 0
-                finally:
-                    try:
-                        text_client.close()
-                    except Exception:
-                        pass
-                node_count += textmine_nodes
-                rel_count += textmine_rels
-                row_count += textmine_rows
-                log.info("PubChem text-mining endpoint layer: rows=%d nodes=%d rels=%d", textmine_rows, textmine_nodes, textmine_rels)
+                        log.warning("PubMed text-mining fallback failed; continuing without fallback rows.", exc_info=True)
+                    finally:
+                        try:
+                            pubmed_client.close()
+                        except Exception:
+                            pass
+
+            node_count += textmine_nodes
+            rel_count += textmine_rels
+            row_count += textmine_rows
 
     sim_rows = sim_nodes = sim_rels = 0
     if settings.flags.include_compound_similarity:
@@ -1529,7 +1696,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     if derived_summary.get("enabled"):
         log.info("Schema-derived graph additions: nodes=%d rels=%d", derived_summary.get("added_nodes", 0), derived_summary.get("added_relationships", 0))
 
-    csv_summary = store.materialize_csv_mirrors(guard=guard, activity_threshold_um=settings.activity_threshold_um, weak_activity_as_negative=settings.weak_activity_as_negative)
+    csv_summary = store.materialize_csv_mirrors(guard=guard, activity_threshold_um=settings.activity_threshold_um, weak_activity_as_negative=settings.weak_activity_as_negative, max_candidate_missing_pairs=settings.max_candidate_missing_pairs, candidate_pair_mode=settings.candidate_pair_mode)
     if csv_summary.get("enabled"):
         log.info(
             "Readable CSV mirrors written: rows=%d node_labels=%d rel_types=%d; ML pairs=%d",

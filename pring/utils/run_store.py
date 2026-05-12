@@ -338,6 +338,8 @@ class RunStore:
         guard: Optional[Any] = None,
         activity_threshold_um: Optional[float] = None,
         weak_activity_as_negative: bool = False,
+        max_candidate_missing_pairs: Optional[int] = None,
+        candidate_pair_mode: str = "sampled",
     ) -> Dict[str, Any]:
         """Add schema-required derived relationships without changing extraction.
 
@@ -726,6 +728,8 @@ class RunStore:
         guard: Optional[Any] = None,
         activity_threshold_um: Optional[float] = None,
         weak_activity_as_negative: bool = False,
+        max_candidate_missing_pairs: Optional[int] = None,
+        candidate_pair_mode: str = "sampled",
     ) -> Dict[str, Any]:
         """Create readable CSV mirrors, Neo4j import CSVs, and ML/GCN tables.
 
@@ -1022,7 +1026,13 @@ class RunStore:
                     unknown_candidates.append((c, p))
         rng = random.Random(13)
         rng.shuffle(unknown_candidates)
-        candidate_limit = min(len(unknown_candidates), max(1000, len(pair_rows) * 10 if pair_rows else 1000))
+        mode = str(candidate_pair_mode or "sampled").strip().lower()
+        if mode == "all":
+            candidate_limit = len(unknown_candidates)
+        elif max_candidate_missing_pairs is not None:
+            candidate_limit = max(0, min(len(unknown_candidates), int(max_candidate_missing_pairs)))
+        else:
+            candidate_limit = min(len(unknown_candidates), max(1000, len(pair_rows) * 10 if pair_rows else 1000))
         candidate_rows = []
         for cand_idx, (compound_ref, protein_ref) in enumerate(unknown_candidates[:candidate_limit], start=1):
             if guard is not None and cand_idx % 100 == 0:
@@ -1078,6 +1088,9 @@ class RunStore:
             "positive_compound_target_pairs": len(pair_rows),
             "negative_compound_target_pairs": len(negative_rows),
             "candidate_missing_compound_target_pairs": len(candidate_rows),
+            "candidate_missing_pair_mode": mode,
+            "candidate_missing_pair_limit": candidate_limit,
+            "total_unobserved_compound_target_pairs": len(unknown_candidates),
             "ambiguous_or_unlabeled_observed_pairs": len(ambiguous_pair_keys),
             "observed_compound_target_pairs": len(observed_pair_keys),
             "training_pair_records": len(training_pair_rows),
