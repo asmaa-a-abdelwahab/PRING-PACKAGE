@@ -177,6 +177,8 @@ class RunStore:
             weak_activity_as_negative = bool(label_cfg.get("weak_activity_as_negative"))
         endpoint_label_distribution = {"positive": 0, "negative": 0, "ambiguous_or_unlabeled": 0}
         endpoint_label_distribution_thresholded = {"positive": 0, "negative": 0, "ambiguous_or_unlabeled": 0}
+        endpoint_label_by_ref: Dict[str, str] = {}
+        endpoint_label_thresholded_by_ref: Dict[str, str] = {}
         interaction_label_distribution: Dict[str, int] = {}
 
         for path in sorted(self.nodes_dir.glob("*.jsonl")):
@@ -192,27 +194,25 @@ class RunStore:
                 props = rec.get("props") or {}
                 if label == "Endpoint":
                     endpoint_label = _endpoint_supervision_label(props)
-                    if endpoint_label == 1:
-                        endpoint_label_distribution["positive"] += 1
-                    elif endpoint_label == 0:
-                        endpoint_label_distribution["negative"] += 1
-                    else:
-                        endpoint_label_distribution["ambiguous_or_unlabeled"] += 1
+                    endpoint_label_by_ref[ref] = "positive" if endpoint_label == 1 else ("negative" if endpoint_label == 0 else "ambiguous_or_unlabeled")
                     endpoint_label_t = _endpoint_supervision_label(
                         props,
                         activity_threshold_um=_as_float(activity_threshold_um),
                         weak_activity_as_negative=weak_activity_as_negative,
                     )
-                    if endpoint_label_t == 1:
-                        endpoint_label_distribution_thresholded["positive"] += 1
-                    elif endpoint_label_t == 0:
-                        endpoint_label_distribution_thresholded["negative"] += 1
-                    else:
-                        endpoint_label_distribution_thresholded["ambiguous_or_unlabeled"] += 1
+                    endpoint_label_thresholded_by_ref[ref] = "positive" if endpoint_label_t == 1 else ("negative" if endpoint_label_t == 0 else "ambiguous_or_unlabeled")
                 elif label == "Interaction":
                     ilabel = _stringify_cell(props.get("label") or "missing")
                     interaction_label_distribution[ilabel] = interaction_label_distribution.get(ilabel, 0) + 1
             unique_node_counts[label_name] = len(refs_for_label)
+
+        # Count endpoint label distributions on unique Endpoint nodes, not raw
+        # JSONL append records. This keeps run_quality_report consistent with
+        # Endpoint.csv and node_features_endpoint.csv after rematerialization.
+        for v in endpoint_label_by_ref.values():
+            endpoint_label_distribution[v] = endpoint_label_distribution.get(v, 0) + 1
+        for v in endpoint_label_thresholded_by_ref.values():
+            endpoint_label_distribution_thresholded[v] = endpoint_label_distribution_thresholded.get(v, 0) + 1
 
         relationship_counts: Dict[str, int] = {}
         unique_relationship_counts: Dict[str, int] = {}
@@ -1233,6 +1233,7 @@ class RunStore:
         if guard is not None:
             guard.checkpoint("ml:features:compound", force=True)
         protein_feature_rows = _build_protein_feature_rows(node_records_by_ref, node_id_by_ref, protein_annotation_maps=protein_annotation_maps)
+        protembed_feature_rows = _build_protembed_feature_rows(node_records_by_ref, node_id_by_ref)
         if guard is not None:
             guard.checkpoint("ml:features:protein", force=True)
         endpoint_feature_rows = _build_endpoint_feature_rows(
@@ -1250,6 +1251,7 @@ class RunStore:
         _write_rows_csv(self.ml_dir / "edge_index.csv", edge_rows)
         _write_rows_csv(self.ml_dir / "node_features_compound.csv", compound_feature_rows)
         _write_rows_csv(self.ml_dir / "node_features_protein.csv", protein_feature_rows)
+        _write_rows_csv(self.ml_dir / "node_features_protembed.csv", protembed_feature_rows)
         _write_rows_csv(self.ml_dir / "node_features_endpoint.csv", endpoint_feature_rows)
         _write_rows_csv(self.ml_dir / "positive_compound_target_pairs.csv", pair_rows, columns=ML_PAIR_COLUMNS)
         _write_rows_csv(self.ml_dir / "negative_compound_target_pairs.csv", negative_rows, columns=ML_NEGATIVE_COLUMNS)
@@ -1267,6 +1269,7 @@ class RunStore:
             "edge_index_records": len(edge_rows),
             "compound_feature_records": len(compound_feature_rows),
             "protein_feature_records": len(protein_feature_rows),
+            "protein_embedding_feature_records": len(protembed_feature_rows),
             "endpoint_feature_records": len(endpoint_feature_rows),
             "positive_compound_target_pairs": len(pair_rows),
             "negative_compound_target_pairs": len(negative_rows),
@@ -1512,9 +1515,19 @@ def _cyp450_gcn_readiness_report(
     if int(evidence_report.get("endpoints_with_numeric_value") or 0) == 0:
         warnings.append("numeric_endpoint_values_missing")
 
-    bindingdb_status = ((optional_layer_report.get("bindingdb") or {}).get("status") if isinstance(optional_layer_report, dict) else None)
+    bindingdb_layer = (optional_layer_report.get("bindingdb") or {}) if isinstance(optional_layer_report, dict) else {}
+    bindingdb_status = bindingdb_layer.get("status")
     if bindingdb_status and bindingdb_status != "materialized":
         warnings.append(f"bindingdb_{bindingdb_status}")
+    if int(bindingdb_layer.get("records_emitted") or 0) and int(bindingdb_layer.get("has_bindingdb_record_edges") or 0) == 0:
+        warnings.append("bindingdb_ligands_not_linked_to_compounds")
+    embedding_layer = (optional_layer_report.get("protein_embeddings") or {}) if isinstance(optional_layer_report, dict) else {}
+    if embedding_layer.get("requested") and embedding_layer.get("models_skipped"):
+        warnings.append("requested_protein_embedding_models_skipped")
+    requested_models = {str(x).lower() for x in (embedding_layer.get("models_requested") or [])}
+    materialized_methods = {str(x).lower() for x in (embedding_layer.get("models_materialized") or {}).keys()}
+    if "prott5" in requested_models and not any("prot" in m and "t5" in m for m in materialized_methods):
+        warnings.append("prott5_embeddings_missing")
     if schema_alignment_report.get("status") != "evaluated":
         warnings.append("schema_alignment_not_evaluated")
 
@@ -1679,6 +1692,7 @@ def _optional_layer_report(node_counts: Dict[str, int], relationship_counts: Dic
     requested_all = any("all" == p or p.endswith(":make_all_plugin") for p in plugins)
     text_report: Dict[str, Any] = {}
     bindingdb_report: Dict[str, Any] = {}
+    protein_embedding_report: Dict[str, Any] = {}
     try:
         text_report = json.loads((run_dir / "graph" / "textmining_report.json").read_text(encoding="utf-8"))
     except Exception:
@@ -1687,6 +1701,10 @@ def _optional_layer_report(node_counts: Dict[str, int], relationship_counts: Dic
         bindingdb_report = json.loads((run_dir / "graph" / "bindingdb_report.json").read_text(encoding="utf-8"))
     except Exception:
         bindingdb_report = {}
+    try:
+        protein_embedding_report = json.loads((run_dir / "graph" / "protein_embedding_report.json").read_text(encoding="utf-8"))
+    except Exception:
+        protein_embedding_report = {}
     bindingdb_status = "materialized" if node_counts.get("BindingDB", 0) else "not_materialized_or_empty"
     if not node_counts.get("BindingDB", 0) and bindingdb_report.get("raw_records_returned") and not bindingdb_report.get("records_emitted"):
         bindingdb_status = "raw_records_available_but_not_materialized"
@@ -1711,8 +1729,20 @@ def _optional_layer_report(node_counts: Dict[str, int], relationship_counts: Dic
             "validated_by_bindingdb_edges": int(relationship_counts.get("VALIDATED_BY_BINDINGDB", 0)),
             "raw_records_returned": bindingdb_report.get("raw_records_returned"),
             "records_after_parsing": bindingdb_report.get("records_after_parsing"),
+            "records_with_pubchem_cid": bindingdb_report.get("records_with_pubchem_cid"),
+            "records_without_pubchem_cid": bindingdb_report.get("records_without_pubchem_cid"),
             "records_emitted": bindingdb_report.get("records_emitted"),
             "status": bindingdb_status,
+        },
+        "protein_embeddings": {
+            "requested": protein_embedding_report.get("requested"),
+            "status": protein_embedding_report.get("status") or ("materialized" if relationship_counts.get("HAS_PROTEIN_EMBEDDING", 0) else "not_materialized_or_empty"),
+            "models_requested": protein_embedding_report.get("models_requested", []),
+            "models_materialized": protein_embedding_report.get("models_materialized", {}),
+            "models_skipped": protein_embedding_report.get("models_skipped", {}),
+            "skip_examples": protein_embedding_report.get("skip_examples", []),
+            "protein_embedding_nodes": int(node_counts.get("ProtEmbed", 0)),
+            "protein_embedding_edges": int(relationship_counts.get("HAS_PROTEIN_EMBEDDING", 0)),
         },
         "drugbank": {
             "drugbank_nodes": int(node_counts.get("DrugBank", 0)),
@@ -2340,6 +2370,47 @@ def _uniprot_acc_from_protein_id(protein_id: str) -> str:
         return text[3:]
     return text
 
+
+
+def _build_protembed_feature_rows(
+    node_records_by_ref: dict[str, dict[str, str]],
+    node_id_by_ref: dict[str, int],
+) -> list[dict[str, Any]]:
+    """Export one row per ProtEmbed node with vector columns intact.
+
+    node_features_protein.csv also flattens embedding vectors into protein rows
+    for simple GCN loaders. This separate file preserves the graph-native
+    ProtEmbed representation for heterogeneous loaders that treat embeddings as
+    explicit nodes connected by HAS_PROTEIN_EMBEDDING.
+    """
+    rows: list[dict[str, Any]] = []
+    for ref, rec in sorted(node_records_by_ref.items()):
+        if rec.get("label") != "ProtEmbed":
+            continue
+        _, key = _parse_node_ref(ref)
+        embedding_id = str(key.get("embedding_id") or rec.get("key_embedding_id") or rec.get("props_embedding_id") or "")
+        out: dict[str, Any] = {
+            "node_id": node_id_by_ref.get(ref, ""),
+            "node_ref": ref,
+            "embedding_id": embedding_id,
+            "method": rec.get("props_method", ""),
+            "model_family": rec.get("props_model_family", ""),
+            "model_name": rec.get("props_model_name", ""),
+            "dim": rec.get("props_dim", ""),
+            "version": rec.get("props_version", ""),
+            "sequence_length": rec.get("props_sequence_length", ""),
+            "truncated_to": rec.get("props_truncated_to", ""),
+            "uniprot_acc": rec.get("props_uniprot_acc", ""),
+        }
+        method_prefix = _safe_feature_prefix(str(out.get("method") or embedding_id or "embedding"))
+        for k, v in rec.items():
+            if not k.startswith("props_"):
+                continue
+            raw = k[6:]
+            if raw.startswith("emb_") or raw.startswith("aa_") or raw.startswith("freq_"):
+                out[f"{method_prefix}_{raw}"] = v
+        rows.append(out)
+    return rows
 
 def _build_endpoint_feature_rows(
     node_records_by_ref: dict[str, dict[str, str]],

@@ -950,6 +950,8 @@ def _add_shared_args(parser: argparse.ArgumentParser, *, default_suppress: bool 
                         help="Maximum unobserved compound-target pairs exported as unknown link-prediction candidates. Use none for all. Default: 1000 or 10x observed pairs.")
     parser.add_argument("--candidate-pair-mode", type=str, choices=["sampled", "all"], default=default,
                         help="Export unknown candidate pairs as deterministic sampled subset or all unobserved pairs. Default: sampled.")
+    parser.add_argument("--case-study-mode", type=str, choices=["exploratory", "final-cyp450"], default=default,
+                        help="Optional QA preset. final-cyp450 refuses capped extraction settings and requires all missing compound-target candidates.")
 
     # Cache + runtime
     parser.add_argument("--cache-dir", type=str, default=default, help="Cache directory for downloads/HTTP responses.")
@@ -1374,6 +1376,28 @@ def main(argv: Optional[List[str]] = None) -> None:
         max_candidate_missing_pairs=(settings.max_candidate_missing_pairs if getattr(args, "max_candidate_missing_pairs", None) is None else _parse_int_or_none(args.max_candidate_missing_pairs)),
         candidate_pair_mode=(settings.candidate_pair_mode if getattr(args, "candidate_pair_mode", None) is None else args.candidate_pair_mode),
     )
+
+    if str(getattr(args, "case_study_mode", "") or "").strip().lower() == "final-cyp450":
+        active_caps = {
+            "--max-compounds-per-target": settings.caps.max_compounds_per_target,
+            "--max-targets-per-compound": settings.caps.max_targets_per_compound,
+            "--max-substances-per-compound": settings.caps.max_substances_per_compound,
+            "--max-measuregroups-per-target": settings.caps.max_measuregroups_per_target,
+            "--max-measuregroups-per-compound": settings.caps.max_measuregroups_per_compound,
+            "--max-endpoints-per-pair": settings.caps.max_endpoints_per_pair,
+            "--max-similar-compounds-per-compound": settings.caps.max_similar_compounds_per_compound,
+            "--max-textmine-records": settings.caps.max_textmine_records,
+            "--max-textmine-records-per-target": settings.caps.max_textmine_records_per_target,
+            "--max-textmine-references-per-pair": settings.caps.max_textmine_references_per_pair,
+            "--max-enrichment-records-per-entity": settings.max_enrichment_records_per_entity,
+            "--max-candidate-missing-pairs": settings.max_candidate_missing_pairs,
+        }
+        active_caps = {k: v for k, v in active_caps.items() if v is not None}
+        if active_caps:
+            details = ", ".join(f"{k}={v}" for k, v in sorted(active_caps.items()))
+            parser.error("--case-study-mode final-cyp450 requires uncapped extraction. Set capped options to none or omit them. Active caps: " + details)
+        if str(settings.candidate_pair_mode or "").lower() != "all":
+            parser.error("--case-study-mode final-cyp450 requires --candidate-pair-mode all")
 
     # Plugins / external enrichment
     plugin_args = args.plugins or []

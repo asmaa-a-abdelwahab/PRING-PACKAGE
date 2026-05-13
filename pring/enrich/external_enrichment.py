@@ -562,6 +562,7 @@ def _protein_embedding_row(protein_id: str, acc: str, rec: Dict[str, Any]) -> Op
 
 
 _TRANSFORMER_MODEL_CACHE: Dict[tuple[str, str, str, str, bool], Any] = {}
+_BINDINGDB_CID_CACHE: Dict[str, Optional[int]] = {}
 
 
 def _protein_sequence_from_uniprot(rec: Dict[str, Any]) -> str:
@@ -672,16 +673,32 @@ def _load_transformer_model(
     cache_dir: Optional[Path],
     local_files_only: bool,
 ) -> Dict[str, Any]:
+    """Load optional transformer model with robust ESM2/ProtT5 handling.
+
+    ProtT5 checkpoints require the slow SentencePiece tokenizer and are encoder
+    models for embedding use. Fast tokenizer auto-loading can fail with errors
+    such as "Unigram model ... different algorithm". Keep this isolated from
+    the main package so missing optional dependencies never break non-embedding
+    runs.
+    """
     try:
         import torch  # type: ignore
         from transformers import AutoModel, AutoTokenizer  # type: ignore
+        try:
+            from transformers import T5EncoderModel, T5Tokenizer  # type: ignore
+        except Exception:  # pragma: no cover - optional dependency variant
+            T5EncoderModel = None  # type: ignore
+            T5Tokenizer = None  # type: ignore
     except Exception as exc:  # pragma: no cover - optional dependency path
-        raise RuntimeError("torch and transformers are required for optional ESM/ProtT5 embeddings") from exc
+        raise RuntimeError("torch, transformers, sentencepiece, and protobuf are required for optional ESM/ProtT5 embeddings") from exc
 
     if device == "auto":
         device_name = "cuda" if torch.cuda.is_available() else "cpu"
     else:
         device_name = device
+    if str(device_name).startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("Torch not compiled with CUDA enabled")
+
     key = (model_key, model_name, device_name, str(cache_dir or ""), bool(local_files_only))
     if key in _TRANSFORMER_MODEL_CACHE:
         return _TRANSFORMER_MODEL_CACHE[key]
@@ -689,14 +706,40 @@ def _load_transformer_model(
     kwargs: Dict[str, Any] = {"local_files_only": bool(local_files_only)}
     if cache_dir:
         kwargs["cache_dir"] = str(cache_dir)
-    tokenizer = AutoTokenizer.from_pretrained(model_name, **kwargs)
-    model = AutoModel.from_pretrained(model_name, **kwargs)
+
+    if model_key == "prott5":
+        tokenizer_errors: List[str] = []
+        tokenizer = None
+        # Prefer the slow SentencePiece tokenizer for ProtT5. This avoids the
+        # common fast-tokenizer Unigram/BPE mismatch and is the recommended path
+        # for Rostlab/prot_t5_* checkpoints.
+        for loader_name, loader in [
+            ("AutoTokenizer(use_fast=False)", lambda: AutoTokenizer.from_pretrained(model_name, use_fast=False, **kwargs)),
+            ("T5Tokenizer", lambda: T5Tokenizer.from_pretrained(model_name, **kwargs) if T5Tokenizer is not None else None),
+        ]:
+            try:
+                tokenizer = loader()
+                if tokenizer is not None:
+                    break
+            except Exception as exc:
+                tokenizer_errors.append(f"{loader_name}: {exc}")
+        if tokenizer is None:
+            raise RuntimeError(
+                "Could not load ProtT5 tokenizer. Install optional dependencies with "
+                "`pip install sentencepiece protobuf transformers torch`. Errors: " + " | ".join(tokenizer_errors)
+            )
+        if T5EncoderModel is None:
+            raise RuntimeError("T5EncoderModel is unavailable; upgrade transformers to use ProtT5 embeddings")
+        model = T5EncoderModel.from_pretrained(model_name, **kwargs)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(model_name, **kwargs)
+        model = AutoModel.from_pretrained(model_name, **kwargs)
+
     model.eval()
     model.to(device_name)
     wrapper = {"torch": torch, "tokenizer": tokenizer, "model": model, "device_name": device_name, "model_key": model_key, "model_name": model_name}
     _TRANSFORMER_MODEL_CACHE[key] = wrapper
     return wrapper
-
 
 def _embed_sequence_with_transformer(*, wrapper: Dict[str, Any], sequence: str, model_key: str, max_length: int) -> List[float]:
     torch = wrapper["torch"]
@@ -958,6 +1001,10 @@ def _bindingdb_uniprot_rows(
             "pubchemcompoundcid", "pubchemcid",
         )
         smiles = _first_bindingdb_flat_value(flat, "smiles", "ligandsmiles", "canonicalsmiles", "isomericsmiles")
+        inchikey = _first_bindingdb_flat_value(flat, "inchikey", "inchi_key", "ligandinchikey", "standardinchikey")
+        inchi = _first_bindingdb_flat_value(flat, "inchi", "ligandinchi", "standardinchi")
+        if _as_int(cid) is None:
+            cid = _resolve_pubchem_cid_for_bindingdb_ligand(client, smiles=smiles, inchikey=inchikey, inchi=inchi)
         affinity_type = _first_bindingdb_flat_value(flat, "affinitytype", "type", "affinitykind")
         affinity_value = _first_bindingdb_flat_value(flat, "affinity", "affinityvalue", "value", "affinitynm")
         kd = _first_bindingdb_flat_value(flat, "kd", "kdnm")
@@ -986,6 +1033,8 @@ def _bindingdb_uniprot_rows(
             "affinity_type": affinity_type,
             "affinity_value": affinity_value,
             "smiles": smiles,
+            "inchikey": inchikey,
+            "inchi": inchi,
             "source_ref": source_ref,
             "source_url": f"https://bindingdb.org/rest/getLigandsByUniprot?uniprot={acc};10000&response=application/json",
             "source": "BindingDB REST getLigandsByUniprot",
@@ -1000,6 +1049,58 @@ def _bindingdb_uniprot_rows(
     if diagnostics is not None:
         diagnostics["rows_skipped_unparseable"] = skipped_unparseable
 
+
+
+def _resolve_pubchem_cid_for_bindingdb_ligand(
+    client: HttpClient,
+    *,
+    smiles: Optional[Any] = None,
+    inchikey: Optional[Any] = None,
+    inchi: Optional[Any] = None,
+) -> Optional[int]:
+    """Resolve a BindingDB ligand structure to a PubChem CID.
+
+    BindingDB target-centric JSON frequently omits PubChem CID but includes
+    SMILES/InChIKey. Resolving here allows PRING to create Compound->BindingDB
+    evidence links when the ligand exists in PubChem, while keeping target-only
+    BindingDB nodes for unresolved ligands.
+    """
+    candidates: List[tuple[str, str]] = []
+    for namespace, value in [("inchikey", inchikey), ("smiles", smiles), ("inchi", inchi)]:
+        text = str(value or "").strip()
+        if not text or text.upper() in {"NA", "N/A", "NONE", "NULL"}:
+            continue
+        candidates.append((namespace, text))
+
+    for namespace, value in candidates:
+        cache_key = f"{namespace}:{value}"
+        if cache_key in _BINDINGDB_CID_CACHE:
+            cached = _BINDINGDB_CID_CACHE[cache_key]
+            if cached is not None:
+                return cached
+            continue
+        try:
+            if namespace == "inchikey":
+                url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/inchikey/{value}/cids/JSON"
+            elif namespace == "smiles":
+                # POST would be safer for arbitrary SMILES, but the package HTTP
+                # wrapper is JSON-GET oriented. Quoted path works for common
+                # BindingDB canonical SMILES and failures remain non-fatal.
+                from urllib.parse import quote
+                url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/smiles/{quote(value, safe='')}/cids/JSON"
+            else:
+                from urllib.parse import quote
+                url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/inchi/{quote(value, safe='')}/cids/JSON"
+            data = _safe_get_json(client, url, warn=False)
+            cids = ((data.get("IdentifierList") or {}).get("CID") if isinstance(data, dict) else None) or []
+            cid = _as_int(cids[0]) if cids else None
+            _BINDINGDB_CID_CACHE[cache_key] = cid
+            if cid is not None:
+                return cid
+        except Exception:
+            _BINDINGDB_CID_CACHE[cache_key] = None
+            continue
+    return None
 
 def _flatten_bindingdb_record(value: Any, prefix: str = "") -> Dict[str, List[Any]]:
     """Flatten BindingDB's nested/dotted JSON into normalized key -> values."""

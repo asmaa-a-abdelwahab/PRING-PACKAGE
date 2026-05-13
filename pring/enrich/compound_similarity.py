@@ -16,6 +16,7 @@ from pring.extract.pubchem_core import PubChemRow
 from pring.extract.pubchem_rdf_rest import PubChemPugClient
 
 log = logging.getLogger("pring")
+_SIMILARITY_SMILES_CACHE: dict[int, Optional[str]] = {}
 
 
 def iter_compound_similarity_rows(
@@ -95,26 +96,68 @@ def iter_compound_similarity_rows(
                 target_record.setdefault("similarity_expansion", True)
                 yield PubChemRow("compound", target_record)
 
-        # PubChem fastsimilarity returns CIDs above the requested threshold but
-        # does not expose the exact Tanimoto score in this lightweight call. For
-        # GCN exports, still write an explicit numeric edge weight: the threshold
-        # lower bound. If later code computes exact RDKit Tanimoto scores, it can
-        # overwrite ``score``/``edge_weight`` while preserving ``score_type``.
+        # PubChem fastsimilarity returns CIDs above the requested threshold.
+        # When RDKit and SMILES are available, compute the exact local Morgan
+        # Tanimoto value for modeling. Otherwise keep the threshold lower-bound
+        # as a safe numeric edge weight.
         threshold_score = float(int(threshold)) / 100.0
-        payload = [
-            {
+        source_smiles = _smiles_for_cid(pug, cid)
+        payload = []
+        for target_cid in target_cids:
+            target_smiles = _smiles_for_cid(pug, int(target_cid))
+            exact = _rdkit_morgan_tanimoto(source_smiles, target_smiles)
+            score = exact if exact is not None else threshold_score
+            payload.append({
                 "cid": int(target_cid),
                 "method": f"fastsimilarity_{method.lower()}",
                 "relation_source": relation_source,
                 "threshold": int(threshold),
-                "score": threshold_score,
-                "edge_weight": threshold_score,
-                "score_type": "threshold_lower_bound",
-            }
-            for target_cid in target_cids
-        ]
+                "score": score,
+                "edge_weight": score,
+                "tanimoto": exact if exact is not None else "",
+                "score_type": "rdkit_morgan_tanimoto" if exact is not None else "threshold_lower_bound",
+            })
         yield PubChemRow("compound", {"cid": cid, "similar_compounds": payload})
 
+
+
+def _smiles_for_cid(pug: PubChemPugClient, cid: int) -> Optional[str]:
+    cid_int = _as_int(cid)
+    if cid_int is None:
+        return None
+    if cid_int in _SIMILARITY_SMILES_CACHE:
+        return _SIMILARITY_SMILES_CACHE[cid_int]
+    smiles = None
+    try:
+        recs = list(pug.compound_records([cid_int], synonym_limit=0))
+        if recs:
+            rec = recs[0]
+            for key in ("canonical_smiles", "CanonicalSMILES", "smiles", "SMILES", "isomeric_smiles", "IsomericSMILES"):
+                value = rec.get(key)
+                if value not in (None, ""):
+                    smiles = str(value).strip()
+                    break
+    except Exception:
+        smiles = None
+    _SIMILARITY_SMILES_CACHE[cid_int] = smiles
+    return smiles
+
+
+def _rdkit_morgan_tanimoto(smiles_a: Optional[str], smiles_b: Optional[str]) -> Optional[float]:
+    if not smiles_a or not smiles_b:
+        return None
+    try:
+        from rdkit import Chem, DataStructs  # type: ignore
+        from rdkit.Chem import AllChem  # type: ignore
+        mol_a = Chem.MolFromSmiles(str(smiles_a))
+        mol_b = Chem.MolFromSmiles(str(smiles_b))
+        if mol_a is None or mol_b is None:
+            return None
+        fp_a = AllChem.GetMorganFingerprintAsBitVect(mol_a, radius=2, nBits=2048)
+        fp_b = AllChem.GetMorganFingerprintAsBitVect(mol_b, radius=2, nBits=2048)
+        return round(float(DataStructs.TanimotoSimilarity(fp_a, fp_b)), 6)
+    except Exception:
+        return None
 
 def _safe_compound_records(
     pug: PubChemPugClient,
