@@ -251,6 +251,18 @@ class RunStore:
         cap_completeness_report = _cap_completeness_report(self.run_dir)
 
         ml_summary = (csv_summary or {}).get("ml", {}) if isinstance(csv_summary, dict) else {}
+        cyp450_gcn_readiness_report = _cyp450_gcn_readiness_report(
+            unique_node_counts=unique_node_counts,
+            unique_relationship_counts=unique_relationship_counts,
+            dangling_relationship_counts=dangling_relationship_counts,
+            similarity_report=similarity_report,
+            optional_layer_report=optional_layer_report,
+            schema_alignment_report=schema_alignment_report,
+            feature_completeness_report=feature_completeness_report,
+            cap_completeness_report=cap_completeness_report,
+            ml_summary=ml_summary,
+        )
+
         report = {
             "node_counts_raw": node_counts,
             "node_counts_unique": unique_node_counts,
@@ -270,6 +282,7 @@ class RunStore:
             "schema_alignment_report": schema_alignment_report,
             "feature_completeness_report": feature_completeness_report,
             "cap_completeness_report": cap_completeness_report,
+            "cyp450_gcn_readiness_report": cyp450_gcn_readiness_report,
             "observed_compound_target_pairs": ml_summary.get("observed_compound_target_pairs"),
             "candidate_missing_compound_target_pairs": ml_summary.get("candidate_missing_compound_target_pairs"),
             "positive_compound_target_pairs": ml_summary.get("positive_compound_target_pairs"),
@@ -293,6 +306,10 @@ class RunStore:
                 "molgraph_fingerprints_missing": bool(feature_completeness_report.get("compound", {}).get("molgraph_compounds_missing_fingerprint", 0)),
                 "protein_sequence_missing": bool(feature_completeness_report.get("protein", {}).get("proteins_missing_sequence_or_uniprot_length", 0)),
                 "capped_test_run": cap_completeness_report.get("data_completeness_status") == "capped_test_run",
+                "cyp450_gcn_ready_for_final_modeling": cyp450_gcn_readiness_report.get("status") == "ready_for_final_modeling",
+                "cyp450_gcn_ready_for_pipeline_validation": cyp450_gcn_readiness_report.get("pipeline_validation_ready") is True,
+                "cyp450_gcn_blockers": cyp450_gcn_readiness_report.get("blockers", []),
+                "cyp450_gcn_warnings": cyp450_gcn_readiness_report.get("warnings", []),
             },
         }
         self.graph_dir.mkdir(parents=True, exist_ok=True)
@@ -1218,7 +1235,13 @@ class RunStore:
         protein_feature_rows = _build_protein_feature_rows(node_records_by_ref, node_id_by_ref, protein_annotation_maps=protein_annotation_maps)
         if guard is not None:
             guard.checkpoint("ml:features:protein", force=True)
-        endpoint_feature_rows = _build_endpoint_feature_rows(node_records_by_ref, node_id_by_ref, endpoint_feature_context=endpoint_feature_context)
+        endpoint_feature_rows = _build_endpoint_feature_rows(
+            node_records_by_ref,
+            node_id_by_ref,
+            endpoint_feature_context=endpoint_feature_context,
+            activity_threshold_um=activity_threshold_um,
+            weak_activity_as_negative=weak_activity_as_negative,
+        )
         if guard is not None:
             guard.checkpoint("ml:features:endpoint", force=True)
 
@@ -1436,6 +1459,93 @@ def _similarity_quality_report(nodes_dir: Path, rels_dir: Path, node_refs: set[s
 
 
 
+def _cyp450_gcn_readiness_report(
+    *,
+    unique_node_counts: Dict[str, int],
+    unique_relationship_counts: Dict[str, int],
+    dangling_relationship_counts: Dict[str, int],
+    similarity_report: Dict[str, Any],
+    optional_layer_report: Dict[str, Any],
+    schema_alignment_report: Dict[str, Any],
+    feature_completeness_report: Dict[str, Any],
+    cap_completeness_report: Dict[str, Any],
+    ml_summary: Dict[str, Any],
+) -> Dict[str, Any]:
+    """High-level QA gate for the CYP450 Neo4j + GCN case study.
+
+    The goal is not to fail exploratory/capped tests, but to make it explicit
+    whether a run is suitable for final 5-CYP450 modeling or only pipeline QA.
+    """
+    blockers: list[str] = []
+    warnings: list[str] = []
+
+    if dangling_relationship_counts:
+        blockers.append("dangling_relationships_present")
+    if similarity_report.get("similarity_missing_target_compounds"):
+        blockers.append("dangling_similarity_edges_present")
+    if int(unique_node_counts.get("Compound", 0)) == 0 or int(unique_node_counts.get("Protein", 0)) == 0:
+        blockers.append("missing_compound_or_protein_nodes")
+    if int(unique_relationship_counts.get("ASSERTS_TARGET", 0)) == 0 or int(unique_relationship_counts.get("ASSERTS_CHEMICAL", 0)) == 0:
+        blockers.append("missing_interaction_backbone_edges")
+    if int(ml_summary.get("positive_compound_target_pairs") or 0) == 0:
+        blockers.append("no_positive_training_pairs")
+    if int(ml_summary.get("negative_compound_target_pairs") or 0) == 0:
+        blockers.append("no_negative_training_pairs")
+    if str(ml_summary.get("candidate_missing_pair_mode") or "").lower() != "all":
+        warnings.append("candidate_pair_mode_not_all")
+    if cap_completeness_report.get("data_completeness_status") == "capped_test_run":
+        warnings.append("active_caps_make_this_a_pipeline_test_not_final_biological_dataset")
+
+    compound_report = feature_completeness_report.get("compound", {}) if isinstance(feature_completeness_report, dict) else {}
+    protein_report = feature_completeness_report.get("protein", {}) if isinstance(feature_completeness_report, dict) else {}
+    evidence_report = feature_completeness_report.get("evidence", {}) if isinstance(feature_completeness_report, dict) else {}
+    if compound_report.get("compounds_missing_smiles"):
+        warnings.append("some_compounds_missing_smiles")
+    if compound_report.get("molgraph_compounds_missing_fingerprint"):
+        warnings.append("some_compounds_missing_fingerprints")
+    if not compound_report.get("rdkit_available_in_export"):
+        warnings.append("rdkit_morgan_fingerprints_not_used")
+    if protein_report.get("proteins_missing_sequence_or_uniprot_length"):
+        warnings.append("some_proteins_missing_sequence_features")
+    if int(protein_report.get("protein_embedding_edges") or 0) == 0:
+        warnings.append("protein_embedding_edges_missing")
+    if int(evidence_report.get("endpoints_with_numeric_value") or 0) == 0:
+        warnings.append("numeric_endpoint_values_missing")
+
+    bindingdb_status = ((optional_layer_report.get("bindingdb") or {}).get("status") if isinstance(optional_layer_report, dict) else None)
+    if bindingdb_status and bindingdb_status != "materialized":
+        warnings.append(f"bindingdb_{bindingdb_status}")
+    if schema_alignment_report.get("status") != "evaluated":
+        warnings.append("schema_alignment_not_evaluated")
+
+    pipeline_validation_ready = not blockers and int(ml_summary.get("training_pair_records") or 0) > 0
+    final_ready = pipeline_validation_ready and not warnings
+    status = "ready_for_final_modeling" if final_ready else ("ready_for_pipeline_validation" if pipeline_validation_ready else "not_ready")
+    return {
+        "status": status,
+        "pipeline_validation_ready": pipeline_validation_ready,
+        "final_modeling_ready": final_ready,
+        "blockers": blockers,
+        "warnings": warnings,
+        "minimum_expected_layers": {
+            "compound_nodes": int(unique_node_counts.get("Compound", 0)),
+            "protein_nodes": int(unique_node_counts.get("Protein", 0)),
+            "interaction_nodes": int(unique_node_counts.get("Interaction", 0)),
+            "similarity_edges": int(unique_relationship_counts.get("SIMILAR_TO", 0)),
+            "go_edges": int(unique_relationship_counts.get("HAS_GO_ANNOTATION", 0)),
+            "reactome_edges": int(unique_relationship_counts.get("MAPS_TO_REACTOME_PATHWAY", 0)),
+            "interpro_edges": int(unique_relationship_counts.get("HAS_INTERPRO_DOMAIN", 0)),
+            "textmine_cooc_nodes": int(unique_node_counts.get("Cooc", 0)),
+        },
+        "ml_pair_summary": {
+            "positive_compound_target_pairs": ml_summary.get("positive_compound_target_pairs"),
+            "negative_compound_target_pairs": ml_summary.get("negative_compound_target_pairs"),
+            "candidate_missing_compound_target_pairs": ml_summary.get("candidate_missing_compound_target_pairs"),
+            "candidate_missing_pair_mode": ml_summary.get("candidate_missing_pair_mode"),
+        },
+    }
+
+
 def _feature_completeness_report(
     nodes_dir: Path,
     rels_dir: Path,
@@ -1554,18 +1664,34 @@ def _feature_completeness_report(
 def _optional_layer_report(node_counts: Dict[str, int], relationship_counts: Dict[str, int], run_dir: Path) -> Dict[str, Any]:
     """Give explicit status for optional schema layers used by thesis QA."""
     manifest: Dict[str, Any] = {}
+    source_manifest: Dict[str, Any] = {}
     try:
         manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     except Exception:
         manifest = {}
-    paths = manifest.get("paths") or {}
-    plugins = set(str(x).lower() for x in (manifest.get("plugins") or []))
+    try:
+        source_manifest = json.loads((run_dir / "source_manifest.json").read_text(encoding="utf-8"))
+    except Exception:
+        source_manifest = {}
+    paths = dict(source_manifest.get("paths") or {})
+    paths.update(manifest.get("paths") or {})
+    plugins = set(str(x).lower() for x in ((source_manifest.get("plugins") or []) + (manifest.get("plugins") or [])))
     requested_all = any("all" == p or p.endswith(":make_all_plugin") for p in plugins)
     text_report: Dict[str, Any] = {}
+    bindingdb_report: Dict[str, Any] = {}
     try:
         text_report = json.loads((run_dir / "graph" / "textmining_report.json").read_text(encoding="utf-8"))
     except Exception:
         text_report = {}
+    try:
+        bindingdb_report = json.loads((run_dir / "graph" / "bindingdb_report.json").read_text(encoding="utf-8"))
+    except Exception:
+        bindingdb_report = {}
+    bindingdb_status = "materialized" if node_counts.get("BindingDB", 0) else "not_materialized_or_empty"
+    if not node_counts.get("BindingDB", 0) and bindingdb_report.get("raw_records_returned") and not bindingdb_report.get("records_emitted"):
+        bindingdb_status = "raw_records_available_but_not_materialized"
+        if str(manifest.get("mode") or "").startswith("load-run"):
+            bindingdb_status = "not_revalidated_by_load_run_raw_records_available"
     return {
         "textmining": {
             "textmine_nodes": int(node_counts.get("TextMine", 0)),
@@ -1583,7 +1709,10 @@ def _optional_layer_report(node_counts: Dict[str, int], relationship_counts: Dic
             "has_bindingdb_record_edges": int(relationship_counts.get("HAS_BINDINGDB_RECORD", 0)),
             "has_bindingdb_target_record_edges": int(relationship_counts.get("HAS_BINDINGDB_TARGET_RECORD", 0)),
             "validated_by_bindingdb_edges": int(relationship_counts.get("VALIDATED_BY_BINDINGDB", 0)),
-            "status": "materialized" if node_counts.get("BindingDB", 0) else "not_materialized_or_empty",
+            "raw_records_returned": bindingdb_report.get("raw_records_returned"),
+            "records_after_parsing": bindingdb_report.get("records_after_parsing"),
+            "records_emitted": bindingdb_report.get("records_emitted"),
+            "status": bindingdb_status,
         },
         "drugbank": {
             "drugbank_nodes": int(node_counts.get("DrugBank", 0)),
@@ -1607,17 +1736,50 @@ def _optional_layer_report(node_counts: Dict[str, int], relationship_counts: Dic
 def _schema_alignment_report(node_counts: Dict[str, int], relationship_counts: Dict[str, int], run_dir: Path) -> Dict[str, Any]:
     """Compare materialized graph labels/types against the DOT schema if present."""
     manifest: Dict[str, Any] = {}
+    source_manifest: Dict[str, Any] = {}
     try:
         manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     except Exception:
         manifest = {}
-    dot_path_text = ((manifest.get("paths") or {}).get("schema_dot") or "")
+    try:
+        source_manifest = json.loads((run_dir / "source_manifest.json").read_text(encoding="utf-8"))
+    except Exception:
+        source_manifest = {}
+
+    dot_path_text = (
+        ((manifest.get("paths") or {}).get("schema_dot"))
+        or ((source_manifest.get("paths") or {}).get("schema_dot"))
+        or ""
+    )
     dot_path = Path(dot_path_text) if dot_path_text else None
-    if dot_path and not dot_path.is_absolute():
-        candidates = [Path(dot_path_text), (run_dir / dot_path), (run_dir.parent / dot_path)]
-        dot_path = next((c.resolve() for c in candidates if c.exists()), candidates[0])
-    if not dot_path or not dot_path.exists():
-        return {"status": "schema_dot_not_available", "schema_dot": dot_path_text}
+    candidate_paths: list[Path] = []
+    if dot_path:
+        if dot_path.is_absolute():
+            candidate_paths.append(dot_path)
+        else:
+            candidate_paths.extend([
+                Path(dot_path_text),
+                (Path.cwd() / dot_path),
+                (run_dir / dot_path),
+                (run_dir.parent / dot_path),
+                (run_dir.parent.parent / dot_path),
+                (run_dir / "schema" / dot_path.name),
+                (run_dir / "graph" / "schema" / dot_path.name),
+            ])
+    # load-run copies canonical graph artifacts; keep a local copied schema usable
+    # for later QA even if the original relative schema path is no longer valid.
+    copied_schema = run_dir / "schema" / "pring-implementation-ready-schema.dot"
+    if copied_schema.exists():
+        candidate_paths.insert(0, copied_schema)
+
+    resolved = next((c.resolve() for c in candidate_paths if c.exists()), None)
+    if resolved is None:
+        return {
+            "status": "schema_dot_not_available",
+            "schema_dot": dot_path_text,
+            "candidate_paths_checked": [str(c) for c in candidate_paths],
+        }
+    dot_path = resolved
     try:
         text = dot_path.read_text(encoding="utf-8")
     except Exception:
@@ -2184,6 +2346,8 @@ def _build_endpoint_feature_rows(
     node_id_by_ref: dict[str, int],
     *,
     endpoint_feature_context: Optional[dict[str, dict[str, Any]]] = None,
+    activity_threshold_um: Optional[float] = None,
+    weak_activity_as_negative: bool = False,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for ref, rec in sorted(node_records_by_ref.items()):
@@ -2191,7 +2355,15 @@ def _build_endpoint_feature_rows(
             continue
         _, key = _parse_node_ref(ref)
         ctx = (endpoint_feature_context or {}).get(ref, {})
-        sup_label = _endpoint_supervision_label(rec)
+        # Use the same threshold/weak-activity policy as Interaction and pair-label exports.
+        # Earlier versions exported raw endpoint labels here, which made
+        # node_features_endpoint.csv inconsistent with Endpoint.csv and the
+        # compound-target training pairs.
+        sup_label = _endpoint_supervision_label(
+            rec,
+            activity_threshold_um=activity_threshold_um,
+            weak_activity_as_negative=weak_activity_as_negative,
+        )
         has_numeric = _truthy(rec.get("props_has_numeric_value")) or rec.get("props_value_float") not in (None, "") or rec.get("props_value_molar") not in (None, "")
         rows.append({
             "node_id": node_id_by_ref.get(ref, ""),
@@ -2213,6 +2385,7 @@ def _build_endpoint_feature_rows(
             "outcome_label_normalized": rec.get("props_outcome_label_normalized", ""),
             "activity_flag": rec.get("props_activity_flag", ""),
             "supervision_label": "" if sup_label is None else sup_label,
+            "supervision_label_name": "active" if sup_label == 1 else ("inactive_or_weak" if sup_label == 0 else "ambiguous_or_unlabeled"),
             "score": rec.get("props_score", ""),
             "has_numeric_value": has_numeric,
             "measuregroup_count": ctx.get("measuregroup_count", 0),

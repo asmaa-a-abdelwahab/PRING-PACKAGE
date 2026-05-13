@@ -59,6 +59,83 @@ def _mb_to_bytes(v: Optional[int]) -> Optional[int]:
     return None if v is None else max(0, int(v)) * 1024 * 1024
 
 
+def _read_json_file(path: Path) -> dict:
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        log.debug("Could not read JSON file %s", path, exc_info=True)
+    return {}
+
+
+def _load_run_source_defaults(source_run_dir: Path) -> dict:
+    """Return labeling/export defaults preserved in an existing run.
+
+    Older runs did not store activity-threshold settings in manifest.json, but
+    refreshed CSV exports store them in graph/csv_export_summary.json.  load-run
+    should reuse these values unless the user explicitly overrides them, so
+    rematerialization never silently changes the GCN labels or candidate space.
+    """
+    source_run_dir = Path(source_run_dir)
+    manifest = _read_json_file(source_run_dir / "manifest.json")
+    csv_summary = _read_json_file(source_run_dir / "graph" / "csv_export_summary.json")
+    quality_report = _read_json_file(source_run_dir / "graph" / "run_quality_report.json")
+
+    resources = manifest.get("resources") or {}
+    paths = manifest.get("paths") or {}
+    label_config = (csv_summary.get("label_config") or quality_report.get("label_config") or {})
+    ml_summary = csv_summary.get("ml") or {}
+
+    return {
+        "activity_threshold_um": label_config.get("activity_threshold_um"),
+        "weak_activity_as_negative": label_config.get("weak_activity_as_negative"),
+        "candidate_pair_mode": resources.get("candidate_pair_mode") or ml_summary.get("candidate_missing_pair_mode"),
+        "max_candidate_missing_pairs": resources.get("max_candidate_missing_pairs"),
+        "schema_dot": paths.get("schema_dot"),
+    }
+
+
+def _resolve_existing_path(path_text: object, *, source_run_dir: Path) -> Optional[Path]:
+    if not path_text:
+        return None
+    path = Path(str(path_text))
+    candidates = [path] if path.is_absolute() else [
+        path,
+        Path.cwd() / path,
+        source_run_dir / path,
+        source_run_dir.parent / path,
+        source_run_dir.parent.parent / path,
+    ]
+    return next((c.resolve() for c in candidates if c.exists()), path)
+
+
+def _apply_load_run_source_defaults(settings: Settings, source_run_dir: Path, raw_argv: List[str]) -> Settings:
+    """Preserve source-run label/candidate/schema settings for load-run.
+
+    Explicit CLI flags always win.  This function only fills omitted settings
+    from source manifest/CSV QA artifacts.
+    """
+    defaults = _load_run_source_defaults(source_run_dir)
+    overrides = {}
+    if not _flag_present(raw_argv, "--activity-threshold-um") and defaults.get("activity_threshold_um") is not None:
+        try:
+            overrides["activity_threshold_um"] = float(defaults["activity_threshold_um"])
+        except Exception:
+            pass
+    if not _flag_present(raw_argv, "--weak-activity-as-negative") and defaults.get("weak_activity_as_negative") is not None:
+        overrides["weak_activity_as_negative"] = bool(defaults["weak_activity_as_negative"])
+    if not _flag_present(raw_argv, "--candidate-pair-mode") and defaults.get("candidate_pair_mode") in {"sampled", "all"}:
+        overrides["candidate_pair_mode"] = defaults["candidate_pair_mode"]
+    if not _flag_present(raw_argv, "--max-candidate-missing-pairs") and "max_candidate_missing_pairs" in defaults:
+        overrides["max_candidate_missing_pairs"] = defaults.get("max_candidate_missing_pairs")
+    if not _flag_present(raw_argv, "--schema-dot") and defaults.get("schema_dot"):
+        overrides["schema_dot_path"] = _resolve_existing_path(defaults.get("schema_dot"), source_run_dir=Path(source_run_dir))
+    if overrides:
+        log.info("load-run: preserved source-run defaults for omitted CLI options: %s", sorted(overrides))
+        settings = settings.with_overrides(**overrides)
+    return settings
+
+
 def _min_cap(current: Optional[int], limit: Optional[int]) -> Optional[int]:
     if limit is None:
         return current
@@ -437,6 +514,33 @@ def _load_existing_run_to_neo4j(
     if source_run_dir.resolve() != store.run_dir.resolve():
         _copy_existing_run_artifacts(source_run_dir, store.run_dir)
         log.info("Copied canonical artifacts from %s to %s before rematerialization.", source_run_dir, store.run_dir)
+
+    # Persist the effective load-run settings in the target manifest so QA reports
+    # can resolve schema files and explain which label/candidate policy was used.
+    manifest_path = store.run_dir / "manifest.json"
+    load_manifest = _read_json_file(manifest_path)
+    load_manifest.setdefault("paths", {})
+    if settings.schema_dot_path:
+        schema_path = _resolve_existing_path(settings.schema_dot_path, source_run_dir=source_run_dir) or Path(settings.schema_dot_path)
+        load_manifest["paths"]["schema_dot"] = str(schema_path)
+        if schema_path.exists():
+            local_schema_dir = store.run_dir / "schema"
+            local_schema_dir.mkdir(parents=True, exist_ok=True)
+            local_schema_path = local_schema_dir / schema_path.name
+            try:
+                shutil.copy2(schema_path, local_schema_path)
+                load_manifest["paths"]["schema_dot_local_copy"] = str(local_schema_path)
+            except Exception:
+                log.debug("Could not copy schema DOT into run folder", exc_info=True)
+    load_manifest["label_config"] = {
+        "activity_threshold_um": settings.activity_threshold_um,
+        "weak_activity_as_negative": settings.weak_activity_as_negative,
+    }
+    load_manifest["candidate_pair_config"] = {
+        "candidate_pair_mode": settings.candidate_pair_mode,
+        "max_candidate_missing_pairs": settings.max_candidate_missing_pairs,
+    }
+    manifest_path.write_text(json.dumps(load_manifest, indent=2, ensure_ascii=False), encoding="utf-8")
 
     node_count_before = _count_jsonl_files(store.nodes_dir)
     rel_count_before = _count_jsonl_files(store.rels_dir)
@@ -1303,6 +1407,9 @@ def main(argv: Optional[List[str]] = None) -> None:
         enrichment_overrides["prott5_model_name"] = str(args.prott5_model_name).strip()
     settings = settings.with_overrides(**enrichment_overrides)
 
+    if getattr(args, "cmd", None) == "load-run":
+        settings = _apply_load_run_source_defaults(settings, Path(args.run_dir), raw_argv)
+
     guard = ResourceGuard.from_settings(settings)
     log.info("Resource guard: %s", guard.describe())
     guard.checkpoint("configured", force=True)
@@ -1443,6 +1550,14 @@ def main(argv: Optional[List[str]] = None) -> None:
             "save_raw_http_cache": settings.save_raw_http_cache,
             "save_extracted_artifacts": settings.save_extracted_artifacts,
             "batch_size": settings.batch_size,
+            "candidate_pair_mode": getattr(settings, "candidate_pair_mode", "sampled"),
+            "max_candidate_missing_pairs": getattr(settings, "max_candidate_missing_pairs", None),
+        },
+        "label_config": {
+            "activity_threshold_um": settings.activity_threshold_um,
+            "weak_activity_as_negative": settings.weak_activity_as_negative,
+        },
+        "candidate_pair_config": {
             "candidate_pair_mode": getattr(settings, "candidate_pair_mode", "sampled"),
             "max_candidate_missing_pairs": getattr(settings, "max_candidate_missing_pairs", None),
         },
