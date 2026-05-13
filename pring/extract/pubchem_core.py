@@ -424,6 +424,7 @@ def iter_graph_records(rows: Iterable[PubChemRow]) -> Iterator[Tuple[str, Dict]]
                 "cooc_id": cooc_id,
                 "score": d.get("score"),
                 "sentence_count": d.get("sentence_count"),
+                "score_type": d.get("score_type"),
                 "mention_context": d.get("mention_context"),
                 "association_type": d.get("association_type"),
                 "evidence_level": d.get("evidence_level") or "text_mined",
@@ -864,6 +865,9 @@ def _compound_neighbor_target(payload: Any) -> tuple[int | None, Dict[str, Any]]
     if isinstance(payload, dict):
         rel_props = {
             "score": payload.get("score"),
+            "edge_weight": payload.get("edge_weight") or payload.get("score"),
+            "score_type": payload.get("score_type"),
+            "tanimoto": payload.get("tanimoto"),
             "method": payload.get("method"),
             "relation_source": payload.get("relation_source"),
             "threshold": payload.get("threshold"),

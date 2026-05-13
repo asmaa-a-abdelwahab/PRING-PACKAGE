@@ -1,0 +1,6 @@
+# Optional dependencies for ESM/ProtT5 transformer protein embeddings.
+# Install these only in the environment that will run --plugins esm/prott5.
+torch
+transformers
+sentencepiece
+protobuf

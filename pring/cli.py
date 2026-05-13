@@ -37,6 +37,20 @@ def _parse_int_or_none(v: Optional[str]) -> Optional[int]:
     return int(v)
 
 
+def _parse_str_tuple(value: Optional[str], *, default: tuple[str, ...] = ()) -> tuple[str, ...]:
+    if value is None:
+        return default
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in str(value).replace(";", ",").split(","):
+        item = part.strip().lower().replace("-", "_")
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return tuple(out) or default
+
+
 def _flag_present(raw_argv: List[str], flag: str) -> bool:
     return flag in raw_argv
 
@@ -889,6 +903,20 @@ def _add_shared_args(parser: argparse.ArgumentParser, *, default_suppress: bool 
                         help="Optional local BindingDB CSV/TSV mapping file for BindingDB enrichment.")
     parser.add_argument("--drugbank-file", type=str, default=default,
                         help="Optional local DrugBank CSV/TSV mapping file. DrugBank online API requires licensed/authenticated access, so PRING imports local mappings.")
+    parser.add_argument("--protein-embedding-models", type=str, default=default,
+                        help="Comma-separated protein embedding models to emit when embedding plugins are requested. Supported: aa_composition, esm2, prott5. Default: aa_composition.")
+    parser.add_argument("--protein-embedding-device", type=str, default=default,
+                        help="Device for optional transformer embeddings: auto, cpu, cuda, cuda:0, etc. Default: auto.")
+    parser.add_argument("--protein-embedding-cache-dir", type=str, default=default,
+                        help="Optional Hugging Face cache directory for ESM/ProtT5 model files.")
+    parser.add_argument("--protein-embedding-local-files-only", type=str, choices=["true", "false"], default=default,
+                        help="Load ESM/ProtT5 only from local cache. Useful for offline HPC jobs after pre-downloading models.")
+    parser.add_argument("--protein-embedding-max-length", type=int, default=default,
+                        help="Maximum amino-acid tokens passed to transformer embedding models. CYP450 sequences fit under the default 1024.")
+    parser.add_argument("--esm-model-name", type=str, default=default,
+                        help="Hugging Face ESM/ESM2 model name. Default: facebook/esm2_t6_8M_UR50D.")
+    parser.add_argument("--prott5-model-name", type=str, default=default,
+                        help="Hugging Face ProtT5 model name. Default: Rostlab/prot_t5_xl_uniref50.")
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -1259,6 +1287,20 @@ def main(argv: Optional[List[str]] = None) -> None:
         enrichment_overrides["bindingdb_file"] = Path(args.bindingdb_file)
     if getattr(args, "drugbank_file", None):
         enrichment_overrides["drugbank_file"] = Path(args.drugbank_file)
+    if getattr(args, "protein_embedding_models", None):
+        enrichment_overrides["protein_embedding_models"] = _parse_str_tuple(args.protein_embedding_models, default=settings.protein_embedding_models)
+    if getattr(args, "protein_embedding_device", None):
+        enrichment_overrides["protein_embedding_device"] = str(args.protein_embedding_device).strip() or settings.protein_embedding_device
+    if getattr(args, "protein_embedding_cache_dir", None):
+        enrichment_overrides["protein_embedding_cache_dir"] = Path(args.protein_embedding_cache_dir)
+    if getattr(args, "protein_embedding_local_files_only", None) is not None:
+        enrichment_overrides["protein_embedding_local_files_only"] = args.protein_embedding_local_files_only == "true"
+    if getattr(args, "protein_embedding_max_length", None) is not None:
+        enrichment_overrides["protein_embedding_max_length"] = int(args.protein_embedding_max_length)
+    if getattr(args, "esm_model_name", None):
+        enrichment_overrides["esm_model_name"] = str(args.esm_model_name).strip()
+    if getattr(args, "prott5_model_name", None):
+        enrichment_overrides["prott5_model_name"] = str(args.prott5_model_name).strip()
     settings = settings.with_overrides(**enrichment_overrides)
 
     guard = ResourceGuard.from_settings(settings)

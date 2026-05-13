@@ -387,7 +387,12 @@ def iter_pubmed_textmining_rows(
                 "gene_symbol": target.get("gene_symbol"),
                 "reference_id": reference_id,
                 "pmid": pmid,
-                "score": None,
+                # Deterministic weak score for PubMed fallback. This prevents
+                # pair-level ML exports from carrying empty score columns while
+                # still making the weak-evidence nature explicit. Curated assay
+                # labels remain separate and are never replaced by this score.
+                "score": 0.25,
+                "score_type": "pubmed_fallback_weak_cooccurrence",
                 "sentence_count": 1,
                 "mention_context": context[:1000] if context else None,
                 "association_type": "compound-target title/abstract cooccurrence",

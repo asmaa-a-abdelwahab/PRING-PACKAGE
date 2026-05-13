@@ -11,7 +11,7 @@ from typing import Any, Dict, Iterable, Optional, Iterator
 import gc
 
 from pring.transform.target_normalization import normalize_node_record
-from pring.transform.endpoint_normalization import normalize_endpoint_node_record
+from pring.transform.endpoint_normalization import normalize_endpoint_node_record, normalize_endpoint_props
 from pring.transform.metadata_normalization import normalize_metadata_node_record
 
 
@@ -248,6 +248,7 @@ class RunStore:
         optional_layer_report = _optional_layer_report(unique_node_counts, unique_relationship_counts, self.run_dir)
         schema_alignment_report = _schema_alignment_report(unique_node_counts, unique_relationship_counts, self.run_dir)
         feature_completeness_report = _feature_completeness_report(self.nodes_dir, self.rels_dir, unique_node_counts, unique_relationship_counts)
+        cap_completeness_report = _cap_completeness_report(self.run_dir)
 
         ml_summary = (csv_summary or {}).get("ml", {}) if isinstance(csv_summary, dict) else {}
         report = {
@@ -268,6 +269,7 @@ class RunStore:
             "optional_layer_report": optional_layer_report,
             "schema_alignment_report": schema_alignment_report,
             "feature_completeness_report": feature_completeness_report,
+            "cap_completeness_report": cap_completeness_report,
             "observed_compound_target_pairs": ml_summary.get("observed_compound_target_pairs"),
             "candidate_missing_compound_target_pairs": ml_summary.get("candidate_missing_compound_target_pairs"),
             "positive_compound_target_pairs": ml_summary.get("positive_compound_target_pairs"),
@@ -290,6 +292,7 @@ class RunStore:
                 "compound_smiles_missing": bool(feature_completeness_report.get("compound", {}).get("compounds_missing_smiles", 0)),
                 "molgraph_fingerprints_missing": bool(feature_completeness_report.get("compound", {}).get("molgraph_compounds_missing_fingerprint", 0)),
                 "protein_sequence_missing": bool(feature_completeness_report.get("protein", {}).get("proteins_missing_sequence_or_uniprot_length", 0)),
+                "capped_test_run": cap_completeness_report.get("data_completeness_status") == "capped_test_run",
             },
         }
         self.graph_dir.mkdir(parents=True, exist_ok=True)
@@ -879,6 +882,12 @@ class RunStore:
                 label = _stringify_cell(merged.get("label") or path.stem)
                 key = merged.get("key") or {}
                 props = merged.get("props") or {}
+                if label == "Endpoint":
+                    # Final defensive normalization after merging duplicate
+                    # Endpoint node records. This prevents an earlier stale
+                    # has_numeric_value=false from surviving into Neo4j CSVs.
+                    props = normalize_endpoint_props(props, key)
+                    merged["props"] = props
                 if ref not in node_id_by_ref:
                     node_id_by_ref[ref] = next_node_id
                     next_node_id += 1
@@ -937,6 +946,17 @@ class RunStore:
                 start = rec.get("start") or {}
                 end = rec.get("end") or {}
                 props = rec.get("props") or {}
+                if schema_label == "SIMILAR_TO":
+                    props = dict(props)
+                    score_val = _as_float(props.get("score"))
+                    if score_val is None:
+                        threshold_val = _as_float(props.get("threshold"))
+                        if threshold_val is not None:
+                            score_val = threshold_val / 100.0 if threshold_val > 1 else threshold_val
+                            props.setdefault("score", score_val)
+                            props.setdefault("score_type", "threshold_lower_bound")
+                    if score_val is not None and props.get("edge_weight") in (None, ""):
+                        props["edge_weight"] = score_val
                 start_ref = _node_ref(start.get("label"), start.get("key") or {})
                 end_ref = _node_ref(end.get("label"), end.get("key") or {})
                 edge_sig = (schema_label, start_ref, end_ref, _props_fingerprint(props))
@@ -1275,6 +1295,54 @@ class RunStore:
 
 
 
+
+def _cap_completeness_report(run_dir: Path) -> Dict[str, Any]:
+    """Report whether extraction was internally capped or intended as complete."""
+    try:
+        manifest = json.loads((Path(run_dir) / "manifest.json").read_text(encoding="utf-8"))
+    except Exception:
+        manifest = {}
+    # Build manifests store caps at top level. load-run manifests may only
+    # point to a source run; in that case preserve the original completeness
+    # status by reading the source manifest as well.
+    settings = manifest.get("settings") if isinstance(manifest, dict) else {}
+    caps = {}
+    if isinstance(manifest, dict) and isinstance(manifest.get("caps"), dict):
+        caps.update(manifest.get("caps") or {})
+    if isinstance(settings, dict) and isinstance(settings.get("caps"), dict):
+        caps.update(settings.get("caps") or {})
+    source_manifest = {}
+    source_dir = manifest.get("source_run_dir") if isinstance(manifest, dict) else None
+    if source_dir:
+        try:
+            source_manifest = json.loads((Path(source_dir) / "manifest.json").read_text(encoding="utf-8"))
+        except Exception:
+            source_manifest = {}
+    if isinstance(source_manifest, dict) and isinstance(source_manifest.get("caps"), dict):
+        caps.update(source_manifest.get("caps") or {})
+    source_settings = source_manifest.get("settings") if isinstance(source_manifest, dict) else {}
+    if isinstance(source_settings, dict) and isinstance(source_settings.get("caps"), dict):
+        caps.update(source_settings.get("caps") or {})
+    cap_keys = [
+        "max_compounds_per_target", "max_targets_per_compound", "max_substances_per_compound",
+        "max_measuregroups_per_target", "max_measuregroups_per_compound", "max_endpoints_per_pair",
+        "max_similar_compounds_per_compound", "max_textmine_records",
+        "max_textmine_records_per_target", "max_textmine_references_per_pair",
+        "max_enrichment_records_per_entity",
+    ]
+    active_caps = {k: caps.get(k) for k in cap_keys if caps.get(k) not in (None, "", "none", "None", 0)}
+    status = "uncapped_or_no_internal_caps_detected" if not active_caps else "capped_test_run"
+    return {
+        "data_completeness_status": status,
+        "active_internal_caps": active_caps,
+        "uncapped_keys_checked": cap_keys,
+        "recommendation": (
+            "Use the run for final biological completeness only if active_internal_caps is empty. "
+            "Capped runs remain valid for package QA, Neo4j import testing, and GCN pipeline validation."
+        ),
+    }
+
+
 def _similarity_quality_report(nodes_dir: Path, rels_dir: Path, node_refs: set[str]) -> Dict[str, Any]:
     """Summarize raw/exportable compound similarity coverage.
 
@@ -1382,6 +1450,7 @@ def _feature_completeness_report(
     molgraph_with_fp = 0
     molgraph_compound_refs_with_fp: set[str] = set()
     fingerprint_method_counts: Dict[str, int] = {}
+    fingerprint_method_counts_all_rows: Dict[str, int] = {}
     for rec in _read_jsonl(nodes_dir / "Compound.jsonl"):
         cid = _as_int((rec.get("key") or {}).get("cid") or (rec.get("props") or {}).get("cid"))
         if cid is not None:
@@ -1402,8 +1471,9 @@ def _feature_completeness_report(
         props = rec.get("props") or {}
         has_fp = _truthy(props.get("fingerprint_available")) or any(re.fullmatch(r"fp_\d+", str(k)) for k in props)
         method = str(props.get("fingerprint_method") or "missing").strip() or "missing"
-        fingerprint_method_counts[method] = fingerprint_method_counts.get(method, 0) + 1
+        fingerprint_method_counts_all_rows[method] = fingerprint_method_counts_all_rows.get(method, 0) + 1
         if has_fp:
+            fingerprint_method_counts[method] = fingerprint_method_counts.get(method, 0) + 1
             molgraph_with_fp += 1
             cid = _as_int(props.get("cid") or props.get("raw_cid") or (rec.get("key") or {}).get("cid"))
             if cid is None:
@@ -1453,6 +1523,7 @@ def _feature_completeness_report(
             "molgraph_compounds_missing_fingerprint": max(0, len(compound_refs) - len(molgraph_compound_refs_with_fp)),
             "molgraph_rows_missing_fingerprint": max(0, molgraph_rows - molgraph_with_fp),
             "fingerprint_method_counts": dict(sorted(fingerprint_method_counts.items())),
+            "fingerprint_method_counts_all_molgraph_rows": dict(sorted(fingerprint_method_counts_all_rows.items())),
             "rdkit_available_in_export": any(str(k).startswith("rdkit") for k in fingerprint_method_counts),
             "fallback_fingerprint_rows": sum(v for k, v in fingerprint_method_counts.items() if "fallback" in str(k)),
             "similar_to_edges": int(relationship_counts.get("SIMILAR_TO", 0)),
@@ -1938,7 +2009,14 @@ def _build_textmine_pair_features(
             proteins.update(gene_to_proteins.get(gene_ref, set()))
         if not compounds or not proteins:
             continue
-        score = _as_float((node_records_by_ref.get(cooc_ref, {}) or {}).get("props_score"))
+        cooc_rec = node_records_by_ref.get(cooc_ref, {}) or {}
+        score = _as_float(cooc_rec.get("props_score"))
+        # Older PubMed fallback runs may have no explicit score. Use a stable
+        # weak-evidence score so textmine_score_max/mean are usable ML features
+        # instead of NaN/blank. Evidence remains weak and separated from curated
+        # PubChem activity labels.
+        if score is None:
+            score = 0.25 if (cooc_rec.get("props_evidence_level") or "").startswith("text_mined") else 0.1
         refs = set(cooc_to_refs.get(cooc_ref, set()))
         for c_ref in compounds:
             for p_ref in proteins:
@@ -2023,6 +2101,7 @@ def _build_protein_feature_rows(
         acc = _uniprot_acc_from_protein_id(protein_id)
         uniprot = node_records_by_ref.get(_node_ref("UniProt", {"uniprot_acc": acc}), {}) if acc else {}
         embed = node_records_by_ref.get(_node_ref("ProtEmbed", {"embedding_id": f"protembed:{acc}:aa_composition_v1"}), {}) if acc else {}
+        all_embeds = _protein_embedding_records_for_acc(node_records_by_ref, acc) if acc else []
         out = {
             "node_id": node_id_by_ref.get(ref, ""),
             "node_ref": ref,
@@ -2053,8 +2132,44 @@ def _build_protein_feature_rows(
             for k, v in side.items():
                 if k.startswith("props_") and k not in {"props_function", "props_raw"}:
                     out[f"{source_name}_{k[6:]}"] = v
+        out["protein_embedding_node_count"] = len(all_embeds)
+        out["protein_embedding_methods"] = " | ".join(sorted({e.get("props_method", "") for e in all_embeds if e.get("props_method")}))
+        for emb_rec in all_embeds:
+            method = _safe_feature_prefix(str(emb_rec.get("props_method") or emb_rec.get("key_embedding_id") or "embedding"))
+            # Export transformer dimensions and useful metadata with a stable,
+            # method-specific prefix. This supports multiple embeddings per
+            # protein, e.g. aa_composition + ESM2 + ProtT5, without overwriting.
+            for k, v in emb_rec.items():
+                if not k.startswith("props_"):
+                    continue
+                raw = k[6:]
+                if raw in {"raw", "source"}:
+                    continue
+                if raw.startswith("emb_") or raw.startswith("aa_") or raw.startswith("freq_") or raw in {"dim", "sequence_length", "hydrophobic_fraction", "charged_fraction", "model_family", "model_name", "pooling", "version", "truncated_to"}:
+                    out[f"protembed_{method}_{raw}"] = v
         rows.append(out)
     return rows
+
+
+def _protein_embedding_records_for_acc(node_records_by_ref: dict[str, dict[str, str]], acc: str) -> list[dict[str, str]]:
+    if not acc:
+        return []
+    acc_text = str(acc).strip()
+    prefix = f"protembed:{acc_text}:"
+    rows: list[dict[str, str]] = []
+    for ref, rec in node_records_by_ref.items():
+        if rec.get("label") != "ProtEmbed":
+            continue
+        _, key = _parse_node_ref(ref)
+        embedding_id = str(key.get("embedding_id") or rec.get("key_embedding_id") or rec.get("props_embedding_id") or "")
+        if str(rec.get("props_uniprot_acc") or "").strip() == acc_text or embedding_id.startswith(prefix):
+            rows.append(rec)
+    return sorted(rows, key=lambda r: str(r.get("props_method") or r.get("key_embedding_id") or ""))
+
+
+def _safe_feature_prefix(value: str) -> str:
+    text = re.sub(r"[^0-9A-Za-z]+", "_", str(value or "").strip()).strip("_").lower()
+    return text[:120] or "embedding"
 
 
 def _uniprot_acc_from_protein_id(protein_id: str) -> str:

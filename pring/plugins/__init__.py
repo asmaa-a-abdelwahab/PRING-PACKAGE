@@ -18,6 +18,12 @@ PLUGIN_ALIASES: Dict[str, str] = {
     "alphafold": "pring.plugins.alphafold:get_plugin",
     "embeddings": "pring.plugins.embeddings:get_plugin",
     "protembed": "pring.plugins.embeddings:get_plugin",
+    "esm": "pring.plugins.esm:get_plugin",
+    "esm2": "pring.plugins.esm:get_plugin",
+    "prott5": "pring.plugins.prott5:get_plugin",
+    "prot_t5": "pring.plugins.prott5:get_plugin",
+    "transformer_embeddings": "pring.plugins.transformer_embeddings:get_plugin",
+    "transformers": "pring.plugins.transformer_embeddings:get_plugin",
     "molgraph": "pring.plugins.molgraph:get_plugin",
     "all": "pring.plugins.external:make_all_plugin",
 }

@@ -174,6 +174,17 @@ class Settings:
     bindingdb_file: Optional[Path] = None
     drugbank_file: Optional[Path] = None
 
+    # Optional transformer protein embeddings. These are intentionally disabled
+    # unless the user explicitly requests an ESM/ProtT5 plugin/model so normal
+    # PRING runs remain lightweight and do not require torch/transformers.
+    protein_embedding_models: Tuple[str, ...] = ("aa_composition",)
+    protein_embedding_device: str = "auto"  # auto | cpu | cuda | cuda:0 ...
+    protein_embedding_cache_dir: Optional[Path] = None
+    protein_embedding_local_files_only: bool = False
+    protein_embedding_max_length: int = 1024
+    esm_model_name: str = "facebook/esm2_t6_8M_UR50D"
+    prott5_model_name: str = "Rostlab/prot_t5_xl_uniref50"
+
     def with_overrides(self, **kwargs: Any) -> "Settings":
         return replace(self, **kwargs)
 
@@ -253,6 +264,7 @@ class Settings:
         textmining_file = os.getenv("PRING_TEXTMINING_FILE")
         bindingdb_file = os.getenv("PRING_BINDINGDB_FILE")
         drugbank_file = os.getenv("PRING_DRUGBANK_FILE")
+        protein_embedding_cache_dir = os.getenv("PRING_PROTEIN_EMBEDDING_CACHE_DIR")
 
         return Settings(
             neo4j=neo,
@@ -282,6 +294,13 @@ class Settings:
             max_enrichment_records_per_entity=_int_or_none(os.getenv("PRING_MAX_ENRICHMENT_RECORDS_PER_ENTITY"), 50),
             bindingdb_file=Path(bindingdb_file) if bindingdb_file else None,
             drugbank_file=Path(drugbank_file) if drugbank_file else None,
+            protein_embedding_models=_parse_str_tuple(os.getenv("PRING_PROTEIN_EMBEDDING_MODELS", "aa_composition"), default=("aa_composition",)),
+            protein_embedding_device=os.getenv("PRING_PROTEIN_EMBEDDING_DEVICE", "auto").strip() or "auto",
+            protein_embedding_cache_dir=Path(protein_embedding_cache_dir) if protein_embedding_cache_dir else None,
+            protein_embedding_local_files_only=_parse_bool(os.getenv("PRING_PROTEIN_EMBEDDING_LOCAL_FILES_ONLY"), False),
+            protein_embedding_max_length=int(os.getenv("PRING_PROTEIN_EMBEDDING_MAX_LENGTH", "1024")),
+            esm_model_name=os.getenv("PRING_ESM_MODEL_NAME", "facebook/esm2_t6_8M_UR50D").strip() or "facebook/esm2_t6_8M_UR50D",
+            prott5_model_name=os.getenv("PRING_PROTT5_MODEL_NAME", "Rostlab/prot_t5_xl_uniref50").strip() or "Rostlab/prot_t5_xl_uniref50",
         )
 
 
@@ -289,6 +308,20 @@ def _parse_bool(v: Optional[str], default: bool) -> bool:
     if v is None:
         return default
     return v.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _parse_str_tuple(v: Optional[str], *, default: Tuple[str, ...] = ()) -> Tuple[str, ...]:
+    if v is None:
+        return default
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in str(v or "").replace(";", ",").split(","):
+        item = part.strip().lower().replace("-", "_")
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return tuple(out) or default
 
 
 def _parse_taxids(v: str) -> Optional[Tuple[int, ...]]:

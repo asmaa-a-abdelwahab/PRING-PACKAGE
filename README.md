@@ -1527,3 +1527,34 @@ graph/bindingdb_report.json
 ```
 
 For final GCN training, the most important QA checks are: no dangling relationships, non-zero interaction labels, complete candidate-pair export or a documented candidate cap, SMILES/fingerprint coverage, UniProt/GO/Reactome/InterPro coverage, and clear separation between curated evidence and text-mined weak associations.
+
+
+## Optional transformer protein embeddings
+
+PRING supports optional ESM/ESM2 and ProtT5 protein embedding plugins for final CYP450 GCN/link-prediction runs. They are not enabled by `--plugins all` because they require heavy optional dependencies and Hugging Face model files.
+
+Install optional dependencies only on the environment where you need transformer embeddings:
+
+```bash
+pip install -r requirements-embeddings.txt
+```
+
+Enable ESM2:
+
+```bash
+python -m pring build \
+  --plugins all esm \
+  --protein-embedding-models aa_composition,esm2 \
+  --protein-embedding-device auto
+```
+
+Enable ESM2 + ProtT5:
+
+```bash
+python -m pring build \
+  --plugins all transformer_embeddings \
+  --protein-embedding-models aa_composition,esm2,prott5 \
+  --protein-embedding-device cuda
+```
+
+For offline HPC jobs, use `--protein-embedding-cache-dir` and `--protein-embedding-local-files-only true`. See `docs/OPTIONAL_TRANSFORMER_PROTEIN_EMBEDDINGS.md` for details.

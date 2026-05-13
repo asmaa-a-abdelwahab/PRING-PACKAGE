@@ -13,6 +13,7 @@ import csv
 import hashlib
 import json
 import logging
+import math
 import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set
@@ -43,17 +44,26 @@ def iter_external_enrichment_rows(
     """Yield external enrichment rows for requested layers.
 
     Layers are lowercase plugin names, for example ``uniprot``, ``go``,
-    ``reactome``, ``interpro``, ``pdb``, ``alphafold``, ``embeddings``,
+    ``reactome``, ``interpro``, ``pdb``, ``alphafold``, ``embeddings``/``esm``/``prott5``,
     ``molgraph``, ``chembl``, ``bindingdb``, and ``drugbank``.
     """
     requested = {str(x).strip().lower() for x in layers if str(x).strip()}
     if "all" in requested:
+        # Keep heavy transformer embeddings out of the default all-plugin path.
+        # Users can opt in with --plugins esm prott5 or
+        # --plugins transformer_embeddings.
         requested.update({
             "uniprot", "go", "reactome", "interpro", "pdb", "alphafold",
             "embeddings", "protembed", "molgraph", "chembl", "bindingdb", "drugbank",
         })
     if "protembed" in requested:
         requested.add("embeddings")
+    if "esm2" in requested:
+        requested.add("esm")
+    if "prot_t5" in requested:
+        requested.add("prott5")
+    if "transformer_embeddings" in requested or "transformers" in requested:
+        requested.update({"esm", "prott5"})
 
     inputs = load_enrichment_inputs(store)
     cache_dir = (settings.cache_dir / "external_enrichment") if getattr(settings, "save_raw_http_cache", True) else None
@@ -80,7 +90,17 @@ def iter_external_enrichment_rows(
         # Protein-centric annotations mostly come from a single UniProtKB JSON
         # response, avoiding repeated calls to GO/Reactome/InterPro/PDB services.
         uniprot_records: Dict[str, Dict[str, Any]] = {}
-        if requested & {"uniprot", "go", "reactome", "interpro", "pdb", "alphafold", "embeddings"}:
+        transformer_requested = bool(requested & {"esm", "prott5", "transformer_embeddings", "transformers"})
+        protein_embedding_report: Dict[str, Any] = {
+            "requested": transformer_requested,
+            "models_requested": [],
+            "models_materialized": {},
+            "models_skipped": {},
+            "rows_emitted": 0,
+            "proteins_seen": len(inputs.proteins),
+        }
+
+        if requested & {"uniprot", "go", "reactome", "interpro", "pdb", "alphafold", "embeddings", "esm", "prott5", "transformer_embeddings", "transformers"}:
             for protein in inputs.proteins:
                 acc = protein.get("uniprot_acc") or _extract_uniprot_acc(protein.get("protein_id"), protein.get("pubchem_uri"))
                 if not acc:
@@ -135,6 +155,23 @@ def iter_external_enrichment_rows(
                     emb = _protein_embedding_row(protein_id, acc, rec)
                     if emb:
                         yield PubChemRow("protembed", emb)
+
+                if transformer_requested:
+                    seq = _protein_sequence_from_uniprot(rec) or str(protein.get("sequence") or "")
+                    for emb in _transformer_embedding_rows(
+                        protein_id=protein_id,
+                        acc=acc,
+                        sequence=seq,
+                        settings=settings,
+                        requested=requested,
+                        report=protein_embedding_report,
+                    ):
+                        protein_embedding_report["rows_emitted"] = int(protein_embedding_report.get("rows_emitted") or 0) + 1
+                        yield PubChemRow("protembed", emb)
+
+        if transformer_requested:
+            protein_embedding_report["status"] = "materialized" if int(protein_embedding_report.get("rows_emitted") or 0) else "skipped_or_unavailable"
+            _write_enrichment_report(store, "protein_embedding_report.json", protein_embedding_report)
 
         if "molgraph" in requested:
             for compound in inputs.compounds:
@@ -523,6 +560,179 @@ def _protein_embedding_row(protein_id: str, acc: str, rec: Dict[str, Any]) -> Op
     }
 
 
+
+_TRANSFORMER_MODEL_CACHE: Dict[tuple[str, str, str, str, bool], Any] = {}
+
+
+def _protein_sequence_from_uniprot(rec: Dict[str, Any]) -> str:
+    seq = ((rec.get("sequence") or {}).get("value") or rec.get("sequence") or "")
+    if isinstance(seq, dict):
+        seq = seq.get("value") or ""
+    return re.sub(r"[^A-Za-z]", "", str(seq).upper())
+
+
+def _transformer_embedding_rows(
+    *,
+    protein_id: str,
+    acc: str,
+    sequence: str,
+    settings: Any,
+    requested: Set[str],
+    report: Dict[str, Any],
+) -> Iterator[Dict[str, Any]]:
+    """Yield optional ESM/ProtT5 embedding rows without hard dependencies.
+
+    This function is deliberately defensive: missing torch/transformers, absent
+    cached model files, GPU memory errors, or Hugging Face download issues are
+    reported in protein_embedding_report.json and do not fail the PRING build.
+    """
+    seq = re.sub(r"[^A-Z]", "", str(sequence or "").upper()).replace("U", "X").replace("Z", "X").replace("O", "X").replace("B", "X")
+    if not seq:
+        _embedding_skip(report, "all", protein_id, "missing_sequence")
+        return
+
+    model_names = {str(x).strip().lower().replace("-", "_") for x in getattr(settings, "protein_embedding_models", ("aa_composition",))}
+    if "esm" in requested or "esm2" in requested:
+        model_names.add("esm2")
+    if "prott5" in requested or "prot_t5" in requested:
+        model_names.add("prott5")
+    if "transformer_embeddings" in requested or "transformers" in requested:
+        model_names.update({"esm2", "prott5"})
+    model_names.discard("aa")
+    model_names.discard("aa_composition")
+    model_names.discard("aa_composition_v1")
+    model_names.discard("")
+
+    supported = [m for m in ("esm2", "prott5") if m in model_names]
+    report["models_requested"] = sorted(set(list(report.get("models_requested") or []) + supported))
+    if not supported:
+        return
+
+    for model_key in supported:
+        model_name = getattr(settings, "esm_model_name", "facebook/esm2_t6_8M_UR50D") if model_key == "esm2" else getattr(settings, "prott5_model_name", "Rostlab/prot_t5_xl_uniref50")
+        try:
+            wrapper = _load_transformer_model(
+                model_key=model_key,
+                model_name=str(model_name),
+                device=str(getattr(settings, "protein_embedding_device", "auto") or "auto"),
+                cache_dir=getattr(settings, "protein_embedding_cache_dir", None),
+                local_files_only=bool(getattr(settings, "protein_embedding_local_files_only", False)),
+            )
+            vector = _embed_sequence_with_transformer(
+                wrapper=wrapper,
+                sequence=seq,
+                model_key=model_key,
+                max_length=int(getattr(settings, "protein_embedding_max_length", 1024) or 1024),
+            )
+        except Exception as exc:
+            log.warning("Optional %s protein embedding skipped for %s (%s): %s", model_key, acc, model_name, exc)
+            _embedding_skip(report, model_key, protein_id, str(exc))
+            continue
+
+        if not vector:
+            _embedding_skip(report, model_key, protein_id, "empty_embedding_vector")
+            continue
+        method = _embedding_method_name(model_key, str(model_name))
+        dims = {f"emb_{i:04d}": round(float(v), 8) for i, v in enumerate(vector)}
+        report.setdefault("models_materialized", {}).setdefault(method, 0)
+        report["models_materialized"][method] += 1
+        yield {
+            "protein_id": protein_id,
+            "uniprot_acc": acc,
+            "embedding_id": f"protembed:{acc}:{method}:mean_pool_v1",
+            "method": method,
+            "model_name": str(model_name),
+            "model_family": model_key,
+            "pooling": "attention_mask_mean_pool",
+            "dim": len(vector),
+            "version": "mean_pool_v1",
+            "sequence_length": len(seq),
+            "truncated_to": min(len(seq), int(getattr(settings, "protein_embedding_max_length", 1024) or 1024)),
+            "device": wrapper.get("device_name"),
+            "storage_uri": None,
+            "source": "Optional Hugging Face transformer protein embedding plugin",
+            **dims,
+        }
+
+
+def _embedding_skip(report: Dict[str, Any], model_key: str, protein_id: str, reason: str) -> None:
+    skipped = report.setdefault("models_skipped", {})
+    skipped.setdefault(model_key, 0)
+    skipped[model_key] += 1
+    examples = report.setdefault("skip_examples", [])
+    if len(examples) < 10:
+        examples.append({"model": model_key, "protein_id": protein_id, "reason": str(reason)[:500]})
+
+
+def _load_transformer_model(
+    *,
+    model_key: str,
+    model_name: str,
+    device: str,
+    cache_dir: Optional[Path],
+    local_files_only: bool,
+) -> Dict[str, Any]:
+    try:
+        import torch  # type: ignore
+        from transformers import AutoModel, AutoTokenizer  # type: ignore
+    except Exception as exc:  # pragma: no cover - optional dependency path
+        raise RuntimeError("torch and transformers are required for optional ESM/ProtT5 embeddings") from exc
+
+    if device == "auto":
+        device_name = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        device_name = device
+    key = (model_key, model_name, device_name, str(cache_dir or ""), bool(local_files_only))
+    if key in _TRANSFORMER_MODEL_CACHE:
+        return _TRANSFORMER_MODEL_CACHE[key]
+
+    kwargs: Dict[str, Any] = {"local_files_only": bool(local_files_only)}
+    if cache_dir:
+        kwargs["cache_dir"] = str(cache_dir)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, **kwargs)
+    model = AutoModel.from_pretrained(model_name, **kwargs)
+    model.eval()
+    model.to(device_name)
+    wrapper = {"torch": torch, "tokenizer": tokenizer, "model": model, "device_name": device_name, "model_key": model_key, "model_name": model_name}
+    _TRANSFORMER_MODEL_CACHE[key] = wrapper
+    return wrapper
+
+
+def _embed_sequence_with_transformer(*, wrapper: Dict[str, Any], sequence: str, model_key: str, max_length: int) -> List[float]:
+    torch = wrapper["torch"]
+    tokenizer = wrapper["tokenizer"]
+    model = wrapper["model"]
+    device_name = wrapper["device_name"]
+    seq = sequence[: max(1, int(max_length))]
+    if model_key == "prott5":
+        # ProtT5 tokenizers expect whitespace-separated amino acids.
+        seq_for_tokenizer = " ".join(list(seq))
+    else:
+        seq_for_tokenizer = seq
+    encoded = tokenizer(seq_for_tokenizer, return_tensors="pt", truncation=True, max_length=max_length)
+    encoded = {k: v.to(device_name) for k, v in encoded.items()}
+    with torch.no_grad():
+        outputs = model(**encoded)
+        hidden = outputs.last_hidden_state
+        mask = encoded.get("attention_mask")
+        if mask is None:
+            pooled = hidden.mean(dim=1)
+        else:
+            mask_f = mask.unsqueeze(-1).to(hidden.dtype)
+            pooled = (hidden * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1.0)
+    vec = pooled.detach().cpu().float().numpy()[0].tolist()
+    # Protect CSV/Neo4j exports from non-finite values.
+    return [0.0 if (not isinstance(v, (int, float)) or not math.isfinite(float(v))) else float(v) for v in vec]
+
+
+def _embedding_method_name(model_key: str, model_name: str) -> str:
+    base = re.sub(r"[^0-9A-Za-z]+", "_", model_name.strip()).strip("_").lower()
+    if model_key == "esm2" and "esm2" not in base:
+        base = "esm2_" + base
+    if model_key == "prott5" and "prot" not in base:
+        base = "prott5_" + base
+    return base[:120]
+
 def _molgraph_rows(client: HttpClient, compound: Dict[str, Any], *, max_records: Optional[int]) -> Iterator[Dict[str, Any]]:
     """Yield molecular descriptor/fingerprint rows for a compound.
 
@@ -730,44 +940,114 @@ def _bindingdb_uniprot_rows(
         log.info("BindingDB returned no ligand records for UniProt %s", acc)
 
     seen = 0
+    skipped_unparseable = 0
     for item in records:
         if not isinstance(item, dict):
+            skipped_unparseable += 1
             continue
-        norm = {_norm_bindingdb_key(k): v for k, v in item.items()}
-        ligand = (
-            norm.get("monomerid")
-            or norm.get("bindingdbmonomerid")
-            or norm.get("bindingdbligandid")
-            or norm.get("ligand")
+        flat = _flatten_bindingdb_record(item)
+        raw_hash = hashlib.sha1(json.dumps(item, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+        ligand = _first_bindingdb_flat_value(
+            flat,
+            "monomerid", "bindingdbmonomerid", "bindingdbligandid", "ligandid",
+            "bdbmonomerid", "bdbprimary", "primary", "ligand", "hitid", "id",
         )
-        cid = (
-            norm.get("pubchemcid")
-            or norm.get("pubchemcids")
-            or norm.get("cid")
-            or norm.get("pubchemcompoundid")
+        cid = _first_bindingdb_flat_value(
+            flat,
+            "pubchemcid", "pubchemcids", "cid", "pubchemcompoundid",
+            "pubchemcompoundcid", "pubchemcid",
         )
-        if not ligand and not cid:
+        smiles = _first_bindingdb_flat_value(flat, "smiles", "ligandsmiles", "canonicalsmiles", "isomericsmiles")
+        affinity_type = _first_bindingdb_flat_value(flat, "affinitytype", "type", "affinitykind")
+        affinity_value = _first_bindingdb_flat_value(flat, "affinity", "affinityvalue", "value", "affinitynm")
+        kd = _first_bindingdb_flat_value(flat, "kd", "kdnm")
+        ki = _first_bindingdb_flat_value(flat, "ki", "kinm")
+        ic50 = _first_bindingdb_flat_value(flat, "ic50", "ic50nm")
+        source_ref = _first_bindingdb_flat_value(flat, "pmid", "pubmedid", "doi", "reference", "articleid")
+
+        # BindingDB's JSON wrappers are not stable across endpoints. If no
+        # explicit ligand id/CID is exposed but the record contains affinity or
+        # ligand fields, still materialize a target-level BindingDB node so the
+        # run does not silently drop API-returned validation evidence. Compound
+        # edges are added only when a PubChem CID can be parsed.
+        if not (ligand or cid or smiles or affinity_value or kd or ki or ic50):
+            skipped_unparseable += 1
             continue
-        ligand_id = str(ligand or f"CID{cid}").strip()
+        ligand_id = str(ligand or (f"CID{cid}" if cid else f"{acc}:{raw_hash}")).strip()
         yield {
             "protein_id": protein_id,
             "cid": _as_int(cid),
             "bindingdb_id": f"BindingDB:{ligand_id}",
             "ligand_id": ligand_id,
             "target_uniprot_acc": acc,
-            "kd": _first_bindingdb_value(norm, "kd", "kdnm"),
-            "ki": _first_bindingdb_value(norm, "ki", "kinm"),
-            "ic50": _first_bindingdb_value(norm, "ic50", "ic50nm"),
-            "affinity_type": _first_bindingdb_value(norm, "affinitytype", "type"),
-            "affinity_value": _first_bindingdb_value(norm, "affinity", "affinityvalue", "value"),
-            "smiles": _first_bindingdb_value(norm, "smiles", "ligandsmiles"),
-            "source_ref": _first_bindingdb_value(norm, "pmid", "pubmedid", "doi", "reference"),
+            "kd": kd,
+            "ki": ki,
+            "ic50": ic50,
+            "affinity_type": affinity_type,
+            "affinity_value": affinity_value,
+            "smiles": smiles,
+            "source_ref": source_ref,
             "source_url": f"https://bindingdb.org/rest/getLigandsByUniprot?uniprot={acc};10000&response=application/json",
             "source": "BindingDB REST getLigandsByUniprot",
+            "parse_status": "compound_mapped" if _as_int(cid) is not None else "target_level_no_pubchem_cid",
+            "raw_record_hash": raw_hash,
+            "raw_flat_key_count": len(flat),
+            "raw_top_level_keys": " | ".join(sorted(str(k) for k in item.keys())[:50]),
         }
         seen += 1
         if max_records is not None and seen >= max_records:
             break
+    if diagnostics is not None:
+        diagnostics["rows_skipped_unparseable"] = skipped_unparseable
+
+
+def _flatten_bindingdb_record(value: Any, prefix: str = "") -> Dict[str, List[Any]]:
+    """Flatten BindingDB's nested/dotted JSON into normalized key -> values."""
+    out: Dict[str, List[Any]] = {}
+
+    def add(path: str, val: Any) -> None:
+        if val in (None, "", "NA", "N/A", []):
+            return
+        path_norm = _norm_bindingdb_key(path)
+        if path_norm:
+            out.setdefault(path_norm, []).append(val)
+        leaf = path.split(".")[-1].split(":")[-1].split("/")[-1]
+        leaf_norm = _norm_bindingdb_key(leaf)
+        if leaf_norm and leaf_norm != path_norm:
+            out.setdefault(leaf_norm, []).append(val)
+
+    def walk(obj: Any, path: str = "") -> None:
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                key = str(k)
+                walk(v, f"{path}.{key}" if path else key)
+        elif isinstance(obj, list):
+            for i, v in enumerate(obj):
+                walk(v, f"{path}.{i}" if path else str(i))
+        else:
+            add(path, obj)
+
+    walk(value, prefix)
+    return out
+
+
+def _first_bindingdb_flat_value(flat: Dict[str, List[Any]], *keys: str) -> Optional[Any]:
+    # Prefer exact normalized keys.
+    for key in keys:
+        vals = flat.get(_norm_bindingdb_key(key))
+        if vals:
+            for val in vals:
+                if val not in (None, "", "NA", "N/A"):
+                    return val
+    # Fallback to suffix/sub-string matches for dotted wrappers such as
+    # bdb.hit.bdb.monomerid or bdb.affinities.0.bdb.ic50.
+    wanted = [_norm_bindingdb_key(k) for k in keys]
+    for norm_key, vals in flat.items():
+        if any(norm_key.endswith(w) or w in norm_key for w in wanted if w):
+            for val in vals:
+                if val not in (None, "", "NA", "N/A"):
+                    return val
+    return None
 
 
 def _bindingdb_records_from_response(data: Any) -> List[Dict[str, Any]]:

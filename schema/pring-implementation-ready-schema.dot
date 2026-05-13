@@ -144,7 +144,7 @@ digraph PRING_Final_ImplementationReady_Thesis {
     PDB       [label="PDBStructure\nkey: pdb_id\nprops: method?, resolution?, chain_map?"];
     AlphaFold [label="AlphaFoldModel\nkey: alphafold_id\nprops: model_version?, confidence_summary?"];
 
-    ProtEmbed [label="ProteinEmbedding\nkey: embedding_id\nprops: method, dim, storage_uri, version"];
+    ProtEmbed [label="ProteinEmbedding\nkey: embedding_id\nprops: method, model_family, model_name, dim, pooling, storage_uri, version, emb_*?"];
     MolGraph  [label="MolecularRepresentation\nkey: repr_id\nprops: SMILES, RDKit/fallback fingerprint bits,\nformula descriptors, method, fp_type?, dim?, version"];
   }
 
@@ -179,8 +179,10 @@ digraph PRING_Final_ImplementationReady_Thesis {
     fontcolor="firebrick4",
     penwidth=1.8,
     minlen=2,
-    label="SIMILAR_TO | HAS_PARENT_COMPOUND | HAS_COMPONENT_COMPOUND\n{score?, method?, relation_source?, threshold?}"
+    label="SIMILAR_TO\n{score?, edge_weight?, score_type?, tanimoto?, method?, relation_source?, threshold?}"
   ];
+  Compound -> Compound [label="HAS_PARENT_COMPOUND", style=dashed];
+  Compound -> Compound [label="HAS_COMPONENT_COMPOUND", style=dashed];
 
   // =========================
   // Evidence backbone

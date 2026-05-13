@@ -95,12 +95,21 @@ def iter_compound_similarity_rows(
                 target_record.setdefault("similarity_expansion", True)
                 yield PubChemRow("compound", target_record)
 
+        # PubChem fastsimilarity returns CIDs above the requested threshold but
+        # does not expose the exact Tanimoto score in this lightweight call. For
+        # GCN exports, still write an explicit numeric edge weight: the threshold
+        # lower bound. If later code computes exact RDKit Tanimoto scores, it can
+        # overwrite ``score``/``edge_weight`` while preserving ``score_type``.
+        threshold_score = float(int(threshold)) / 100.0
         payload = [
             {
                 "cid": int(target_cid),
                 "method": f"fastsimilarity_{method.lower()}",
                 "relation_source": relation_source,
                 "threshold": int(threshold),
+                "score": threshold_score,
+                "edge_weight": threshold_score,
+                "score_type": "threshold_lower_bound",
             }
             for target_cid in target_cids
         ]
