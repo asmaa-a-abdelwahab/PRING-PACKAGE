@@ -4,6 +4,7 @@ import csv
 import hashlib
 import json
 import random
+import re
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Iterator
@@ -26,6 +27,12 @@ ML_PAIR_COLUMNS = [
     "evidence_measuregroups",
     "evidence_endpoints",
     "evidence_count",
+    "assay_count",
+    "reference_count",
+    "textmine_cooc_count",
+    "textmine_reference_count",
+    "textmine_score_max",
+    "textmine_score_mean",
     "positive_endpoint_count",
     "negative_endpoint_count",
     "ambiguous_endpoint_count",
@@ -43,6 +50,10 @@ ML_CANDIDATE_COLUMNS = [
     "split_strategy",
     "candidate_sampling_method",
     "evidence_count",
+    "textmine_cooc_count",
+    "textmine_reference_count",
+    "textmine_score_max",
+    "textmine_score_mean",
 ]
 
 ML_NEGATIVE_COLUMNS = [
@@ -58,6 +69,12 @@ ML_NEGATIVE_COLUMNS = [
     "evidence_measuregroups",
     "evidence_endpoints",
     "evidence_count",
+    "assay_count",
+    "reference_count",
+    "textmine_cooc_count",
+    "textmine_reference_count",
+    "textmine_score_max",
+    "textmine_score_mean",
     "positive_endpoint_count",
     "negative_endpoint_count",
     "ambiguous_endpoint_count",
@@ -152,7 +169,14 @@ class RunStore:
         node_counts: Dict[str, int] = {}
         unique_node_counts: Dict[str, int] = {}
         node_refs: set[str] = set()
+        activity_threshold_um = None
+        weak_activity_as_negative = False
+        if isinstance(csv_summary, dict):
+            label_cfg = csv_summary.get("label_config") or {}
+            activity_threshold_um = label_cfg.get("activity_threshold_um")
+            weak_activity_as_negative = bool(label_cfg.get("weak_activity_as_negative"))
         endpoint_label_distribution = {"positive": 0, "negative": 0, "ambiguous_or_unlabeled": 0}
+        endpoint_label_distribution_thresholded = {"positive": 0, "negative": 0, "ambiguous_or_unlabeled": 0}
         interaction_label_distribution: Dict[str, int] = {}
 
         for path in sorted(self.nodes_dir.glob("*.jsonl")):
@@ -174,6 +198,17 @@ class RunStore:
                         endpoint_label_distribution["negative"] += 1
                     else:
                         endpoint_label_distribution["ambiguous_or_unlabeled"] += 1
+                    endpoint_label_t = _endpoint_supervision_label(
+                        props,
+                        activity_threshold_um=_as_float(activity_threshold_um),
+                        weak_activity_as_negative=weak_activity_as_negative,
+                    )
+                    if endpoint_label_t == 1:
+                        endpoint_label_distribution_thresholded["positive"] += 1
+                    elif endpoint_label_t == 0:
+                        endpoint_label_distribution_thresholded["negative"] += 1
+                    else:
+                        endpoint_label_distribution_thresholded["ambiguous_or_unlabeled"] += 1
                 elif label == "Interaction":
                     ilabel = _stringify_cell(props.get("label") or "missing")
                     interaction_label_distribution[ilabel] = interaction_label_distribution.get(ilabel, 0) + 1
@@ -206,8 +241,13 @@ class RunStore:
                 except Exception:
                     pass
 
+        # QA reports should use unique/exported counts where possible. Raw JSONL
+        # remains available in node_counts_raw/relationship_counts_raw, but GCN
+        # readiness should reflect the deduplicated graph that Neo4j/ML exports use.
         similarity_report = _similarity_quality_report(self.nodes_dir, self.rels_dir, node_refs)
-        optional_layer_report = _optional_layer_report(node_counts, relationship_counts, self.run_dir)
+        optional_layer_report = _optional_layer_report(unique_node_counts, unique_relationship_counts, self.run_dir)
+        schema_alignment_report = _schema_alignment_report(unique_node_counts, unique_relationship_counts, self.run_dir)
+        feature_completeness_report = _feature_completeness_report(self.nodes_dir, self.rels_dir, unique_node_counts, unique_relationship_counts)
 
         ml_summary = (csv_summary or {}).get("ml", {}) if isinstance(csv_summary, dict) else {}
         report = {
@@ -218,9 +258,16 @@ class RunStore:
             "relationship_counts_unique_by_file": unique_relationship_counts,
             "dangling_relationship_counts": dangling_relationship_counts,
             "endpoint_label_distribution": endpoint_label_distribution,
+            "endpoint_label_distribution_thresholded": endpoint_label_distribution_thresholded,
+            "label_config": {
+                "activity_threshold_um": activity_threshold_um,
+                "weak_activity_as_negative": weak_activity_as_negative,
+            },
             "interaction_label_distribution_raw": interaction_label_distribution,
             "similarity_report": similarity_report,
             "optional_layer_report": optional_layer_report,
+            "schema_alignment_report": schema_alignment_report,
+            "feature_completeness_report": feature_completeness_report,
             "observed_compound_target_pairs": ml_summary.get("observed_compound_target_pairs"),
             "candidate_missing_compound_target_pairs": ml_summary.get("candidate_missing_compound_target_pairs"),
             "positive_compound_target_pairs": ml_summary.get("positive_compound_target_pairs"),
@@ -232,12 +279,17 @@ class RunStore:
             "quality_flags": {
                 "has_dangling_relationships": bool(dangling_relationship_counts),
                 "has_dangling_similarity_edges": bool(similarity_report.get("similarity_missing_target_compounds")),
+                "missing_schema_node_labels": schema_alignment_report.get("missing_node_labels", []),
+                "missing_schema_relationship_types": schema_alignment_report.get("missing_relationship_types", []),
                 "all_interactions_unlabeled": (
                     bool(interaction_label_distribution)
                     and sum(v for k, v in interaction_label_distribution.items() if k != "curated_unlabeled") == 0
                 ),
                 "csv_export_complete": bool(stage_markers.get("csv_ml_export.complete")),
                 "derived_schema_complete": bool(stage_markers.get("derived_schema.complete")),
+                "compound_smiles_missing": bool(feature_completeness_report.get("compound", {}).get("compounds_missing_smiles", 0)),
+                "molgraph_fingerprints_missing": bool(feature_completeness_report.get("compound", {}).get("molgraph_compounds_missing_fingerprint", 0)),
+                "protein_sequence_missing": bool(feature_completeness_report.get("protein", {}).get("proteins_missing_sequence_or_uniprot_length", 0)),
             },
         }
         self.graph_dir.mkdir(parents=True, exist_ok=True)
@@ -491,6 +543,35 @@ class RunStore:
                 props = dict(rec.get("props") or {})
                 existing_node_props_by_ref[ref] = _merge_nonempty(existing_node_props_by_ref.get(ref, {}), props)
         existing_nodes = set(existing_node_props_by_ref)
+
+        # Persist deterministic endpoint supervision fields to Endpoint nodes so
+        # Neo4j/CSV/ML users can inspect exactly why an endpoint was treated as
+        # active, inactive, or ambiguous under the configured CYP450 threshold.
+        endpoint_label_updates = 0
+        for endpoint_ref, props in list(existing_node_props_by_ref.items()):
+            label_name, endpoint_key = _parse_node_ref(endpoint_ref)
+            if label_name != "Endpoint":
+                continue
+            endpoint_label = _endpoint_supervision_label(
+                props,
+                activity_threshold_um=activity_threshold_um,
+                weak_activity_as_negative=weak_activity_as_negative,
+            )
+            endpoint_id = endpoint_key.get("endpoint_id") or props.get("endpoint_id")
+            if not endpoint_id:
+                continue
+            derived_label = "active" if endpoint_label == 1 else ("inactive_or_weak" if endpoint_label == 0 else "ambiguous_or_unlabeled")
+            update_props = {
+                "endpoint_id": endpoint_id,
+                "supervision_label": endpoint_label if endpoint_label is not None else "unknown",
+                "supervision_label_name": derived_label,
+                "activity_threshold_um": activity_threshold_um,
+                "weak_activity_as_negative": bool(weak_activity_as_negative),
+                "label_rule": "derived by PRING endpoint supervision labeler",
+            }
+            self.save_node({"label": "Endpoint", "key": {"endpoint_id": endpoint_id}, "props": update_props})
+            existing_node_props_by_ref[endpoint_ref] = _merge_nonempty(props, update_props)
+            endpoint_label_updates += 1
 
         # Materialize Organism context required by the schema. When PubChem has
         # not returned explicit MeasureGrp->Organism rows, infer human context
@@ -832,6 +913,16 @@ class RunStore:
         substance_to_compound: dict[str, str] = {}
         mg_to_endpoints: dict[str, set[str]] = {}
         mg_to_proteins: dict[str, set[str]] = {}
+        mg_to_assays: dict[str, set[str]] = {}
+        endpoint_to_refs: dict[str, set[str]] = {}
+        endpoint_to_mgs: dict[str, set[str]] = {}
+        compound_similarity_degree: dict[str, int] = {}
+        protein_annotation_maps: dict[str, dict[str, set[str]]] = {}
+        cooc_to_compounds: dict[str, set[str]] = {}
+        cooc_to_proteins: dict[str, set[str]] = {}
+        cooc_to_genes: dict[str, set[str]] = {}
+        cooc_to_refs: dict[str, set[str]] = {}
+        gene_to_proteins: dict[str, set[str]] = {}
         seen_edge_keys: set[tuple[str, str, str, str]] = set()
         similarity_components = _UnionFind()
 
@@ -893,6 +984,27 @@ class RunStore:
                     mg_to_endpoints=mg_to_endpoints,
                     mg_to_proteins=mg_to_proteins,
                 )
+                if schema_label in {"HAS_ENDPOINT", "HAS_OUTPUT"} and start_label_text == "MeasureGrp" and end_label_text == "Endpoint":
+                    endpoint_to_mgs.setdefault(end_ref, set()).add(start_ref)
+                elif schema_label == "HAS_MEASURE_GROUP" and start_label_text == "BioAssay" and end_label_text == "MeasureGrp":
+                    mg_to_assays.setdefault(end_ref, set()).add(start_ref)
+                elif schema_label == "SUPPORTED_BY" and start_label_text == "Endpoint" and end_label_text == "Reference":
+                    endpoint_to_refs.setdefault(start_ref, set()).add(end_ref)
+                elif schema_label == "SIMILAR_TO" and start_label_text == "Compound" and end_label_text == "Compound":
+                    compound_similarity_degree[start_ref] = compound_similarity_degree.get(start_ref, 0) + 1
+                    compound_similarity_degree[end_ref] = compound_similarity_degree.get(end_ref, 0) + 1
+                elif start_label_text == "Protein" and schema_label in {"HAS_UNIPROT_RECORD", "HAS_INTERPRO_DOMAIN", "HAS_GO_ANNOTATION", "MAPS_TO_REACTOME_PATHWAY", "HAS_PDB_STRUCTURE", "HAS_ALPHAFOLD_MODEL", "HAS_BINDINGDB_TARGET_RECORD"}:
+                    protein_annotation_maps.setdefault(start_ref, {}).setdefault(schema_label, set()).add(end_ref)
+                elif schema_label == "ENCODED_BY" and start_label_text == "Protein" and end_label_text == "Gene":
+                    gene_to_proteins.setdefault(end_ref, set()).add(start_ref)
+                elif schema_label == "MENTIONS_COMPOUND" and start_label_text == "Cooc" and end_label_text == "Compound":
+                    cooc_to_compounds.setdefault(start_ref, set()).add(end_ref)
+                elif schema_label == "MENTIONS_PROTEIN" and start_label_text == "Cooc" and end_label_text == "Protein":
+                    cooc_to_proteins.setdefault(start_ref, set()).add(end_ref)
+                elif schema_label == "MENTIONS_GENE" and start_label_text == "Cooc" and end_label_text == "Gene":
+                    cooc_to_genes.setdefault(start_ref, set()).add(end_ref)
+                elif schema_label == "FOUND_IN_REFERENCE" and start_label_text == "Cooc" and end_label_text == "Reference":
+                    cooc_to_refs.setdefault(start_ref, set()).add(end_ref)
 
             out = self.rels_csv_dir / f"{path.stem}.csv"
             _write_rows_csv(out, rel_rows)
@@ -903,6 +1015,20 @@ class RunStore:
             gc.collect()
             if guard is not None:
                 guard.checkpoint(f"csv-rels:{path.stem}:written", force=True)
+
+        textmine_pair_features = _build_textmine_pair_features(
+            node_records_by_ref,
+            cooc_to_compounds=cooc_to_compounds,
+            cooc_to_proteins=cooc_to_proteins,
+            cooc_to_genes=cooc_to_genes,
+            cooc_to_refs=cooc_to_refs,
+            gene_to_proteins=gene_to_proteins,
+        )
+        endpoint_feature_context = _build_endpoint_feature_context(
+            endpoint_to_mgs=endpoint_to_mgs,
+            endpoint_to_refs=endpoint_to_refs,
+            mg_to_assays=mg_to_assays,
+        )
 
         for mg_idx, (mg_ref, endpoint_refs) in enumerate(mg_to_endpoints.items(), start=1):
             if guard is not None and mg_idx % 100 == 0:
@@ -929,9 +1055,13 @@ class RunStore:
                         "positive_endpoints": set(),
                         "negative_endpoints": set(),
                         "ambiguous_endpoints": set(),
+                        "evidence_assays": set(),
+                        "evidence_references": set(),
                     })
                     rec["evidence_measuregroups"].add(mg_ref)
                     rec["evidence_endpoints"].add(endpoint_ref)
+                    rec["evidence_assays"].update(mg_to_assays.get(mg_ref, set()))
+                    rec["evidence_references"].update(endpoint_to_refs.get(endpoint_ref, set()))
                     if endpoint_label == 1:
                         rec["positive_endpoints"].add(endpoint_ref)
                     elif endpoint_label == 0:
@@ -988,6 +1118,11 @@ class RunStore:
                 "evidence_measuregroups": " | ".join(sorted(rec["evidence_measuregroups"])),
                 "evidence_endpoints": " | ".join(sorted(rec["evidence_endpoints"])),
                 "evidence_count": len(rec["evidence_endpoints"]),
+                "evidence_assays": " | ".join(sorted(rec.get("evidence_assays", set()))),
+                "evidence_references": " | ".join(sorted(rec.get("evidence_references", set()))),
+                "assay_count": len(rec.get("evidence_assays", set())),
+                "reference_count": len(rec.get("evidence_references", set())),
+                **_textmine_feature_for_pair(textmine_pair_features, rec["compound_node_ref"], rec["protein_node_ref"]),
                 "positive_endpoint_count": pos_n,
                 "negative_endpoint_count": neg_n,
                 "ambiguous_endpoint_count": amb_n,
@@ -1050,19 +1185,20 @@ class RunStore:
                 "split_strategy": "compound_similarity_component_holdout",
                 "candidate_sampling_method": "unobserved_within_extracted_scope",
                 "evidence_count": 0,
+                **_textmine_feature_for_pair(textmine_pair_features, compound_ref, protein_ref),
             })
         training_pair_rows = pair_rows + negative_rows
         link_prediction_pair_rows = training_pair_rows + candidate_rows
 
         if guard is not None:
             guard.checkpoint("ml:features:before", force=True)
-        compound_feature_rows = _build_compound_feature_rows(node_records_by_ref, node_id_by_ref)
+        compound_feature_rows = _build_compound_feature_rows(node_records_by_ref, node_id_by_ref, compound_similarity_degree=compound_similarity_degree)
         if guard is not None:
             guard.checkpoint("ml:features:compound", force=True)
-        protein_feature_rows = _build_protein_feature_rows(node_records_by_ref, node_id_by_ref)
+        protein_feature_rows = _build_protein_feature_rows(node_records_by_ref, node_id_by_ref, protein_annotation_maps=protein_annotation_maps)
         if guard is not None:
             guard.checkpoint("ml:features:protein", force=True)
-        endpoint_feature_rows = _build_endpoint_feature_rows(node_records_by_ref, node_id_by_ref)
+        endpoint_feature_rows = _build_endpoint_feature_rows(node_records_by_ref, node_id_by_ref, endpoint_feature_context=endpoint_feature_context)
         if guard is not None:
             guard.checkpoint("ml:features:endpoint", force=True)
 
@@ -1078,6 +1214,10 @@ class RunStore:
         _write_rows_csv(self.ml_dir / "compound_target_training_pairs.csv", training_pair_rows, columns=ML_PAIR_COLUMNS)
         _write_rows_csv(self.ml_dir / "compound_target_link_prediction_pairs.csv", link_prediction_pair_rows, columns=_columns(link_prediction_pair_rows) or list(dict.fromkeys(ML_PAIR_COLUMNS + ML_NEGATIVE_COLUMNS + ML_CANDIDATE_COLUMNS)))
 
+        summary["label_config"] = {
+            "activity_threshold_um": activity_threshold_um,
+            "weak_activity_as_negative": bool(weak_activity_as_negative),
+        }
         summary["ml"] = {
             "node_mapping_records": len(node_mapping_rows),
             "relation_mapping_records": len(relation_mapping_rows),
@@ -1095,6 +1235,7 @@ class RunStore:
             "observed_compound_target_pairs": len(observed_pair_keys),
             "training_pair_records": len(training_pair_rows),
             "link_prediction_pair_records": len(link_prediction_pair_rows),
+            "textmine_pair_features": len(textmine_pair_features),
             "skipped_relationships_missing_nodes": skipped_relationships_missing_nodes,
             "split_strategy": "compound_similarity_component_holdout",
             "label_semantics": "supervised labels use normalized endpoint evidence; unobserved compound-target pairs are exported as unknown candidates, not true negatives",
@@ -1145,16 +1286,30 @@ def _similarity_quality_report(nodes_dir: Path, rels_dir: Path, node_refs: set[s
     valid_edges = 0
     missing_target_cids: set[int] = set()
     missing_source_cids: set[int] = set()
-    similarity_expanded_nodes = 0
+    similarity_expanded_nodes_flagged = 0
     fallback_nodes = 0
+    all_compound_cids: set[int] = set()
+    asserted_compound_cids: set[int] = set()
+    similarity_source_cids: set[int] = set()
+    similarity_target_cids: set[int] = set()
 
     compound_file = nodes_dir / "Compound.jsonl"
     for rec in _read_jsonl(compound_file):
         props = rec.get("props") or {}
+        cid = _as_int((rec.get("key") or {}).get("cid") or props.get("cid"))
+        if cid is not None:
+            all_compound_cids.add(cid)
         if _truthy(props.get("similarity_expansion")):
-            similarity_expanded_nodes += 1
+            similarity_expanded_nodes_flagged += 1
         if props.get("retrieval_status") == "minimal_fallback":
             fallback_nodes += 1
+
+    asserted_file = rels_dir / "ASSERTS_CHEMICAL.jsonl"
+    for rec in _read_jsonl(asserted_file):
+        end = rec.get("end") or {}
+        cid = _as_int((end.get("key") or {}).get("cid"))
+        if cid is not None:
+            asserted_compound_cids.add(cid)
 
     rel_file = rels_dir / "SIMILAR_TO.jsonl"
     for rec in _read_jsonl(rel_file):
@@ -1163,6 +1318,12 @@ def _similarity_quality_report(nodes_dir: Path, rels_dir: Path, node_refs: set[s
         end = rec.get("end") or {}
         start_ref = _node_ref(start.get("label"), start.get("key") or {})
         end_ref = _node_ref(end.get("label"), end.get("key") or {})
+        scid = _as_int((start.get("key") or {}).get("cid"))
+        ecid = _as_int((end.get("key") or {}).get("cid"))
+        if scid is not None:
+            similarity_source_cids.add(scid)
+        if ecid is not None:
+            similarity_target_cids.add(ecid)
         if start_ref in node_refs and end_ref in node_refs:
             valid_edges += 1
         else:
@@ -1175,6 +1336,13 @@ def _similarity_quality_report(nodes_dir: Path, rels_dir: Path, node_refs: set[s
                 if cid is not None:
                     missing_target_cids.add(cid)
 
+    similarity_all_cids = similarity_source_cids | similarity_target_cids
+    materialized_similarity_cids = similarity_all_cids & all_compound_cids
+    # Final-run QA should not depend only on a historical boolean property.
+    # Count similarity-expanded nodes by comparing all materialized compounds with
+    # compounds observed in curated Interaction assertions. This correctly reports
+    # similarity-only compounds even after rematerialization/merge steps.
+    similarity_only_cids = materialized_similarity_cids - asserted_compound_cids
     return {
         "raw_similarity_edges": raw_edges,
         "valid_similarity_edges_from_jsonl": valid_edges,
@@ -1182,15 +1350,135 @@ def _similarity_quality_report(nodes_dir: Path, rels_dir: Path, node_refs: set[s
         "similarity_missing_source_compounds": len(missing_source_cids),
         "similarity_missing_target_compounds": len(missing_target_cids),
         "missing_target_cid_sample": sorted(missing_target_cids)[:25],
-        "similarity_expansion_performed": similarity_expanded_nodes > 0,
-        "similarity_expanded_compound_nodes": similarity_expanded_nodes,
+        "similarity_expansion_performed": bool(similarity_only_cids) or similarity_expanded_nodes_flagged > 0,
+        "compound_nodes_total": len(all_compound_cids),
+        "observed_interaction_compounds": len(asserted_compound_cids),
+        "similarity_source_compounds": len(similarity_source_cids),
+        "similarity_target_compounds": len(similarity_target_cids),
+        "similarity_compounds_materialized": len(materialized_similarity_cids),
+        "similarity_expanded_compound_nodes": len(similarity_only_cids),
+        "similarity_expanded_compound_nodes_flagged": similarity_expanded_nodes_flagged,
         "similarity_minimal_fallback_compound_nodes": fallback_nodes,
+        "similarity_only_cid_sample": sorted(similarity_only_cids)[:25],
         "note": (
             "If missing_target_compounds is greater than zero, rerun build with complete similarity expansion "
             "or run load-run with --complete-similar-compound-nodes true --allow-network true."
         ),
     }
 
+
+
+def _feature_completeness_report(
+    nodes_dir: Path,
+    rels_dir: Path,
+    node_counts: Dict[str, int],
+    relationship_counts: Dict[str, int],
+) -> Dict[str, Any]:
+    """Summarize feature availability for final CYP450 GCN readiness."""
+    compound_refs: set[str] = set()
+    structure_refs_with_smiles: set[str] = set()
+    properties_refs_with_core: set[str] = set()
+    molgraph_rows = 0
+    molgraph_with_fp = 0
+    molgraph_compound_refs_with_fp: set[str] = set()
+    fingerprint_method_counts: Dict[str, int] = {}
+    for rec in _read_jsonl(nodes_dir / "Compound.jsonl"):
+        cid = _as_int((rec.get("key") or {}).get("cid") or (rec.get("props") or {}).get("cid"))
+        if cid is not None:
+            compound_refs.add(_node_ref("Compound", {"cid": cid}))
+    for rec in _read_jsonl(nodes_dir / "Structure.jsonl"):
+        key, props = rec.get("key") or {}, rec.get("props") or {}
+        cid = _as_int(key.get("cid") or props.get("cid"))
+        if cid is not None and any(props.get(k) for k in ["smiles", "canonical_smiles", "isomeric_smiles"]):
+            structure_refs_with_smiles.add(_node_ref("Compound", {"cid": cid}))
+    for rec in _read_jsonl(nodes_dir / "Properties.jsonl"):
+        key, props = rec.get("key") or {}, rec.get("props") or {}
+        cid = _as_int(key.get("cid") or props.get("cid"))
+        core = ["molecular_weight", "formula", "xlogp3", "tpsa", "hbond_donor_count", "hbond_acceptor_count", "rotatable_bond_count"]
+        if cid is not None and any(props.get(k) not in (None, "") for k in core):
+            properties_refs_with_core.add(_node_ref("Compound", {"cid": cid}))
+    for rec in _read_jsonl(nodes_dir / "MolGraph.jsonl"):
+        molgraph_rows += 1
+        props = rec.get("props") or {}
+        has_fp = _truthy(props.get("fingerprint_available")) or any(re.fullmatch(r"fp_\d+", str(k)) for k in props)
+        method = str(props.get("fingerprint_method") or "missing").strip() or "missing"
+        fingerprint_method_counts[method] = fingerprint_method_counts.get(method, 0) + 1
+        if has_fp:
+            molgraph_with_fp += 1
+            cid = _as_int(props.get("cid") or props.get("raw_cid") or (rec.get("key") or {}).get("cid"))
+            if cid is None:
+                m = re.search(r"CID(\d+)", str((rec.get("key") or {}).get("repr_id") or props.get("repr_id") or ""))
+                cid = int(m.group(1)) if m else None
+            if cid is not None:
+                molgraph_compound_refs_with_fp.add(_node_ref("Compound", {"cid": cid}))
+
+    protein_refs: set[str] = set()
+    protein_with_sequence_or_len: set[str] = set()
+    for rec in _read_jsonl(nodes_dir / "Protein.jsonl"):
+        ref = _node_ref("Protein", rec.get("key") or {})
+        protein_refs.add(ref)
+        props = rec.get("props") or {}
+        if props.get("sequence") or props.get("sequence_length") or props.get("uniprot_sequence_length"):
+            protein_with_sequence_or_len.add(ref)
+    uniprot_with_len = 0
+    for rec in _read_jsonl(nodes_dir / "UniProt.jsonl"):
+        props = rec.get("props") or {}
+        if props.get("sequence_length") or props.get("sequence"):
+            uniprot_with_len += 1
+
+    endpoint_total = int(node_counts.get("Endpoint", 0))
+    endpoint_numeric = 0
+    endpoint_labeled = 0
+    endpoint_unit_normalized = 0
+    for rec in _read_jsonl(nodes_dir / "Endpoint.jsonl"):
+        rec = normalize_endpoint_node_record(rec)
+        props = rec.get("props") or {}
+        if _truthy(props.get("has_numeric_value")) or props.get("value_float") not in (None, ""):
+            endpoint_numeric += 1
+        if props.get("unit_curie") or props.get("value_molar") not in (None, ""):
+            endpoint_unit_normalized += 1
+        if _endpoint_supervision_label(props) is not None:
+            endpoint_labeled += 1
+
+    return {
+        "compound": {
+            "compound_nodes": len(compound_refs),
+            "compounds_with_smiles": len(structure_refs_with_smiles),
+            "compounds_missing_smiles": max(0, len(compound_refs) - len(structure_refs_with_smiles)),
+            "compounds_with_core_properties": len(properties_refs_with_core),
+            "compounds_missing_core_properties": max(0, len(compound_refs) - len(properties_refs_with_core)),
+            "molgraph_rows": molgraph_rows,
+            "molgraph_rows_with_fingerprint": molgraph_with_fp,
+            "molgraph_compounds_with_fingerprint": len(molgraph_compound_refs_with_fp),
+            "molgraph_compounds_missing_fingerprint": max(0, len(compound_refs) - len(molgraph_compound_refs_with_fp)),
+            "molgraph_rows_missing_fingerprint": max(0, molgraph_rows - molgraph_with_fp),
+            "fingerprint_method_counts": dict(sorted(fingerprint_method_counts.items())),
+            "rdkit_available_in_export": any(str(k).startswith("rdkit") for k in fingerprint_method_counts),
+            "fallback_fingerprint_rows": sum(v for k, v in fingerprint_method_counts.items() if "fallback" in str(k)),
+            "similar_to_edges": int(relationship_counts.get("SIMILAR_TO", 0)),
+        },
+        "protein": {
+            "protein_nodes": len(protein_refs),
+            "proteins_with_sequence_or_uniprot_length": len(protein_with_sequence_or_len),
+            "proteins_missing_sequence_or_uniprot_length": max(0, len(protein_refs) - len(protein_with_sequence_or_len)),
+            "uniprot_nodes_with_sequence_length": uniprot_with_len,
+            "go_annotation_edges": int(relationship_counts.get("HAS_GO_ANNOTATION", 0)),
+            "reactome_pathway_edges": int(relationship_counts.get("MAPS_TO_REACTOME_PATHWAY", 0)),
+            "interpro_domain_edges": int(relationship_counts.get("HAS_INTERPRO_DOMAIN", 0)),
+            "protein_embedding_edges": int(relationship_counts.get("HAS_PROTEIN_EMBEDDING", 0)),
+        },
+        "evidence": {
+            "endpoint_nodes": endpoint_total,
+            "endpoints_with_numeric_value": endpoint_numeric,
+            "endpoints_with_normalized_unit_or_molar_value": endpoint_unit_normalized,
+            "endpoints_with_supervision_label": endpoint_labeled,
+            "assay_reference_edges": int(relationship_counts.get("DESCRIBED_BY", 0)),
+            "endpoint_reference_edges": int(relationship_counts.get("SUPPORTED_BY", 0)),
+            "textmine_cooc_nodes": int(node_counts.get("Cooc", 0)),
+            "textmine_compound_edges": int(relationship_counts.get("MENTIONS_COMPOUND", 0)),
+            "textmine_protein_edges": int(relationship_counts.get("MENTIONS_PROTEIN", 0)),
+        },
+    }
 
 def _optional_layer_report(node_counts: Dict[str, int], relationship_counts: Dict[str, int], run_dir: Path) -> Dict[str, Any]:
     """Give explicit status for optional schema layers used by thesis QA."""
@@ -1202,16 +1490,27 @@ def _optional_layer_report(node_counts: Dict[str, int], relationship_counts: Dic
     paths = manifest.get("paths") or {}
     plugins = set(str(x).lower() for x in (manifest.get("plugins") or []))
     requested_all = any("all" == p or p.endswith(":make_all_plugin") for p in plugins)
+    text_report: Dict[str, Any] = {}
+    try:
+        text_report = json.loads((run_dir / "graph" / "textmining_report.json").read_text(encoding="utf-8"))
+    except Exception:
+        text_report = {}
     return {
         "textmining": {
             "textmine_nodes": int(node_counts.get("TextMine", 0)),
             "cooc_nodes": int(node_counts.get("Cooc", 0)),
             "mentions_compound_edges": int(relationship_counts.get("MENTIONS_COMPOUND", 0)),
+            "mentions_protein_edges": int(relationship_counts.get("MENTIONS_PROTEIN", 0)),
             "mentions_gene_edges": int(relationship_counts.get("MENTIONS_GENE", 0)),
-            "status": "materialized" if node_counts.get("Cooc", 0) else "not_materialized_or_empty",
+            "found_in_reference_edges": int(relationship_counts.get("FOUND_IN_REFERENCE", 0)),
+            "source": text_report.get("source") or paths.get("textmining_source"),
+            "pubmed_fallback_enabled": text_report.get("pubmed_fallback_enabled", paths.get("textmining_pubmed_fallback")),
+            "status": text_report.get("status") or ("materialized" if node_counts.get("Cooc", 0) else "not_materialized_or_empty"),
         },
         "bindingdb": {
             "bindingdb_nodes": int(node_counts.get("BindingDB", 0)),
+            "has_bindingdb_record_edges": int(relationship_counts.get("HAS_BINDINGDB_RECORD", 0)),
+            "has_bindingdb_target_record_edges": int(relationship_counts.get("HAS_BINDINGDB_TARGET_RECORD", 0)),
             "validated_by_bindingdb_edges": int(relationship_counts.get("VALIDATED_BY_BINDINGDB", 0)),
             "status": "materialized" if node_counts.get("BindingDB", 0) else "not_materialized_or_empty",
         },
@@ -1219,6 +1518,11 @@ def _optional_layer_report(node_counts: Dict[str, int], relationship_counts: Dic
             "drugbank_nodes": int(node_counts.get("DrugBank", 0)),
             "drugbank_file": paths.get("drugbank_file"),
             "status": "materialized" if node_counts.get("DrugBank", 0) else ("skipped_no_drugbank_file" if requested_all and not paths.get("drugbank_file") else "not_materialized_or_empty"),
+        },
+        "alphafold": {
+            "alphafold_nodes": int(node_counts.get("AlphaFold", 0)),
+            "has_alphafold_model_edges": int(relationship_counts.get("HAS_ALPHAFOLD_MODEL", 0)),
+            "status": "materialized" if node_counts.get("AlphaFold", 0) else "not_materialized_or_empty",
         },
         "optional_context": {
             "cellline_nodes": int(node_counts.get("CellLine", 0)),
@@ -1228,6 +1532,50 @@ def _optional_layer_report(node_counts: Dict[str, int], relationship_counts: Dic
         },
     }
 
+
+def _schema_alignment_report(node_counts: Dict[str, int], relationship_counts: Dict[str, int], run_dir: Path) -> Dict[str, Any]:
+    """Compare materialized graph labels/types against the DOT schema if present."""
+    manifest: Dict[str, Any] = {}
+    try:
+        manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    except Exception:
+        manifest = {}
+    dot_path_text = ((manifest.get("paths") or {}).get("schema_dot") or "")
+    dot_path = Path(dot_path_text) if dot_path_text else None
+    if dot_path and not dot_path.is_absolute():
+        candidates = [Path(dot_path_text), (run_dir / dot_path), (run_dir.parent / dot_path)]
+        dot_path = next((c.resolve() for c in candidates if c.exists()), candidates[0])
+    if not dot_path or not dot_path.exists():
+        return {"status": "schema_dot_not_available", "schema_dot": dot_path_text}
+    try:
+        text = dot_path.read_text(encoding="utf-8")
+    except Exception:
+        return {"status": "schema_dot_unreadable", "schema_dot": str(dot_path)}
+    observed_nodes = set(node_counts)
+    observed_rels = set(relationship_counts)
+    schema_nodes = set(re.findall(r"^\s*([A-Za-z][A-Za-z0-9_]*)\s*\[label=", text, flags=re.MULTILINE))
+    schema_nodes = {n for n in schema_nodes if not n.startswith("Conv")}
+    labels: set[str] = set()
+    for match in re.finditer(r'label="([^"]+)"', text):
+        label_text = match.group(1)
+        if label_text.isupper() or " | " in label_text:
+            for part in re.split(r"\s*\|\s*", label_text.split("\\n", 1)[0]):
+                token = part.strip().split()[0]
+                if token and token.upper() == token:
+                    labels.add(token)
+    return {
+        "status": "evaluated",
+        "schema_dot": str(dot_path),
+        "schema_node_labels": sorted(schema_nodes),
+        "schema_relationship_types": sorted(labels),
+        "observed_node_labels": sorted(observed_nodes),
+        "observed_relationship_types": sorted(observed_rels),
+        "missing_node_labels": sorted(schema_nodes - observed_nodes),
+        "missing_relationship_types": sorted(labels - observed_rels),
+        "extra_node_labels": sorted(observed_nodes - schema_nodes),
+        "extra_relationship_types": sorted(observed_rels - labels),
+        "note": "Missing optional schema labels/types can be normal for scoped tests when the source data has no such layer.",
+    }
 
 
 class _UnionFind:
@@ -1551,7 +1899,80 @@ def _deterministic_split(seed: str) -> str:
     return "test"
 
 
-def _build_compound_feature_rows(node_records_by_ref: dict[str, dict[str, str]], node_id_by_ref: dict[str, int]) -> list[dict[str, Any]]:
+
+def _build_endpoint_feature_context(
+    *,
+    endpoint_to_mgs: dict[str, set[str]],
+    endpoint_to_refs: dict[str, set[str]],
+    mg_to_assays: dict[str, set[str]],
+) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for endpoint_ref, mgs in endpoint_to_mgs.items():
+        assays: set[str] = set()
+        for mg in mgs:
+            assays.update(mg_to_assays.get(mg, set()))
+        refs = endpoint_to_refs.get(endpoint_ref, set())
+        out[endpoint_ref] = {
+            "measuregroup_count": len(mgs),
+            "assay_count": len(assays),
+            "reference_count": len(refs),
+        }
+    for endpoint_ref, refs in endpoint_to_refs.items():
+        out.setdefault(endpoint_ref, {"measuregroup_count": 0, "assay_count": 0, "reference_count": 0})["reference_count"] = len(refs)
+    return out
+
+
+def _build_textmine_pair_features(
+    node_records_by_ref: dict[str, dict[str, str]],
+    *,
+    cooc_to_compounds: dict[str, set[str]],
+    cooc_to_proteins: dict[str, set[str]],
+    cooc_to_genes: dict[str, set[str]],
+    cooc_to_refs: dict[str, set[str]],
+    gene_to_proteins: dict[str, set[str]],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    pair_map: dict[tuple[str, str], dict[str, Any]] = {}
+    for cooc_ref, compounds in cooc_to_compounds.items():
+        proteins = set(cooc_to_proteins.get(cooc_ref, set()))
+        for gene_ref in cooc_to_genes.get(cooc_ref, set()):
+            proteins.update(gene_to_proteins.get(gene_ref, set()))
+        if not compounds or not proteins:
+            continue
+        score = _as_float((node_records_by_ref.get(cooc_ref, {}) or {}).get("props_score"))
+        refs = set(cooc_to_refs.get(cooc_ref, set()))
+        for c_ref in compounds:
+            for p_ref in proteins:
+                rec = pair_map.setdefault((c_ref, p_ref), {"cooc_refs": set(), "reference_refs": set(), "scores": []})
+                rec["cooc_refs"].add(cooc_ref)
+                rec["reference_refs"].update(refs)
+                if score is not None:
+                    rec["scores"].append(score)
+    out: dict[tuple[str, str], dict[str, Any]] = {}
+    for pair, rec in pair_map.items():
+        scores = rec.get("scores") or []
+        out[pair] = {
+            "textmine_cooc_count": len(rec.get("cooc_refs", set())),
+            "textmine_reference_count": len(rec.get("reference_refs", set())),
+            "textmine_score_max": max(scores) if scores else "",
+            "textmine_score_mean": (sum(scores) / len(scores)) if scores else "",
+        }
+    return out
+
+
+def _textmine_feature_for_pair(feature_map: dict[tuple[str, str], dict[str, Any]], compound_ref: str, protein_ref: str) -> dict[str, Any]:
+    return {
+        "textmine_cooc_count": feature_map.get((compound_ref, protein_ref), {}).get("textmine_cooc_count", 0),
+        "textmine_reference_count": feature_map.get((compound_ref, protein_ref), {}).get("textmine_reference_count", 0),
+        "textmine_score_max": feature_map.get((compound_ref, protein_ref), {}).get("textmine_score_max", ""),
+        "textmine_score_mean": feature_map.get((compound_ref, protein_ref), {}).get("textmine_score_mean", ""),
+    }
+
+def _build_compound_feature_rows(
+    node_records_by_ref: dict[str, dict[str, str]],
+    node_id_by_ref: dict[str, int],
+    *,
+    compound_similarity_degree: Optional[dict[str, int]] = None,
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for ref, rec in sorted(node_records_by_ref.items()):
         if rec.get("label") != "Compound":
@@ -1563,6 +1984,8 @@ def _build_compound_feature_rows(node_records_by_ref: dict[str, dict[str, str]],
             "node_ref": ref,
             "cid": cid,
             "preferred_name": rec.get("props_preferred_name", ""),
+            "similarity_degree": (compound_similarity_degree or {}).get(ref, 0),
+            "has_similarity_neighbors": "true" if (compound_similarity_degree or {}).get(ref, 0) else "false",
         }
         for side_label in ["Properties", "Structure", "Synonyms", "MolGraph"]:
             if side_label == "MolGraph":
@@ -1584,7 +2007,12 @@ def _build_compound_feature_rows(node_records_by_ref: dict[str, dict[str, str]],
     return rows
 
 
-def _build_protein_feature_rows(node_records_by_ref: dict[str, dict[str, str]], node_id_by_ref: dict[str, int]) -> list[dict[str, Any]]:
+def _build_protein_feature_rows(
+    node_records_by_ref: dict[str, dict[str, str]],
+    node_id_by_ref: dict[str, int],
+    *,
+    protein_annotation_maps: Optional[dict[str, dict[str, set[str]]]] = None,
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for ref, rec in sorted(node_records_by_ref.items()):
         if rec.get("label") != "Protein":
@@ -1608,6 +2036,19 @@ def _build_protein_feature_rows(node_records_by_ref: dict[str, dict[str, str]], 
             "has_sequence": "true" if seq else "false",
             "protein_type": rec.get("props_protein_type", ""),
         }
+        annotation_sets = (protein_annotation_maps or {}).get(ref, {})
+        for rel_type, prefix in [
+            ("HAS_UNIPROT_RECORD", "uniprot_record"),
+            ("HAS_GO_ANNOTATION", "go"),
+            ("MAPS_TO_REACTOME_PATHWAY", "reactome"),
+            ("HAS_INTERPRO_DOMAIN", "interpro"),
+            ("HAS_PDB_STRUCTURE", "pdb"),
+            ("HAS_ALPHAFOLD_MODEL", "alphafold"),
+            ("HAS_BINDINGDB_TARGET_RECORD", "bindingdb"),
+        ]:
+            values = sorted(annotation_sets.get(rel_type, set()))
+            out[f"{prefix}_count"] = len(values)
+            out[f"{prefix}_refs"] = " | ".join(values[:100])
         for source_name, side in [("uniprot", uniprot), ("protembed", embed)]:
             for k, v in side.items():
                 if k.startswith("props_") and k not in {"props_function", "props_raw"}:
@@ -1623,12 +2064,20 @@ def _uniprot_acc_from_protein_id(protein_id: str) -> str:
     return text
 
 
-def _build_endpoint_feature_rows(node_records_by_ref: dict[str, dict[str, str]], node_id_by_ref: dict[str, int]) -> list[dict[str, Any]]:
+def _build_endpoint_feature_rows(
+    node_records_by_ref: dict[str, dict[str, str]],
+    node_id_by_ref: dict[str, int],
+    *,
+    endpoint_feature_context: Optional[dict[str, dict[str, Any]]] = None,
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for ref, rec in sorted(node_records_by_ref.items()):
         if rec.get("label") != "Endpoint":
             continue
         _, key = _parse_node_ref(ref)
+        ctx = (endpoint_feature_context or {}).get(ref, {})
+        sup_label = _endpoint_supervision_label(rec)
+        has_numeric = _truthy(rec.get("props_has_numeric_value")) or rec.get("props_value_float") not in (None, "") or rec.get("props_value_molar") not in (None, "")
         rows.append({
             "node_id": node_id_by_ref.get(ref, ""),
             "node_ref": ref,
@@ -1648,8 +2097,12 @@ def _build_endpoint_feature_rows(node_records_by_ref: dict[str, dict[str, str]],
             "outcome_label": rec.get("props_outcome_label", ""),
             "outcome_label_normalized": rec.get("props_outcome_label_normalized", ""),
             "activity_flag": rec.get("props_activity_flag", ""),
+            "supervision_label": "" if sup_label is None else sup_label,
             "score": rec.get("props_score", ""),
-            "has_numeric_value": rec.get("props_has_numeric_value", ""),
+            "has_numeric_value": has_numeric,
+            "measuregroup_count": ctx.get("measuregroup_count", 0),
+            "assay_count": ctx.get("assay_count", 0),
+            "reference_count": ctx.get("reference_count", 0),
         })
     return rows
 

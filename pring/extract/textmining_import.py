@@ -354,9 +354,64 @@ def iter_pubmed_textmining_rows(
     seen: set[str] = set()
     pair_ref_counts: Dict[tuple[int, str], int] = {}
 
+    def emit_article_mentions(target: Dict[str, Any], article: Dict[str, Any], matched: list[Dict[str, Any]]) -> Iterator[PubChemRow]:
+        nonlocal emitted
+        text = " ".join([article.get("title") or "", article.get("abstract") or ""]).strip()
+        if not text or not matched:
+            return
+        context = _context_window(text, [target.get("preferred_term") or ""] + [m.get("preferred_term", "") for m in matched])
+        pmid = article.get("pmid")
+        reference_id = f"PMID:{pmid}" if pmid else None
+        for compound in matched:
+            if global_limit is not None and emitted >= global_limit:
+                break
+            pair_key = (int(compound["cid"]), str(target.get("protein_id") or target.get("gene_id") or target.get("display") or "target"))
+            if refs_per_pair is not None:
+                current = pair_ref_counts.get(pair_key, 0)
+                if current >= refs_per_pair:
+                    continue
+                pair_ref_counts[pair_key] = current + 1
+            cooc_seed = "|".join([str(pair_key[0]), pair_key[1], str(reference_id or ""), method_id])
+            cooc_id = make_stable_id(cooc_seed, prefix="cooc:")
+            uniq = f"{cooc_id}|{reference_id or ''}"
+            if uniq in seen:
+                continue
+            seen.add(uniq)
+            data: Dict[str, Any] = {
+                "cooc_id": cooc_id,
+                "cid": compound["cid"],
+                "compound_name": compound.get("preferred_name"),
+                "protein_id": target.get("protein_id"),
+                "protein_name": target.get("protein_name"),
+                "gene_id": target.get("gene_id"),
+                "gene_symbol": target.get("gene_symbol"),
+                "reference_id": reference_id,
+                "pmid": pmid,
+                "score": None,
+                "sentence_count": 1,
+                "mention_context": context[:1000] if context else None,
+                "association_type": "compound-target title/abstract cooccurrence",
+                "direction": "unknown",
+                "evidence_level": "text_mined_weak_context",
+                "method_id": method_id,
+                "method_name": "PubMed title/abstract co-mention fallback",
+                "method_version": "esearch+efetch",
+                "method_source": "NCBI PubMed E-utilities",
+            }
+            emitted += 1
+            yield PubChemRow("compound", {"cid": compound["cid"], "preferred_name": compound.get("preferred_name")})
+            if data.get("protein_id"):
+                yield PubChemRow("protein", {"protein_id": data.get("protein_id"), "name": data.get("protein_name"), "gene_symbol": data.get("gene_symbol")})
+            if data.get("gene_id"):
+                yield PubChemRow("gene", {"gene_id": data.get("gene_id"), "symbol": data.get("gene_symbol")})
+            if reference_id:
+                yield PubChemRow("reference", {"reference_id": reference_id, "ref_id": reference_id, "pmid": pmid, "title": article.get("title")})
+            yield from _cooc_rows_from_data(data)
+
     for target in targets:
         if global_limit is not None and emitted >= global_limit:
             break
+        start_for_target = emitted
         query = _pubmed_query_for_target(target)
         if not query:
             continue
@@ -368,14 +423,14 @@ def iter_pubmed_textmining_rows(
             ids = _pubmed_esearch(client, query, retmax=int(retmax))
         except Exception:
             log.warning("PubMed text-mining eSearch failed for %s", target.get("display") or target.get("protein_id") or target.get("gene_id"), exc_info=True)
-            continue
-        if not ids:
-            continue
-        try:
-            articles = _pubmed_efetch_articles(client, ids)
-        except Exception:
-            log.warning("PubMed text-mining eFetch failed for target %s", target.get("display"), exc_info=True)
-            continue
+            ids = []
+        articles: list[Dict[str, Any]] = []
+        if ids:
+            try:
+                articles = _pubmed_efetch_articles(client, ids)
+            except Exception:
+                log.warning("PubMed text-mining eFetch failed for target %s", target.get("display"), exc_info=True)
+                articles = []
 
         for article in articles:
             if global_limit is not None and emitted >= global_limit:
@@ -387,54 +442,40 @@ def iter_pubmed_textmining_rows(
             if not any(_contains_phrase(lowered, term) for term in target.get("match_terms", [])):
                 continue
             matched = _find_compound_mentions(lowered, compounds)
-            if not matched:
-                continue
-            context = _context_window(text, [target.get("preferred_term") or ""] + [m.get("preferred_term", "") for m in matched])
-            pmid = article.get("pmid")
-            reference_id = f"PMID:{pmid}" if pmid else None
-            for compound in matched:
-                pair_key = (int(compound["cid"]), str(target.get("protein_id") or target.get("gene_id") or target.get("display") or "target"))
-                if refs_per_pair is not None:
-                    current = pair_ref_counts.get(pair_key, 0)
-                    if current >= refs_per_pair:
-                        continue
-                    pair_ref_counts[pair_key] = current + 1
-                cooc_seed = "|".join([str(pair_key[0]), pair_key[1], str(reference_id or ""), method_id])
-                cooc_id = make_stable_id(cooc_seed, prefix="cooc:")
-                uniq = f"{cooc_id}|{reference_id or ''}"
-                if uniq in seen:
+            yield from emit_article_mentions(target, article, matched)
+
+        # Target-only PubMed searches often return CYP papers that do not happen
+        # to mention an extracted compound in the first retmax records. If broad
+        # search produced no Cooc rows for this target, do a bounded pairwise
+        # fallback over the best compound names/synonyms. This is slower, so it
+        # is activated only when needed and remains governed by max_records caps.
+        if emitted == start_for_target:
+            pairwise_budget = min(len(compounds), max(1, int(retmax)))
+            for compound in compounds[:pairwise_budget]:
+                if global_limit is not None and emitted >= global_limit:
+                    break
+                if refs_per_pair is not None and pair_ref_counts.get((int(compound["cid"]), str(target.get("protein_id") or target.get("gene_id") or target.get("display") or "target")), 0) >= refs_per_pair:
                     continue
-                seen.add(uniq)
-                data: Dict[str, Any] = {
-                    "cooc_id": cooc_id,
-                    "cid": compound["cid"],
-                    "compound_name": compound.get("preferred_name"),
-                    "protein_id": target.get("protein_id"),
-                    "protein_name": target.get("protein_name"),
-                    "gene_id": target.get("gene_id"),
-                    "gene_symbol": target.get("gene_symbol"),
-                    "reference_id": reference_id,
-                    "pmid": pmid,
-                    "score": None,
-                    "sentence_count": 1,
-                    "mention_context": context[:1000] if context else None,
-                    "association_type": "compound-target title/abstract cooccurrence",
-                    "direction": "unknown",
-                    "evidence_level": "text_mined_weak_context",
-                    "method_id": method_id,
-                    "method_name": "PubMed title/abstract co-mention fallback",
-                    "method_version": "esearch+efetch",
-                    "method_source": "NCBI PubMed E-utilities",
-                }
-                emitted += 1
-                yield PubChemRow("compound", {"cid": compound["cid"], "preferred_name": compound.get("preferred_name")})
-                if data.get("protein_id"):
-                    yield PubChemRow("protein", {"protein_id": data.get("protein_id"), "name": data.get("protein_name")})
-                if data.get("gene_id"):
-                    yield PubChemRow("gene", {"gene_id": data.get("gene_id"), "symbol": data.get("gene_symbol")})
-                if reference_id:
-                    yield PubChemRow("reference", {"reference_id": reference_id, "ref_id": reference_id, "pmid": pmid, "title": article.get("title")})
-                yield from _cooc_rows_from_data(data)
+                pair_query = _pubmed_pair_query_for_target_compound(target, compound)
+                if not pair_query:
+                    continue
+                try:
+                    pair_ids = _pubmed_esearch(client, pair_query, retmax=max(1, refs_per_pair or 1))
+                except Exception:
+                    log.debug("PubMed pairwise text-mining eSearch failed for target=%s compound=%s", target.get("display"), compound.get("preferred_name"), exc_info=True)
+                    continue
+                if not pair_ids:
+                    continue
+                try:
+                    pair_articles = _pubmed_efetch_articles(client, pair_ids)
+                except Exception:
+                    log.debug("PubMed pairwise text-mining eFetch failed for target=%s compound=%s", target.get("display"), compound.get("preferred_name"), exc_info=True)
+                    continue
+                for article in pair_articles:
+                    text = " ".join([article.get("title") or "", article.get("abstract") or ""]).strip()
+                    lowered = _normalize_text_for_match(text)
+                    if any(_contains_phrase(lowered, t) for t in target.get("match_terms", [])) and any(_contains_phrase(lowered, t) for t in compound.get("match_terms", [])):
+                        yield from emit_article_mentions(target, article, [compound])
 
     if emitted == 0:
         log.warning("PubMed text-mining fallback completed but produced zero compound-target co-occurrences. Check compound names/synonyms and target symbols.")
@@ -513,6 +554,27 @@ def _pubmed_query_for_target(target: Dict[str, Any]) -> str:
     return "(" + " OR ".join(terms) + ") AND " + biology
 
 
+def _pubmed_pair_query_for_target_compound(target: Dict[str, Any], compound: Dict[str, Any]) -> str:
+    target_terms = []
+    for term in target.get("query_terms", []):
+        term = str(term or "").strip()
+        if len(term) >= 3:
+            target_terms.append(f'"{term}"[Title/Abstract]')
+    compound_terms = []
+    for term in compound.get("match_terms", []):
+        # Use original-ish preferred names where possible. Normalized terms are
+        # sufficient for PubMed phrase queries after whitespace normalization.
+        term = str(term or "").strip()
+        if len(term) >= 4 and not term.lower().startswith("cid "):
+            compound_terms.append(f'"{term}"[Title/Abstract]')
+    target_terms = list(dict.fromkeys(target_terms))[:5]
+    compound_terms = list(dict.fromkeys(compound_terms))[:5]
+    if not target_terms or not compound_terms:
+        return ""
+    biology = "(inhibition[Title/Abstract] OR inhibitor[Title/Abstract] OR substrate[Title/Abstract] OR metabolism[Title/Abstract] OR metabolized[Title/Abstract])"
+    return "(" + " OR ".join(target_terms) + ") AND (" + " OR ".join(compound_terms) + ") AND " + biology
+
+
 def _prepare_compound_entities(items: Iterable[Dict[str, Any]]) -> list[Dict[str, Any]]:
     out: list[Dict[str, Any]] = []
     seen: set[int] = set()
@@ -539,6 +601,9 @@ def _prepare_compound_entities(items: Iterable[Dict[str, Any]]) -> list[Dict[str
                 continue
             if re.fullmatch(r"[A-Za-z0-9\-]+", text) and len(text) < 4:
                 continue
+            # Avoid extremely generic tokens that create noisy PubMed matches.
+            if text.lower() in {"compound", "chemical", "unknown", "untitled"}:
+                continue
             terms.append(text)
         terms = list(dict.fromkeys(terms))[:12]
         if not terms:
@@ -560,17 +625,18 @@ def _prepare_target_entities(items: Iterable[Dict[str, Any]]) -> list[Dict[str, 
         if not key or key in seen:
             continue
         terms = []
-        for term in [gene_symbol, protein_name, protein_id, gene_id]:
-            text = str(term or "").strip()
-            if text and len(text) >= 3:
-                terms.append(text)
-        # CYP-specific expansion makes the fallback useful for the main thesis use case.
+        # CYP symbols are the most PubMed-useful names; put them before raw
+        # accessions/gene IDs so query construction is not dominated by IDs.
         if gene_symbol and gene_symbol.upper().startswith("CYP"):
             terms.append(gene_symbol.upper())
             compact = gene_symbol.upper().replace("CYP", "")
             if compact:
                 terms.append(f"cytochrome P450 {compact}")
                 terms.append(f"cytochrome P450 {gene_symbol.upper()}")
+        for term in [gene_symbol, protein_name, protein_id, gene_id]:
+            text = str(term or "").strip()
+            if text and len(text) >= 3:
+                terms.append(text)
         terms = list(dict.fromkeys(terms))[:12]
         if not terms:
             continue

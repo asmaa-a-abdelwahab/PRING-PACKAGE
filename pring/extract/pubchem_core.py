@@ -82,11 +82,11 @@ def iter_graph_records(rows: Iterable[PubChemRow]) -> Iterator[Tuple[str, Dict]]
 
             structure_props = {
                 "cid": cid,
-                "smiles": _first_nonempty(d, "smiles", "canonical_smiles", "isomeric_smiles"),
-                "canonical_smiles": d.get("canonical_smiles"),
-                "isomeric_smiles": d.get("isomeric_smiles"),
-                "inchi": d.get("inchi"),
-                "inchikey": d.get("inchikey"),
+                "smiles": _first_nonempty(d, "smiles", "canonical_smiles", "canonicalsmiles", "isomeric_smiles", "isomericsmiles"),
+                "canonical_smiles": _first_nonempty(d, "canonical_smiles", "canonicalsmiles", "smiles"),
+                "isomeric_smiles": _first_nonempty(d, "isomeric_smiles", "isomericsmiles"),
+                "inchi": _first_nonempty(d, "inchi", "InChI"),
+                "inchikey": _first_nonempty(d, "inchikey", "InChIKey"),
             }
             if _has_non_key_payload(structure_props, "cid"):
                 node("Structure", {"cid": cid}, structure_props)
@@ -150,6 +150,22 @@ def iter_graph_records(rows: Iterable[PubChemRow]) -> Iterator[Tuple[str, Dict]]
                         rel_props,
                         rel_type=rel_name,
                     )
+
+        elif r.kind == "structure":
+            cid = _as_int(d.get("cid"))
+            if cid is not None:
+                compound_key = {"label": "Compound", "key": {"cid": cid}}
+                structure_props = {
+                    "cid": cid,
+                    "smiles": _first_nonempty(d, "smiles", "canonical_smiles", "canonicalsmiles", "isomeric_smiles", "isomericsmiles"),
+                    "canonical_smiles": _first_nonempty(d, "canonical_smiles", "canonicalsmiles", "smiles"),
+                    "isomeric_smiles": _first_nonempty(d, "isomeric_smiles", "isomericsmiles"),
+                    "inchi": _first_nonempty(d, "inchi", "InChI"),
+                    "inchikey": _first_nonempty(d, "inchikey", "InChIKey"),
+                }
+                if _has_non_key_payload(structure_props, "cid"):
+                    node("Structure", {"cid": cid}, _with_raw_fields(structure_props, d))
+                    rel("HAS_STRUCTURE", compound_key, {"label": "Structure", "key": {"cid": cid}})
 
         elif r.kind == "substance":
             sid = _as_int(d.get("sid"))
@@ -587,14 +603,47 @@ def iter_graph_records(rows: Iterable[PubChemRow]) -> Iterator[Tuple[str, Dict]]
                 repr_id = f"molgraph:CID{cid}:pubchem_features_v1"
             if not repr_id:
                 continue
-            node("MolGraph", {"repr_id": repr_id}, _with_raw_fields({
+            molgraph_props = {
                 "repr_id": repr_id,
+                "cid": cid,
                 "method": d.get("method") or "pubchem_features_v1",
                 "fp_type": d.get("fp_type"),
                 "dim": _as_int(d.get("dim")),
                 "storage_uri": d.get("storage_uri"),
                 "version": d.get("version"),
-            }, d))
+                "smiles": _first_nonempty(d, "smiles", "canonical_smiles", "isomeric_smiles"),
+                "canonical_smiles": _first_nonempty(d, "canonical_smiles", "smiles"),
+                "isomeric_smiles": d.get("isomeric_smiles"),
+                "inchi": d.get("inchi"),
+                "inchikey": d.get("inchikey"),
+                "formula": d.get("formula"),
+                "molecular_weight": d.get("molecular_weight"),
+                "xlogp": d.get("xlogp"),
+                "tpsa": d.get("tpsa"),
+                "hbond_donor_count": d.get("hbond_donor_count"),
+                "hbond_acceptor_count": d.get("hbond_acceptor_count"),
+                "rotatable_bond_count": d.get("rotatable_bond_count"),
+                "heavy_atom_count": d.get("heavy_atom_count"),
+                "charge": d.get("charge"),
+                "smiles_length": d.get("smiles_length"),
+                "formula_atom_count": d.get("formula_atom_count"),
+                "formula_c_count": d.get("formula_c_count"),
+                "formula_h_count": d.get("formula_h_count"),
+                "formula_n_count": d.get("formula_n_count"),
+                "formula_o_count": d.get("formula_o_count"),
+                "formula_s_count": d.get("formula_s_count"),
+                "formula_halogen_count": d.get("formula_halogen_count"),
+                "formula_hetero_atom_count": d.get("formula_hetero_atom_count"),
+                "formula_element_count": d.get("formula_element_count"),
+                "fingerprint_available": d.get("fingerprint_available"),
+                "fingerprint_method": d.get("fingerprint_method"),
+                "fingerprint_nbits": d.get("fingerprint_nbits"),
+                "fingerprint_on_bits": d.get("fingerprint_on_bits"),
+            }
+            for fp_key, fp_value in d.items():
+                if re.fullmatch(r"fp_\d+", str(fp_key)):
+                    molgraph_props[str(fp_key)] = fp_value
+            node("MolGraph", {"repr_id": repr_id}, _with_raw_fields(molgraph_props, d))
             if cid is not None:
                 rel("HAS_MOLECULAR_REPRESENTATION", {"label": "Compound", "key": {"cid": cid}}, {"label": "MolGraph", "key": {"repr_id": repr_id}})
 
@@ -630,6 +679,9 @@ def iter_graph_records(rows: Iterable[PubChemRow]) -> Iterator[Tuple[str, Dict]]
             endpoint_id = _as_text(d.get("endpoint_id"))
             if cid is not None:
                 rel("HAS_BINDINGDB_RECORD", {"label": "Compound", "key": {"cid": cid}}, {"label": "BindingDB", "key": {"bindingdb_id": bindingdb_id}})
+            protein_id = _as_text(d.get("protein_id"))
+            if protein_id:
+                rel("HAS_BINDINGDB_TARGET_RECORD", {"label": "Protein", "key": {"protein_id": protein_id}}, {"label": "BindingDB", "key": {"bindingdb_id": bindingdb_id}})
             if endpoint_id:
                 rel("VALIDATED_BY_BINDINGDB", {"label": "Endpoint", "key": {"endpoint_id": endpoint_id}}, {"label": "BindingDB", "key": {"bindingdb_id": bindingdb_id}})
 

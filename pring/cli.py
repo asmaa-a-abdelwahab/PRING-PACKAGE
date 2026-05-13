@@ -23,6 +23,7 @@ from pring.enrich.compound_similarity import iter_compound_similarity_rows
 from pring.utils import setup_logging, RunStore
 from pring.utils.resource_control import ResourceGuard, ResourceLimitExceeded
 from pring.io.http import HttpClient
+from pring.transform.target_normalization import normalize_protein_props, normalize_gene_props
 
 log = logging.getLogger("pring")
 
@@ -618,10 +619,15 @@ def _target_entities_from_artifacts(store: RunStore) -> List[Dict[str, object]]:
             protein_id = str(key.get("protein_id") or props.get("protein_id") or "").strip()
             if not protein_id:
                 continue
+            norm_props = normalize_protein_props(props, key)
             item = out.setdefault(f"protein:{protein_id}", {"protein_id": protein_id})
-            for src_key, dst_key in [("name", "protein_name"), ("preferred_name", "protein_name"), ("gene_symbol", "gene_symbol"), ("symbol", "gene_symbol")]:
-                if props.get(src_key) and not item.get(dst_key):
-                    item[dst_key] = props.get(src_key)
+            for src_key, dst_key in [
+                ("name", "protein_name"), ("preferred_name", "protein_name"), ("protein_name", "protein_name"),
+                ("gene_symbol", "gene_symbol"), ("symbol", "gene_symbol"), ("cyp_symbol", "gene_symbol"), ("target_symbol", "gene_symbol"),
+                ("ncbi_gene_id", "gene_id"),
+            ]:
+                if norm_props.get(src_key) and not item.get(dst_key):
+                    item[dst_key] = norm_props.get(src_key)
     gene_file = store.nodes_dir / "Gene.jsonl"
     if gene_file.exists():
         for rec in _iter_jsonl(gene_file):
@@ -630,10 +636,11 @@ def _target_entities_from_artifacts(store: RunStore) -> List[Dict[str, object]]:
             gene_id = str(key.get("gene_id") or props.get("gene_id") or "").strip()
             if not gene_id:
                 continue
+            norm_props = normalize_gene_props(props, key)
             item = out.setdefault(f"gene:{gene_id}", {"gene_id": gene_id})
-            for src_key, dst_key in [("symbol", "gene_symbol"), ("name", "gene_name"), ("gene_symbol", "gene_symbol")]:
-                if props.get(src_key) and not item.get(dst_key):
-                    item[dst_key] = props.get(src_key)
+            for src_key, dst_key in [("symbol", "gene_symbol"), ("name", "gene_name"), ("gene_symbol", "gene_symbol"), ("cyp_symbol", "gene_symbol")]:
+                if norm_props.get(src_key) and not item.get(dst_key):
+                    item[dst_key] = norm_props.get(src_key)
     # Add CYP symbols from known protein accessions when PubChem did not expose Gene nodes.
     accession_to_symbol = {
         "P08684": "CYP3A4", "P20815": "CYP3A5", "P05177": "CYP1A2", "P11712": "CYP2C9",
@@ -1323,6 +1330,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "run_dir": str(run_dir),
                 "log_file": str(log_path),
                 "cache_dir": str(settings.cache_dir),
+                "schema_dot": str(settings.schema_dot_path) if getattr(settings, "schema_dot_path", None) else None,
                 "textmining_source": getattr(settings, "textmining_source", "auto"),
             "textmining_pubmed_fallback": getattr(settings, "textmining_pubmed_fallback", True),
             "textmining_file": str(settings.textmining_file) if settings.textmining_file else None,
@@ -1406,6 +1414,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             "run_dir": str(run_dir),
             "log_file": str(log_path),
             "cache_dir": str(settings.cache_dir),
+            "schema_dot": str(settings.schema_dot_path) if getattr(settings, "schema_dot_path", None) else None,
             "textmining_source": getattr(settings, "textmining_source", "auto"),
             "textmining_pubmed_fallback": getattr(settings, "textmining_pubmed_fallback", True),
             "textmining_file": str(settings.textmining_file) if settings.textmining_file else None,
@@ -1624,6 +1633,29 @@ def main(argv: Optional[List[str]] = None) -> None:
             node_count += textmine_nodes
             rel_count += textmine_rels
             row_count += textmine_rows
+
+        textmining_report = {
+            "requested": True,
+            "source": source,
+            "rows": int(textmine_rows),
+            "nodes": int(textmine_nodes),
+            "relationships": int(textmine_rels),
+            "cooc_nodes_before": int(before_cooc),
+            "cooc_nodes_after": int(_count_jsonl_records(store.nodes_dir / "Cooc.jsonl")),
+            "pubmed_fallback_enabled": bool(getattr(settings, "textmining_pubmed_fallback", True)),
+            "textmining_file": str(settings.textmining_file) if settings.textmining_file else None,
+            "status": "materialized" if _count_jsonl_records(store.nodes_dir / "Cooc.jsonl") > before_cooc else "empty_or_unavailable",
+        }
+        try:
+            (store.graph_dir / "textmining_report.json").write_text(json.dumps(textmining_report, indent=2, ensure_ascii=False), encoding="utf-8")
+            store._write_stage_marker("textmining", "complete" if textmining_report["status"] == "materialized" else "skipped", textmining_report)
+        except Exception:
+            pass
+    else:
+        try:
+            store._write_stage_marker("textmining", "skipped", {"requested": False, "status": "disabled"})
+        except Exception:
+            pass
 
     sim_rows = sim_nodes = sim_rels = 0
     if settings.flags.include_compound_similarity:

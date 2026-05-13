@@ -68,7 +68,7 @@ digraph PRING_Final_ImplementationReady_Thesis {
     color="honeydew";
 
     Structure  [label="Structure\nkey: cid (1:1)\nprops: smiles, inchi, inchikey"];
-    Properties [label="Properties\nkey: cid (1:1)\nprops: formula, exact_mass?, molecular_weight, xlogp3?, tpsa?"];
+    Properties [label="Properties\nkey: cid (1:1)\nprops: formula, molecular_weight, xlogp3?, tpsa?,\nHBD/HBA?, rotatable_bonds?, formula-derived descriptors?"];
     Synonyms   [label="Synonyms\nkey: cid (1:1 or 1:n)\nprops: preferred, synonyms[]"];
     Neighbors  [label="Neighbors (raw staging)\nkey: cid\nprops: raw_neighbors[]\nparents/components/similar as delivered"];
   }
@@ -83,7 +83,7 @@ digraph PRING_Final_ImplementationReady_Thesis {
 
     BioAssay   [label="BioAssay\nkey: aid\nprops: title, assay_type?, activity_outcome_method?, pubchem_uri?"];
     MeasureGrp [label="MeasureGroup\nkey: measuregroup_id\nprops: panel_row?, assay_context?, target_panel?, pubchem_uri?"];
-    Endpoint   [label="Endpoint\nkey: endpoint_id\nprops: endpoint_type, value, unit, qualifier?,\noutcome_label?, activity_flag?, score?"];
+    Endpoint   [label="Endpoint\nkey: endpoint_id\nprops: endpoint_type, value, unit, qualifier?,\nvalue_float?, value_molar?, -log10M?, outcome/activity label?, score?"];
   }
 
   // --------------------------------------------------------------------------
@@ -145,7 +145,7 @@ digraph PRING_Final_ImplementationReady_Thesis {
     AlphaFold [label="AlphaFoldModel\nkey: alphafold_id\nprops: model_version?, confidence_summary?"];
 
     ProtEmbed [label="ProteinEmbedding\nkey: embedding_id\nprops: method, dim, storage_uri, version"];
-    MolGraph  [label="MolecularRepresentation\nkey: repr_id\nprops: method, fp_type?, dim?, storage_uri, version"];
+    MolGraph  [label="MolecularRepresentation\nkey: repr_id\nprops: SMILES, RDKit/fallback fingerprint bits,\nformula descriptors, method, fp_type?, dim?, version"];
   }
 
   // --------------------------------------------------------------------------
@@ -156,7 +156,7 @@ digraph PRING_Final_ImplementationReady_Thesis {
     style="rounded,filled";
     color="moccasin";
 
-    Interaction [label="InteractionAssertion\nkey: interaction_id\nprops: label, confidence, evidence_count,\naggregation_rule, split?, created_by='PRING'"];
+    Interaction [label="InteractionAssertion\nkey: interaction_id\nprops: label, confidence, evidence_count, assay/reference counts,\naggregation_rule, split?, created_by='PRING'"];
   }
 
   // =========================
@@ -207,6 +207,7 @@ digraph PRING_Final_ImplementationReady_Thesis {
 
   // Text-mined layer (kept distinct from curated evidence)
   Cooc -> Compound  [label="MENTIONS_COMPOUND", style=dashed];
+  Cooc -> Protein   [label="MENTIONS_PROTEIN", style=dashed];
   Cooc -> Gene      [label="MENTIONS_GENE", style=dashed];
   Cooc -> Disease   [label="MENTIONS_DISEASE", style=dashed];
   Cooc -> Reference [label="FOUND_IN_REFERENCE", style=dashed];
@@ -245,6 +246,7 @@ digraph PRING_Final_ImplementationReady_Thesis {
   Compound -> MolGraph  [style=dashed, label="HAS_MOLECULAR_REPRESENTATION"];
   Compound -> ChEMBL    [style=dashed, label="HAS_CHEMBL_RECORD"];
   Compound -> BindingDB [style=dashed, label="HAS_BINDINGDB_RECORD"];
+  Protein  -> BindingDB [style=dashed, label="HAS_BINDINGDB_TARGET_RECORD"];
   Compound -> DrugBank  [style=dashed, label="HAS_DRUGBANK_RECORD"];
 
   Endpoint -> ChEMBL    [style=dashed, label="HARMONIZED_TO_CHEMBL"];

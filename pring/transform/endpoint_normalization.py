@@ -73,9 +73,17 @@ def normalize_endpoint_props(props: Dict[str, Any], key: Optional[Dict[str, Any]
     raw_value = out.get("value")
     if raw_value is not None:
         out.setdefault("value_raw", _text(raw_value) or raw_value)
+
+    # Some rematerialized/merged Endpoint records already contain value_float
+    # or value_molar but no original ``value`` field. Recompute the numeric
+    # flag from all numeric representations instead of trusting an older
+    # false ``has_numeric_value`` property. This keeps Neo4j/ML CSV exports
+    # safe after load-run rematerialization.
     value_float = _parse_float(raw_value)
+    if value_float is None:
+        value_float = _parse_float(out.get("value_float"))
     if value_float is not None and math.isfinite(value_float):
-        out.setdefault("value_float", value_float)
+        out["value_float"] = value_float
 
     unit_raw = _text(out.get("unit") or out.get("unit_uri") or out.get("unit_curie"))
     if unit_raw:
@@ -121,13 +129,19 @@ def normalize_endpoint_props(props: Dict[str, Any], key: Optional[Dict[str, Any]
     if value_float is not None and unit_raw:
         molar = value_to_molar(value_float, out.get("unit_curie") or unit_raw)
         if molar is not None and math.isfinite(molar):
-            out.setdefault("value_molar", molar)
+            out["value_molar"] = molar
             if molar > 0:
                 # pActivity-like feature. Higher values mean stronger potency for
                 # concentration endpoints such as IC50/Ki/Km.
-                out.setdefault("negative_log10_molar", -math.log10(molar))
+                out["negative_log10_molar"] = -math.log10(molar)
 
-    out.setdefault("has_numeric_value", bool(value_float is not None))
+    existing_molar = _parse_float(out.get("value_molar"))
+    if existing_molar is not None and math.isfinite(existing_molar):
+        out["value_molar"] = existing_molar
+        if existing_molar > 0:
+            out["negative_log10_molar"] = -math.log10(existing_molar)
+
+    out["has_numeric_value"] = bool(value_float is not None or existing_molar is not None)
     return out
 
 

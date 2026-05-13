@@ -139,6 +139,26 @@ def iter_external_enrichment_rows(
         if "molgraph" in requested:
             for compound in inputs.compounds:
                 for row in _molgraph_rows(client, compound, max_records=max_records):
+                    # Persist freshly retrieved structure and descriptor fields
+                    # back into the canonical compound sidecars. A PubChemRow of
+                    # kind ``compound`` materializes Compound, Structure, and
+                    # Properties nodes without creating any new schema concept.
+                    if row.get("cid") is not None:
+                        yield PubChemRow("compound", {
+                            "cid": row.get("cid"),
+                            "smiles": row.get("smiles") or row.get("canonical_smiles"),
+                            "canonical_smiles": row.get("canonical_smiles"),
+                            "isomeric_smiles": row.get("isomeric_smiles"),
+                            "inchi": row.get("inchi"),
+                            "inchikey": row.get("inchikey"),
+                            "formula": row.get("formula"),
+                            "molecular_weight": row.get("molecular_weight"),
+                            "xlogp3": row.get("xlogp"),
+                            "tpsa": row.get("tpsa"),
+                            "hbond_donor_count": row.get("hbond_donor_count"),
+                            "hbond_acceptor_count": row.get("hbond_acceptor_count"),
+                            "rotatable_bond_count": row.get("rotatable_bond_count"),
+                        })
                     yield PubChemRow("molgraph", row)
 
         if "chembl" in requested:
@@ -149,18 +169,67 @@ def iter_external_enrichment_rows(
         if "bindingdb" in requested:
             # Prefer optional offline TSV/CSV imports for BindingDB because their
             # web services are broad and target-centric; fallback online calls are
-            # conservative and target-based.
+            # conservative and target-based. Write explicit diagnostics so zero
+            # materialized rows is explainable in the run QA report.
+            diag: Dict[str, Any] = {
+                "requested": True,
+                "mode": "file" if getattr(settings, "bindingdb_file", None) else "online_uniprot",
+                "targets_queried": 0,
+                "records_after_parsing": 0,
+                "records_with_pubchem_cid": 0,
+                "records_without_pubchem_cid": 0,
+                "records_emitted": 0,
+                "http_success_targets": 0,
+                "http_failed_targets": 0,
+                "raw_records_returned": 0,
+                "example_raw_record_keys": [],
+                "query_urls": [],
+                "target_details": [],
+            }
             f = getattr(settings, "bindingdb_file", None)
             if f:
-                for row in _bindingdb_file_rows(Path(f), inputs, max_records=max_records):
+                rows = list(_bindingdb_file_rows(Path(f), inputs, max_records=max_records))
+                diag["records_after_parsing"] = len(rows)
+                diag["records_with_pubchem_cid"] = sum(1 for r in rows if r.get("cid") is not None)
+                diag["records_without_pubchem_cid"] = sum(1 for r in rows if r.get("cid") is None)
+                for row in rows:
+                    diag["records_emitted"] += 1
                     yield PubChemRow("bindingdb", row)
             else:
                 for protein in inputs.proteins:
                     acc = protein.get("uniprot_acc") or _extract_uniprot_acc(protein.get("protein_id"), protein.get("pubchem_uri"))
                     if not acc:
                         continue
-                    for row in _bindingdb_uniprot_rows(client, str(protein.get("protein_id") or acc), str(acc).split("-")[0], max_records=max_records):
+                    diag["targets_queried"] += 1
+                    protein_id = str(protein.get("protein_id") or acc)
+                    acc_text = str(acc).split("-")[0]
+                    detail: Dict[str, Any] = {
+                        "protein_id": protein_id,
+                        "uniprot_acc": acc_text,
+                    }
+                    rows = list(_bindingdb_uniprot_rows(client, protein_id, acc_text, max_records=max_records, diagnostics=detail))
+                    detail.update({
+                        "rows_emitted": len(rows),
+                        "rows_with_pubchem_cid": sum(1 for r in rows if r.get("cid") is not None),
+                    })
+                    if detail.get("http_success"):
+                        diag["http_success_targets"] += 1
+                    else:
+                        diag["http_failed_targets"] += 1
+                    diag["raw_records_returned"] += int(detail.get("raw_records_returned") or 0)
+                    if detail.get("example_raw_record_keys") and not diag["example_raw_record_keys"]:
+                        diag["example_raw_record_keys"] = detail.get("example_raw_record_keys")
+                    if detail.get("query_url"):
+                        diag["query_urls"].append(detail.get("query_url"))
+                    diag["target_details"].append(detail)
+                    diag["records_after_parsing"] += len(rows)
+                    diag["records_with_pubchem_cid"] += detail["rows_with_pubchem_cid"]
+                    diag["records_without_pubchem_cid"] += max(0, len(rows) - detail["rows_with_pubchem_cid"])
+                    for row in rows:
+                        diag["records_emitted"] += 1
                         yield PubChemRow("bindingdb", row)
+            diag["status"] = "materialized" if diag["records_emitted"] else "empty_or_unavailable"
+            _write_enrichment_report(store, "bindingdb_report.json", diag)
 
         if "drugbank" in requested:
             # DrugBank's current API requires licensed/authenticated access. PRING
@@ -406,11 +475,27 @@ def _alphafold_rows(client: HttpClient, protein_id: str, acc: str, *, max_record
             }
         return
 
-    # Do not create URL-pattern placeholders. For GCN/Neo4j QA, an AlphaFold
-    # node should mean that the AlphaFold API returned a real model record. If
-    # the API is unreachable or the accession has no model, leave the layer empty
-    # and let graph/run_quality_report.json show it as missing.
-    log.warning("AlphaFold API returned no usable confirmed model for %s; no AlphaFold node was written.", acc)
+    # Fallback for known UniProt accessions when the API endpoint is temporarily
+    # unavailable or returns an evolved empty wrapper. The node is explicitly
+    # marked unverified so QA can distinguish it from API-confirmed models, while
+    # still preserving the useful AlphaFold URL pattern for Neo4j exploration.
+    fallback_id = f"AF-{acc}-F1"
+    log.warning("AlphaFold API returned no usable confirmed model for %s; writing unverified URL-pattern fallback node.", acc)
+    yield {
+        "protein_id": protein_id,
+        "uniprot_acc": acc,
+        "alphafold_id": fallback_id,
+        "model_version": None,
+        "confidence_summary": None,
+        "average_plddt": None,
+        "pdb_url": f"https://alphafold.ebi.ac.uk/files/{fallback_id}-model_v4.pdb",
+        "cif_url": f"https://alphafold.ebi.ac.uk/files/{fallback_id}-model_v4.cif",
+        "pae_url": f"https://alphafold.ebi.ac.uk/files/{fallback_id}-predicted_aligned_error_v4.json",
+        "storage_uri": f"https://alphafold.ebi.ac.uk/files/{fallback_id}-model_v4.cif",
+        "source_url": f"https://alphafold.ebi.ac.uk/entry/{acc}",
+        "model_status": "url_pattern_fallback_unverified",
+        "source": "AlphaFold DB URL-pattern fallback",
+    }
     return
 
 def _protein_embedding_row(protein_id: str, acc: str, rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -439,15 +524,28 @@ def _protein_embedding_row(protein_id: str, acc: str, rec: Dict[str, Any]) -> Op
 
 
 def _molgraph_rows(client: HttpClient, compound: Dict[str, Any], *, max_records: Optional[int]) -> Iterator[Dict[str, Any]]:
+    """Yield molecular descriptor/fingerprint rows for a compound.
+
+    The function deliberately fetches PubChem PUG-REST properties whenever
+    SMILES or core descriptors are missing, even if InChIKey is already present.
+    Earlier versions considered InChIKey alone sufficient and therefore wrote
+    MolGraph rows with zero SMILES coverage. RDKit Morgan fingerprints are used
+    when RDKit is installed; otherwise a deterministic hashed SMILES n-gram
+    fallback is emitted so the GCN export still has stable bit features.
+    """
     cid = _as_int(compound.get("cid"))
     if cid is None:
         return
     props = dict(compound)
-    # Fetch missing PubChem descriptors only when needed.
-    if not any(props.get(k) for k in ["smiles", "canonical_smiles", "inchikey", "molecular_weight", "formula"]):
+
+    needs_fetch = not _smiles_value(props) or not all(
+        _first_nonempty_dict(props, key) is not None
+        for key in ["molecular_weight", "formula", "xlogp3", "tpsa", "hbond_donor_count", "hbond_acceptor_count", "rotatable_bond_count"]
+    )
+    if needs_fetch:
         url = (
             "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/"
-            f"{cid}/property/CanonicalSMILES,IsomericSMILES,InChIKey,MolecularFormula,"
+            f"{cid}/property/CanonicalSMILES,IsomericSMILES,InChI,InChIKey,MolecularFormula,"
             "MolecularWeight,XLogP,TPSA,HBondDonorCount,HBondAcceptorCount,RotatableBondCount,HeavyAtomCount,Charge/JSON"
         )
         data = _safe_get_json(client, url)
@@ -456,28 +554,114 @@ def _molgraph_rows(client: HttpClient, compound: Dict[str, Any], *, max_records:
             props.update({k: v for k, v in record.items() if v not in (None, "")})
         except Exception:
             pass
-    smiles = props.get("smiles") or props.get("canonical_smiles") or props.get("CanonicalSMILES") or props.get("IsomericSMILES")
-    yield {
+
+    smiles = _smiles_value(props)
+    canonical_smiles = _first_nonempty_dict(props, "canonical_smiles", "CanonicalSMILES", "smiles", "SMILES")
+    isomeric_smiles = _first_nonempty_dict(props, "isomeric_smiles", "IsomericSMILES")
+    formula = _first_nonempty_dict(props, "formula", "MolecularFormula")
+
+    descriptor_props: Dict[str, Any] = {
         "cid": cid,
         "repr_id": f"molgraph:CID{cid}:pubchem_descriptors_v1",
         "method": "pubchem_descriptors_v1",
-        "fp_type": "descriptor_vector",
-        "dim": 10,
-        "canonical_smiles": smiles,
-        "inchikey": props.get("inchikey") or props.get("InChIKey"),
-        "formula": props.get("formula") or props.get("MolecularFormula"),
-        "molecular_weight": props.get("molecular_weight") or props.get("MolecularWeight"),
-        "xlogp": props.get("xlogp3") or props.get("XLogP"),
-        "tpsa": props.get("tpsa") or props.get("TPSA"),
-        "hbond_donor_count": props.get("hbond_donor_count") or props.get("HBondDonorCount"),
-        "hbond_acceptor_count": props.get("hbond_acceptor_count") or props.get("HBondAcceptorCount"),
-        "rotatable_bond_count": props.get("rotatable_bond_count") or props.get("RotatableBondCount"),
-        "heavy_atom_count": props.get("HeavyAtomCount"),
-        "charge": props.get("Charge"),
+        "fp_type": "descriptor_vector+fingerprint",
+        "dim": 266,
+        "smiles": smiles,
+        "canonical_smiles": canonical_smiles or smiles,
+        "isomeric_smiles": isomeric_smiles,
+        "inchi": _first_nonempty_dict(props, "inchi", "InChI"),
+        "inchikey": _first_nonempty_dict(props, "inchikey", "InChIKey"),
+        "formula": formula,
+        "molecular_weight": _first_nonempty_dict(props, "molecular_weight", "MolecularWeight"),
+        "xlogp": _first_nonempty_dict(props, "xlogp3", "xlogp", "XLogP"),
+        "tpsa": _first_nonempty_dict(props, "tpsa", "TPSA"),
+        "hbond_donor_count": _first_nonempty_dict(props, "hbond_donor_count", "HBondDonorCount"),
+        "hbond_acceptor_count": _first_nonempty_dict(props, "hbond_acceptor_count", "HBondAcceptorCount"),
+        "rotatable_bond_count": _first_nonempty_dict(props, "rotatable_bond_count", "RotatableBondCount"),
+        "heavy_atom_count": _first_nonempty_dict(props, "heavy_atom_count", "HeavyAtomCount"),
+        "charge": _first_nonempty_dict(props, "charge", "Charge"),
         "smiles_length": len(str(smiles or "")),
         "source": "PubChem PUG-REST properties / existing PRING structure fields",
     }
+    descriptor_props.update(_formula_features(formula))
+    descriptor_props.update(_fingerprint_features(smiles, n_bits=256))
+    yield descriptor_props
 
+
+
+def _first_nonempty_dict(props: Dict[str, Any], *keys: str) -> Optional[Any]:
+    for key in keys:
+        value = props.get(key)
+        if value not in (None, "", [], {}):
+            return value
+    return None
+
+
+def _smiles_value(props: Dict[str, Any]) -> Optional[str]:
+    value = _first_nonempty_dict(
+        props,
+        "smiles", "canonical_smiles", "CanonicalSMILES", "SMILES",
+        "isomeric_smiles", "IsomericSMILES", "ConnectivitySMILES",
+    )
+    return str(value).strip() if value not in (None, "") else None
+
+
+def _formula_features(formula: Any) -> Dict[str, Any]:
+    """Return lightweight formula-derived descriptors for ML exports."""
+    text = str(formula or "").strip()
+    if not text:
+        return {}
+    counts: Dict[str, int] = {}
+    for elem, raw_n in re.findall(r"([A-Z][a-z]?)(\d*)", text):
+        counts[elem] = counts.get(elem, 0) + int(raw_n or 1)
+    total_atoms = sum(counts.values())
+    hetero = sum(v for k, v in counts.items() if k not in {"C", "H"})
+    return {
+        "formula_atom_count": total_atoms,
+        "formula_c_count": counts.get("C", 0),
+        "formula_h_count": counts.get("H", 0),
+        "formula_n_count": counts.get("N", 0),
+        "formula_o_count": counts.get("O", 0),
+        "formula_s_count": counts.get("S", 0),
+        "formula_halogen_count": counts.get("F", 0) + counts.get("Cl", 0) + counts.get("Br", 0) + counts.get("I", 0),
+        "formula_hetero_atom_count": hetero,
+        "formula_element_count": len(counts),
+    }
+
+
+def _fingerprint_features(smiles: Optional[str], *, n_bits: int = 256) -> Dict[str, Any]:
+    """Build RDKit Morgan fingerprints, with deterministic fallback bits."""
+    if not smiles:
+        return {"fingerprint_available": False, "fingerprint_method": "missing_smiles", "fingerprint_nbits": n_bits, "fingerprint_on_bits": 0}
+    try:
+        from rdkit import Chem  # type: ignore
+        from rdkit.Chem import AllChem  # type: ignore
+
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            raise ValueError("RDKit could not parse SMILES")
+        fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=int(n_bits))
+        bits = [int(x) for x in fp.ToBitString()]
+        method = "rdkit_morgan_radius2"
+    except Exception:
+        bits = [0] * int(n_bits)
+        padded = f"^{smiles}$"
+        tokens = set()
+        for n in (2, 3, 4):
+            tokens.update(padded[i : i + n] for i in range(max(0, len(padded) - n + 1)))
+        for token in tokens:
+            idx = int(hashlib.sha1(token.encode("utf-8")).hexdigest()[:8], 16) % int(n_bits)
+            bits[idx] = 1
+        method = "hashed_smiles_ngram_fallback"
+    out: Dict[str, Any] = {
+        "fingerprint_available": True,
+        "fingerprint_method": method,
+        "fingerprint_nbits": int(n_bits),
+        "fingerprint_on_bits": sum(bits),
+    }
+    for i, bit in enumerate(bits):
+        out[f"fp_{i}"] = bit
+    return out
 
 def _chembl_rows(client: HttpClient, compound: Dict[str, Any], *, max_records: Optional[int]) -> Iterator[Dict[str, Any]]:
     inchikey = compound.get("inchikey") or compound.get("InChIKey")
@@ -511,16 +695,35 @@ def _chembl_rows(client: HttpClient, compound: Dict[str, Any], *, max_records: O
         }
 
 
-def _bindingdb_uniprot_rows(client: HttpClient, protein_id: str, acc: str, *, max_records: Optional[int]) -> Iterator[Dict[str, Any]]:
+def _bindingdb_uniprot_rows(
+    client: HttpClient,
+    protein_id: str,
+    acc: str,
+    *,
+    max_records: Optional[int],
+    diagnostics: Optional[Dict[str, Any]] = None,
+) -> Iterator[Dict[str, Any]]:
     """Yield BindingDB rows for one UniProt accession using the documented REST API."""
     url = "https://bindingdb.org/rest/getLigandsByUniprot"
-    data = _safe_get_json(
-        client,
-        url,
-        params={"uniprot": f"{acc};10000", "response": "application/json"},
-        warn=False,
-    )
+    params = {"uniprot": f"{acc};10000", "response": "application/json"}
+    if diagnostics is not None:
+        diagnostics["query_url"] = f"{url}?uniprot={acc};10000&response=application/json"
+    try:
+        data = client.get_json(url, params=params)
+        if diagnostics is not None:
+            diagnostics["http_success"] = True
+    except Exception as exc:
+        log.debug("BindingDB enrichment request failed %s params=%s error=%s", url, params, exc)
+        if diagnostics is not None:
+            diagnostics["http_success"] = False
+            diagnostics["error"] = str(exc)
+        data = {}
     records = _bindingdb_records_from_response(data)
+    if diagnostics is not None:
+        diagnostics["raw_records_returned"] = len(records)
+        diagnostics["response_container_type"] = type(data).__name__
+        if records:
+            diagnostics["example_raw_record_keys"] = sorted(str(k) for k in list(records[0].keys())[:50])
 
     # Some targets genuinely have no BindingDB records. Do not fail the build.
     if not records:
@@ -706,6 +909,15 @@ def _extract_uniprot_acc(*values: Any) -> Optional[str]:
                 return c
     return None
 
+
+
+def _write_enrichment_report(store: Any, filename: str, payload: Dict[str, Any]) -> None:
+    try:
+        graph_dir = Path(getattr(store, "graph_dir"))
+        graph_dir.mkdir(parents=True, exist_ok=True)
+        (graph_dir / filename).write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        log.debug("Could not write enrichment report %s", filename, exc_info=True)
 
 def _read_jsonl(path: Path) -> Iterator[Dict[str, Any]]:
     if not path.exists():
