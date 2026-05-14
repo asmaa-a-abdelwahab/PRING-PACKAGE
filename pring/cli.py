@@ -604,7 +604,7 @@ def _load_existing_run_to_neo4j(
     rel_count = _count_jsonl_files(store.rels_dir)
 
     if not load_neo4j:
-        log.info("✅ Neo4j disabled: existing run artifacts were checked/refreshed in %s", source_run_dir)
+        log.info("✅ Neo4j disabled: existing run artifacts were checked/refreshed in %s", store.run_dir)
         log.info("Final artifacts: nodes=%d relationships=%d", node_count, rel_count)
         return
 

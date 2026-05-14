@@ -138,7 +138,7 @@ digraph PRING_Final_ImplementationReady_Thesis {
     InterPro  [label="InterProDomain\nkey: interpro_id\nprops: name, type?"];
 
     ChEMBL    [label="ChEMBLRecord\nkey: chembl_id\nprops: entity_type, assay_id?, activity_id?"];
-    BindingDB [label="BindingDBRecord\nkey: bindingdb_id\nprops: kd?, ki?, ic50?, source_ref?"];
+    BindingDB [label="BindingDBRecord\nkey: bindingdb_id\nprops: ligand_id?, kd?, ki?, ic50?, affinity_type?, affinity_value?, smiles?, inchikey?, parse_status?, source_ref?"];
     DrugBank  [label="DrugBankRecord\nkey: drugbank_id\nprops: name, category?, mechanism?"];
 
     PDB       [label="PDBStructure\nkey: pdb_id\nprops: method?, resolution?, chain_map?"];

@@ -215,6 +215,8 @@ def iter_external_enrichment_rows(
                 "records_after_parsing": 0,
                 "records_with_pubchem_cid": 0,
                 "records_without_pubchem_cid": 0,
+                "records_with_smiles": 0,
+                "records_with_inchikey": 0,
                 "records_emitted": 0,
                 "http_success_targets": 0,
                 "http_failed_targets": 0,
@@ -248,6 +250,10 @@ def iter_external_enrichment_rows(
                     detail.update({
                         "rows_emitted": len(rows),
                         "rows_with_pubchem_cid": sum(1 for r in rows if r.get("cid") is not None),
+                        "rows_with_smiles": sum(1 for r in rows if r.get("smiles")),
+                        "rows_with_inchikey": sum(1 for r in rows if r.get("inchikey")),
+                        "unique_ligands": len({str(r.get("ligand_id")) for r in rows if r.get("ligand_id")}),
+                        "parse_status_counts": _count_values(r.get("parse_status") for r in rows),
                     })
                     if detail.get("http_success"):
                         diag["http_success_targets"] += 1
@@ -262,6 +268,8 @@ def iter_external_enrichment_rows(
                     diag["records_after_parsing"] += len(rows)
                     diag["records_with_pubchem_cid"] += detail["rows_with_pubchem_cid"]
                     diag["records_without_pubchem_cid"] += max(0, len(rows) - detail["rows_with_pubchem_cid"])
+                    diag["records_with_smiles"] = int(diag.get("records_with_smiles") or 0) + int(detail.get("rows_with_smiles") or 0)
+                    diag["records_with_inchikey"] = int(diag.get("records_with_inchikey") or 0) + int(detail.get("rows_with_inchikey") or 0)
                     for row in rows:
                         diag["records_emitted"] += 1
                         yield PubChemRow("bindingdb", row)
@@ -1000,17 +1008,24 @@ def _bindingdb_uniprot_rows(
             "pubchemcid", "pubchemcids", "cid", "pubchemcompoundid",
             "pubchemcompoundcid", "pubchemcid",
         )
-        smiles = _first_bindingdb_flat_value(flat, "smiles", "ligandsmiles", "canonicalsmiles", "isomericsmiles")
-        inchikey = _first_bindingdb_flat_value(flat, "inchikey", "inchi_key", "ligandinchikey", "standardinchikey")
-        inchi = _first_bindingdb_flat_value(flat, "inchi", "ligandinchi", "standardinchi")
+        smiles = _first_bindingdb_flat_value(
+            flat,
+            "smiles", "smile", "bdbsmile", "bdbsmiles", "ligandsmiles",
+            "ligandsmile", "canonicalsmiles", "canonicalsmile", "isomericsmiles", "isomericsmile",
+        )
+        inchikey = _first_bindingdb_flat_value(
+            flat,
+            "inchikey", "inchi_key", "bdbinchikey", "ligandinchikey", "standardinchikey",
+        )
+        inchi = _first_bindingdb_flat_value(flat, "inchi", "bdbinchi", "ligandinchi", "standardinchi")
         if _as_int(cid) is None:
             cid = _resolve_pubchem_cid_for_bindingdb_ligand(client, smiles=smiles, inchikey=inchikey, inchi=inchi)
-        affinity_type = _first_bindingdb_flat_value(flat, "affinitytype", "type", "affinitykind")
-        affinity_value = _first_bindingdb_flat_value(flat, "affinity", "affinityvalue", "value", "affinitynm")
-        kd = _first_bindingdb_flat_value(flat, "kd", "kdnm")
-        ki = _first_bindingdb_flat_value(flat, "ki", "kinm")
-        ic50 = _first_bindingdb_flat_value(flat, "ic50", "ic50nm")
-        source_ref = _first_bindingdb_flat_value(flat, "pmid", "pubmedid", "doi", "reference", "articleid")
+        affinity_type = _first_bindingdb_flat_value(flat, "affinitytype", "bdbaffinitytype", "type", "affinitykind")
+        affinity_value = _first_bindingdb_flat_value(flat, "affinity", "bdbaffinity", "affinityvalue", "value", "affinitynm", "bdbvalue")
+        kd = _first_bindingdb_flat_value(flat, "kd", "bdbkd", "kdnm")
+        ki = _first_bindingdb_flat_value(flat, "ki", "bdbki", "kinm")
+        ic50 = _first_bindingdb_flat_value(flat, "ic50", "bdbic50", "ic50nm")
+        source_ref = _first_bindingdb_flat_value(flat, "pmid", "bdbpmid", "pubmedid", "doi", "reference", "articleid")
 
         # BindingDB's JSON wrappers are not stable across endpoints. If no
         # explicit ligand id/CID is exposed but the record contains affinity or
@@ -1021,10 +1036,16 @@ def _bindingdb_uniprot_rows(
             skipped_unparseable += 1
             continue
         ligand_id = str(ligand or (f"CID{cid}" if cid else f"{acc}:{raw_hash}")).strip()
+        # Keep BindingDB evidence records target- and row-specific. BindingDB
+        # monomer ids identify ligands, not a unique target-affinity record; using
+        # only the monomer id caused distinct CYP/affinity rows to merge during
+        # CSV/Neo4j node deduplication. The separate ligand_id remains available
+        # for ligand-level grouping, while bindingdb_id is safe as a node key.
+        bindingdb_record_id = f"BindingDB:{acc}:{ligand_id}:{raw_hash}"
         yield {
             "protein_id": protein_id,
             "cid": _as_int(cid),
-            "bindingdb_id": f"BindingDB:{ligand_id}",
+            "bindingdb_id": bindingdb_record_id,
             "ligand_id": ligand_id,
             "target_uniprot_acc": acc,
             "kd": kd,
@@ -1157,7 +1178,7 @@ def _bindingdb_records_from_response(data: Any) -> List[Dict[str, Any]]:
         return [x for x in data if isinstance(x, dict)]
     if not isinstance(data, dict):
         return []
-    for key in ("getLigandsByUniprotResponse", "getLigandsByUniprotsResponse", "response", "rows", "data", "records", "results"):
+    for key in ("getLigandsByUniprotResponse", "getLigandsByUniprotsResponse", "getLigandsByUniprot", "bdb:getLigandsByUniprotResponse", "bdb:hit", "hit", "hits", "response", "rows", "data", "records", "results"):
         value = data.get(key)
         if isinstance(value, list):
             return [x for x in value if isinstance(x, dict)]
@@ -1212,8 +1233,8 @@ def _bindingdb_file_rows(path: Path, inputs: EnrichmentInputs, *, max_records: O
             "ic50": _first_bindingdb_value(nrow, "ic50", "ic50nm"),
             "affinity_value": _first_bindingdb_value(nrow, "affinity", "affinityvalue", "value", "affinitynm"),
             "affinity_type": _first_bindingdb_value(nrow, "affinitytype", "type", "affinitykind"),
-            "smiles": _first_bindingdb_value(nrow, "smiles", "ligandsmiles", "canonicalsmiles", "isomericsmiles"),
-            "inchikey": _first_bindingdb_value(nrow, "inchikey", "inchi_key", "ligandinchikey", "standardinchikey"),
+            "smiles": _first_bindingdb_value(nrow, "smiles", "smile", "bdbsmile", "bdbsmiles", "ligandsmiles", "ligandsmile", "canonicalsmiles", "canonicalsmile", "isomericsmiles", "isomericsmile"),
+            "inchikey": _first_bindingdb_value(nrow, "inchikey", "inchi_key", "bdbinchikey", "ligandinchikey", "standardinchikey"),
             "source_ref": _first_bindingdb_value(nrow, "pmid", "pubmedid", "doi", "reference", "articleid"),
             **row,
             "source": row.get("source") or "BindingDB local import",
@@ -1242,6 +1263,14 @@ def _drugbank_file_rows(path: Path, inputs: EnrichmentInputs, *, max_records: Op
             "source": row.get("source") or "DrugBank local import",
         }
 
+
+
+def _count_values(values: Iterable[Any]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for value in values:
+        key = str(value or "").strip() or "missing"
+        counts[key] = counts.get(key, 0) + 1
+    return dict(sorted(counts.items()))
 
 def _safe_get_json(client: HttpClient, url: str, params: Optional[Dict[str, Any]] = None, *, warn: bool = True) -> Any:
     try:

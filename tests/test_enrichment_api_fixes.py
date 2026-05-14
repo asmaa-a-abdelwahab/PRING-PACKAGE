@@ -58,7 +58,8 @@ def test_bindingdb_uses_documented_rest_endpoint_and_parses_common_keys():
     assert client.calls[0][1] == {"uniprot": "P08684;10000", "response": "application/json"}
     assert len(rows) == 1
     row = rows[0]
-    assert row["bindingdb_id"] == "BindingDB:12345"
+    assert row["bindingdb_id"].startswith("BindingDB:P08684:12345:")
+    assert row["ligand_id"] == "12345"
     assert row["cid"] == 2244
     assert row["ki"] == "50"
     assert row["ic50"] == "100"

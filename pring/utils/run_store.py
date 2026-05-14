@@ -967,19 +967,29 @@ class RunStore:
                 start = rec.get("start") or {}
                 end = rec.get("end") or {}
                 props = rec.get("props") or {}
-                if schema_label == "SIMILAR_TO":
-                    props = dict(props)
-                    score_val = _as_float(props.get("score"))
-                    if score_val is None:
-                        threshold_val = _as_float(props.get("threshold"))
-                        if threshold_val is not None:
-                            score_val = threshold_val / 100.0 if threshold_val > 1 else threshold_val
-                            props.setdefault("score", score_val)
-                            props.setdefault("score_type", "threshold_lower_bound")
-                    if score_val is not None and props.get("edge_weight") in (None, ""):
-                        props["edge_weight"] = score_val
                 start_ref = _node_ref(start.get("label"), start.get("key") or {})
                 end_ref = _node_ref(end.get("label"), end.get("key") or {})
+                if schema_label == "SIMILAR_TO":
+                    props = dict(props)
+                    exact_tanimoto = _as_float(props.get("tanimoto"))
+                    if exact_tanimoto is None and str(start.get("label") or "") == "Compound" and str(end.get("label") or "") == "Compound":
+                        exact_tanimoto = _compute_rdkit_tanimoto_for_compound_refs(node_records_by_ref, start_ref, end_ref)
+                    if exact_tanimoto is not None:
+                        props["tanimoto"] = exact_tanimoto
+                        props["score"] = exact_tanimoto
+                        props["edge_weight"] = exact_tanimoto
+                        props["score_type"] = "rdkit_morgan_tanimoto"
+                        props.setdefault("similarity_computation", "csv_export_from_structure_smiles")
+                    else:
+                        score_val = _as_float(props.get("score"))
+                        if score_val is None:
+                            threshold_val = _as_float(props.get("threshold"))
+                            if threshold_val is not None:
+                                score_val = threshold_val / 100.0 if threshold_val > 1 else threshold_val
+                                props.setdefault("score", score_val)
+                                props.setdefault("score_type", "threshold_lower_bound")
+                        if score_val is not None and props.get("edge_weight") in (None, ""):
+                            props["edge_weight"] = score_val
                 edge_sig = (schema_label, start_ref, end_ref, _props_fingerprint(props))
                 if edge_sig in seen_edge_keys:
                     continue
@@ -1263,6 +1273,25 @@ class RunStore:
         _write_rows_csv(self.ml_dir / "compound_target_training_pairs.csv", training_pair_rows, columns=ML_PAIR_COLUMNS)
         _write_rows_csv(self.ml_dir / "compound_target_link_prediction_pairs.csv", link_prediction_pair_rows, columns=_columns(link_prediction_pair_rows) or list(dict.fromkeys(ML_PAIR_COLUMNS + ML_NEGATIVE_COLUMNS + ML_CANDIDATE_COLUMNS)))
 
+        ml_feature_export_summary = _build_ml_feature_export_summary(
+            compound_feature_rows=compound_feature_rows,
+            protein_feature_rows=protein_feature_rows,
+            protembed_feature_rows=protembed_feature_rows,
+            endpoint_feature_rows=endpoint_feature_rows,
+            training_pair_rows=training_pair_rows,
+            candidate_rows=candidate_rows,
+            link_prediction_pair_rows=link_prediction_pair_rows,
+        )
+        (self.ml_dir / "modeling_readiness_manifest.json").write_text(json.dumps(ml_feature_export_summary, indent=2, ensure_ascii=False), encoding="utf-8")
+        (self.ml_dir / "gcn_case_study_report.json").write_text(
+            json.dumps(ml_feature_export_summary.get("case_study_report", {}), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        (self.ml_dir / "feature_column_manifest.json").write_text(
+            json.dumps(ml_feature_export_summary.get("feature_column_manifest", {}), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
         summary["label_config"] = {
             "activity_threshold_um": activity_threshold_um,
             "weak_activity_as_negative": bool(weak_activity_as_negative),
@@ -1289,6 +1318,7 @@ class RunStore:
             "skipped_relationships_missing_nodes": skipped_relationships_missing_nodes,
             "split_strategy": "compound_similarity_component_holdout",
             "label_semantics": "supervised labels use normalized endpoint evidence; unobserved compound-target pairs are exported as unknown candidates, not true negatives",
+            "feature_export_summary": ml_feature_export_summary,
         }
         summary_path = self.graph_dir / "csv_export_summary.json"
         summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1749,7 +1779,10 @@ def _optional_layer_report(node_counts: Dict[str, int], relationship_counts: Dic
             "records_after_parsing": bindingdb_report.get("records_after_parsing"),
             "records_with_pubchem_cid": bindingdb_report.get("records_with_pubchem_cid"),
             "records_without_pubchem_cid": bindingdb_report.get("records_without_pubchem_cid"),
+            "records_with_smiles": bindingdb_report.get("records_with_smiles"),
+            "records_with_inchikey": bindingdb_report.get("records_with_inchikey"),
             "records_emitted": bindingdb_report.get("records_emitted"),
+            "target_details": bindingdb_report.get("target_details", []),
             "status": bindingdb_status,
         },
         "protein_embeddings": {
@@ -1995,6 +2028,230 @@ def _columns(rows: list[dict[str, Any]]) -> list[str]:
     return preferred + rest
 
 
+
+def _build_ml_feature_export_summary(
+    *,
+    compound_feature_rows: list[dict[str, Any]],
+    protein_feature_rows: list[dict[str, Any]],
+    protembed_feature_rows: list[dict[str, Any]],
+    endpoint_feature_rows: list[dict[str, Any]],
+    training_pair_rows: list[dict[str, Any]],
+    candidate_rows: list[dict[str, Any]],
+    link_prediction_pair_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Summarize whether exported ML files are directly usable by GCN loaders.
+
+    The manifest is deliberately strict for the CYP450 case study. It checks the
+    feature matrices, supervised pair labels, unknown candidate pairs, split
+    columns, embedding/vector availability, and feature-column provenance so that
+    a run can be evaluated without manually opening every CSV.
+    """
+
+    def cols(rows: list[dict[str, Any]]) -> set[str]:
+        return {str(k) for row in rows for k in row.keys()}
+
+    def non_empty(row: dict[str, Any], key: str) -> bool:
+        value = row.get(key)
+        return value not in (None, "", "NA", "N/A", "nan")
+
+    def vector_cols(rows: list[dict[str, Any]]) -> list[str]:
+        return sorted(
+            c for c in cols(rows)
+            if _is_embedding_feature_name(c)
+            or re.search(r"(^|_)fp_\d+$", c)
+            or re.search(r"(^|_)raw_emb_\d+$", c)
+            or re.search(r"(^|_)emb_\d+$", c)
+        )
+
+    def label_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for row in rows:
+            key = str(row.get("label", "")).strip() or "missing"
+            out[key] = out.get(key, 0) + 1
+        return dict(sorted(out.items()))
+
+    def split_counts(rows: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+        out: dict[str, dict[str, int]] = {}
+        for row in rows:
+            split = str(row.get("split", "")).strip() or "missing"
+            label = str(row.get("label", "")).strip() or "missing"
+            out.setdefault(split, {})[label] = out.setdefault(split, {}).get(label, 0) + 1
+        return {k: dict(sorted(v.items())) for k, v in sorted(out.items())}
+
+    def per_protein_counts(rows: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+        out: dict[str, dict[str, int]] = {}
+        for row in rows:
+            protein = str(row.get("protein_node_ref", "")).strip() or str(row.get("protein_node_id", "")).strip() or "missing"
+            label = str(row.get("label", "")).strip() or "missing"
+            out.setdefault(protein, {})[label] = out.setdefault(protein, {}).get(label, 0) + 1
+        return {k: dict(sorted(v.items())) for k, v in sorted(out.items())}
+
+    def coverage(rows: list[dict[str, Any]], wanted: list[str]) -> dict[str, Any]:
+        row_count = len(rows)
+        return {
+            key: {
+                "present": any(key in row for row in rows),
+                "non_empty_rows": sum(1 for row in rows if non_empty(row, key)),
+                "coverage_fraction": round((sum(1 for row in rows if non_empty(row, key)) / row_count), 6) if row_count else 0.0,
+            }
+            for key in wanted
+        }
+
+    def columns_by_prefix(columns: set[str], prefixes: tuple[str, ...]) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for c in columns:
+            for prefix in prefixes:
+                if c.startswith(prefix):
+                    out[prefix.rstrip("_")] = out.get(prefix.rstrip("_"), 0) + 1
+                    break
+        return dict(sorted(out.items()))
+
+    compound_cols = cols(compound_feature_rows)
+    protein_cols = cols(protein_feature_rows)
+    protembed_cols = cols(protembed_feature_rows)
+    endpoint_cols = cols(endpoint_feature_rows)
+    protembed_vectors = vector_cols(protembed_feature_rows)
+    protein_vectors = vector_cols(protein_feature_rows)
+    compound_vectors = vector_cols(compound_feature_rows)
+    required_pair_cols = {"compound_node_id", "protein_node_id", "compound_node_ref", "protein_node_ref", "label", "split"}
+    pair_cols = cols(link_prediction_pair_rows) | cols(training_pair_rows) | cols(candidate_rows)
+
+    blockers: list[str] = []
+    warnings: list[str] = []
+    if not compound_feature_rows:
+        blockers.append("node_features_compound.csv has no rows")
+    if not protein_feature_rows:
+        blockers.append("node_features_protein.csv has no rows")
+    if not training_pair_rows:
+        blockers.append("compound_target_training_pairs.csv has no supervised rows")
+    if not candidate_rows:
+        warnings.append("candidate_missing_compound_target_pairs.csv has no unknown pairs; link prediction cannot be scored over unobserved pairs")
+    missing_pair_cols = sorted(required_pair_cols - pair_cols)
+    if missing_pair_cols:
+        blockers.append("missing required pair columns: " + ", ".join(missing_pair_cols))
+    if not (compound_vectors or {"compound_molgraph_fingerprint_available", "molgraph_fingerprint_available"} & compound_cols):
+        blockers.append("compound fingerprint/vector features were not exported")
+    if not (protein_vectors or protembed_vectors or any(c.startswith("protembed_") for c in protein_cols)):
+        blockers.append("protein embedding/vector features were not exported")
+
+    supervised_labels = label_counts(training_pair_rows)
+    if supervised_labels.get("1", 0) == 0:
+        blockers.append("no positive compound-target training pairs were exported")
+    if supervised_labels.get("0", 0) == 0:
+        warnings.append("no curated negative/weak pairs were exported; train as positive-unlabeled or add confirmed negatives")
+
+    split_distribution = split_counts(link_prediction_pair_rows)
+    train_labels = split_distribution.get("train", {})
+    valid_labels = split_distribution.get("valid", {})
+    test_labels = split_distribution.get("test", {})
+    if link_prediction_pair_rows and (not valid_labels or not test_labels):
+        warnings.append("valid/test split is empty; small scoped tests can do this, but the 5-CYP final run should have non-empty validation/test splits")
+
+    gcn_ready = not blockers
+    compound_required = [
+        "molecular_weight", "xlogp3", "tpsa", "hbond_donor_count",
+        "hbond_acceptor_count", "rotatable_bond_count", "formula_atom_count",
+        "formula_heavy_atom_count", "similarity_degree",
+    ]
+    protein_required = [
+        "uniprot_sequence_length", "uniprot_molecular_weight", "go_count",
+        "reactome_count", "interpro_count", "protein_embedding_node_count",
+    ]
+    endpoint_required = [
+        "value_float", "value_molar", "activity_label_thresholded", "supervision_label",
+        "activity_threshold_um", "endpoint_type", "unit_curie",
+    ]
+
+    feature_column_manifest = {
+        "compound": {
+            "columns": sorted(compound_cols),
+            "vector_columns": compound_vectors,
+            "vector_column_count": len(compound_vectors),
+            "coverage": coverage(compound_feature_rows, compound_required),
+            "column_groups": columns_by_prefix(compound_cols, ("fp_", "molgraph_", "properties_", "structure_", "formula_", "similarity_")),
+        },
+        "protein": {
+            "columns": sorted(protein_cols),
+            "vector_columns": protein_vectors,
+            "vector_column_count": len(protein_vectors),
+            "coverage": coverage(protein_feature_rows, protein_required),
+            "column_groups": columns_by_prefix(protein_cols, ("protembed_", "uniprot_", "go_", "reactome_", "interpro_", "pdb_", "alphafold_", "bindingdb_")),
+        },
+        "protembed": {
+            "columns": sorted(protembed_cols),
+            "vector_columns": protembed_vectors,
+            "vector_column_count": len(protembed_vectors),
+            "methods": sorted({str(r.get("method") or "").strip() for r in protembed_feature_rows if str(r.get("method") or "").strip()}),
+            "model_families": sorted({str(r.get("model_family") or "").strip() for r in protembed_feature_rows if str(r.get("model_family") or "").strip()}),
+        },
+        "endpoint": {
+            "columns": sorted(endpoint_cols),
+            "coverage": coverage(endpoint_feature_rows, endpoint_required),
+        },
+        "pairs": {
+            "columns": sorted(pair_cols),
+            "required_columns": sorted(required_pair_cols),
+            "missing_required_columns": missing_pair_cols,
+        },
+    }
+
+    case_study_report = {
+        "status": "gcn_modeling_ready" if gcn_ready else "needs_attention",
+        "blockers": blockers,
+        "warnings": warnings,
+        "pair_distribution": {
+            "training_label_counts": supervised_labels,
+            "candidate_label_counts": label_counts(candidate_rows),
+            "link_prediction_label_counts": label_counts(link_prediction_pair_rows),
+            "per_split_label_counts": split_distribution,
+            "per_protein_training_label_counts": per_protein_counts(training_pair_rows),
+            "per_protein_link_prediction_label_counts": per_protein_counts(link_prediction_pair_rows),
+            "train_split_label_counts": train_labels,
+            "valid_split_label_counts": valid_labels,
+            "test_split_label_counts": test_labels,
+        },
+        "leakage_control": {
+            "split_strategy": "compound_similarity_component_holdout",
+            "rationale": "Compounds connected by SIMILAR_TO are assigned to the same deterministic split group to reduce analogue leakage across train/valid/test.",
+            "candidate_pairs_are_unknown_not_negative": True,
+        },
+        "recommended_training_modes": [
+            "Heterogeneous link prediction with Compound and Protein as primary node types plus SIMILAR_TO, Interaction, Endpoint, ProtEmbed, GO, Reactome and InterPro relations.",
+            "Positive-unlabeled link prediction when curated negative/weak evidence is sparse.",
+            "Supervised binary training only after enough threshold-derived negative/weak pairs are present or external confirmed negatives are added.",
+        ],
+        "feature_column_manifest_file": "feature_column_manifest.json",
+    }
+
+    return {
+        "status": "gcn_modeling_ready" if gcn_ready else "needs_attention",
+        "gcn_ready": gcn_ready,
+        "blockers": blockers,
+        "warnings": warnings,
+        "files": {
+            "node_features_compound.csv": {"rows": len(compound_feature_rows), "columns": len(compound_cols), "vector_columns": len(compound_vectors)},
+            "node_features_protein.csv": {"rows": len(protein_feature_rows), "columns": len(protein_cols), "vector_columns": len(protein_vectors)},
+            "node_features_protembed.csv": {"rows": len(protembed_feature_rows), "columns": len(protembed_cols), "vector_columns": len(protembed_vectors)},
+            "node_features_endpoint.csv": {"rows": len(endpoint_feature_rows), "columns": len(endpoint_cols)},
+            "compound_target_training_pairs.csv": {"rows": len(training_pair_rows), "label_counts": supervised_labels},
+            "candidate_missing_compound_target_pairs.csv": {"rows": len(candidate_rows), "label_counts": label_counts(candidate_rows)},
+            "compound_target_link_prediction_pairs.csv": {"rows": len(link_prediction_pair_rows), "label_counts": label_counts(link_prediction_pair_rows)},
+            "feature_column_manifest.json": {"written": True},
+            "gcn_case_study_report.json": {"written": True},
+        },
+        "required_pair_columns_present": sorted(required_pair_cols & pair_cols),
+        "missing_required_pair_columns": missing_pair_cols,
+        "pair_distribution": case_study_report["pair_distribution"],
+        "feature_column_manifest": feature_column_manifest,
+        "case_study_report": case_study_report,
+        "label_semantics": {
+            "1": "curated active/potent endpoint evidence",
+            "0": "curated inactive or weak endpoint evidence when configured",
+            "unknown": "unobserved compound-target candidate; not a true negative",
+        },
+        "recommended_gnn_setup": "heterogeneous GNN/R-GCN/HGT using Compound, Protein, ProtEmbed, Endpoint, Interaction and SIMILAR_TO relations; homogeneous GCN can use flattened node_features_compound/protein plus compound-target pair files as a baseline",
+    }
+
 def _write_rows_csv(path: Path, rows: list[dict[str, Any]], *, columns: Optional[list[str]] = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     cols = list(columns or []) or _columns(rows)
@@ -2088,12 +2345,33 @@ def _endpoint_supervision_label(
                 return endpoint_record.get(key)
         return None
 
+    # Prefer already-materialized supervised labels when present.  Several QA
+    # and load-run paths read merged/flattened Endpoint rows that already carry
+    # supervision_label / supervision_label_name from the thresholding step.
+    # Without this shortcut, reports could incorrectly classify all endpoints as
+    # ambiguous when the raw outcome fields were unavailable in that artifact.
+    direct_label = g("props_supervision_label", "supervision_label")
+    if direct_label not in (None, ""):
+        text = str(direct_label).strip().lower()
+        if text in {"1", "1.0", "true", "active", "positive"}:
+            return 1
+        if text in {"0", "0.0", "false", "inactive", "negative", "inactive_or_weak"}:
+            return 0
+    direct_label_name = _norm_label(g("props_supervision_label_name", "supervision_label_name", "props_activity_label", "activity_label"))
+    if direct_label_name in {"active", "positive", "curated_active"}:
+        return 1
+    if direct_label_name in {"inactive", "inactive_or_weak", "negative", "curated_inactive"}:
+        return 0
+    if direct_label_name in {"ambiguous", "ambiguous_or_unlabeled", "unknown", "unlabeled", "curated_unlabeled"}:
+        return None
+
     values = [
         g("props_activity_flag", "activity_flag"),
         g("props_outcome_label_normalized", "outcome_label_normalized"),
         g("props_outcome_label", "outcome_label"),
         g("props_outcome_raw", "outcome_raw"),
         g("props_label", "label"),
+        g("props_activity_label", "activity_label"),
     ]
     normalized_values = {_norm_label(v) for v in values if _norm_label(v)}
     if normalized_values & {"inactive", "negative", "no_activity", "not_active"}:
@@ -2355,7 +2633,7 @@ def _build_protein_feature_rows(
                 raw = k[6:]
                 if raw in {"raw", "source"}:
                     continue
-                if raw.startswith("emb_") or raw.startswith("aa_") or raw.startswith("freq_") or raw in {"dim", "sequence_length", "hydrophobic_fraction", "charged_fraction", "model_family", "model_name", "pooling", "version", "truncated_to"}:
+                if _is_embedding_feature_name(raw) or raw in {"dim", "sequence_length", "hydrophobic_fraction", "charged_fraction", "model_family", "model_name", "pooling", "version", "truncated_to"}:
                     out[f"protembed_{method}_{raw}"] = v
         rows.append(out)
     return rows
@@ -2380,6 +2658,18 @@ def _protein_embedding_records_for_acc(node_records_by_ref: dict[str, dict[str, 
 def _safe_feature_prefix(value: str) -> str:
     text = re.sub(r"[^0-9A-Za-z]+", "_", str(value or "").strip()).strip("_").lower()
     return text[:120] or "embedding"
+
+
+def _is_embedding_feature_name(name: str) -> bool:
+    """Return true for scalar embedding/vector feature names.
+
+    ProtEmbed nodes may reach the CSV/ML exporter either as native props such as
+    ``emb_0000``/``aa_a`` or as raw-field-preserved props such as
+    ``raw_emb_0000`` after ``_with_raw_fields``. Treat both forms as model
+    features so GCN loaders do not silently lose ESM2/ProtT5 vectors.
+    """
+    raw = str(name or "")
+    return raw.startswith(("emb_", "raw_emb_", "aa_", "raw_aa_", "freq_", "raw_freq_"))
 
 
 def _uniprot_acc_from_protein_id(protein_id: str) -> str:
@@ -2425,10 +2715,68 @@ def _build_protembed_feature_rows(
             if not k.startswith("props_"):
                 continue
             raw = k[6:]
-            if raw.startswith("emb_") or raw.startswith("aa_") or raw.startswith("freq_"):
+            if _is_embedding_feature_name(raw):
+                # Keep a method-prefixed name for heterogeneous feature loaders
+                # and an unprefixed raw name for the one-row-per-ProtEmbed file.
                 out[f"{method_prefix}_{raw}"] = v
+                out.setdefault(raw, v)
         rows.append(out)
     return rows
+
+def _compute_rdkit_tanimoto_for_compound_refs(
+    node_records_by_ref: dict[str, dict[str, str]],
+    start_ref: str,
+    end_ref: str,
+) -> Optional[float]:
+    """Compute exact Morgan Tanimoto for two Compound refs from exported SMILES.
+
+    This is a final export-time repair for SIMILAR_TO edges. Even if online
+    similarity retrieval only returned a threshold lower bound, the exporter can
+    usually compute an exact local RDKit score from already materialized
+    Structure/MolGraph rows. Failures are non-fatal and fall back to threshold.
+    """
+    smiles_a = _compound_smiles_for_ref(node_records_by_ref, start_ref)
+    smiles_b = _compound_smiles_for_ref(node_records_by_ref, end_ref)
+    if not smiles_a or not smiles_b:
+        return None
+    try:
+        from rdkit import Chem, DataStructs  # type: ignore
+        from rdkit.Chem import rdFingerprintGenerator  # type: ignore
+        mol_a = Chem.MolFromSmiles(str(smiles_a))
+        mol_b = Chem.MolFromSmiles(str(smiles_b))
+        if mol_a is None or mol_b is None:
+            return None
+        generator = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
+        fp_a = generator.GetFingerprint(mol_a)
+        fp_b = generator.GetFingerprint(mol_b)
+        return round(float(DataStructs.TanimotoSimilarity(fp_a, fp_b)), 6)
+    except Exception:
+        return None
+
+
+def _compound_smiles_for_ref(node_records_by_ref: dict[str, dict[str, str]], compound_ref: str) -> Optional[str]:
+    label, key = _parse_node_ref(compound_ref)
+    if label != "Compound":
+        return None
+    cid = key.get("cid")
+    candidates = [
+        node_records_by_ref.get(_node_ref("Structure", {"cid": cid}), {}),
+        node_records_by_ref.get(_node_ref("MolGraph", {"repr_id": f"molgraph:CID{cid}:pubchem_descriptors_v1"}), {}),
+        node_records_by_ref.get(_node_ref("MolGraph", {"repr_id": f"molgraph:CID{cid}:pubchem_features_v1"}), {}),
+        node_records_by_ref.get(compound_ref, {}),
+    ]
+    keys = (
+        "props_canonical_smiles", "props_smiles", "props_isomeric_smiles",
+        "props_raw_canonical_smiles", "props_raw_smiles", "props_raw_CanonicalSMILES",
+        "structure_canonical_smiles", "structure_smiles", "molgraph_smiles",
+    )
+    for rec in candidates:
+        for k in keys:
+            value = rec.get(k)
+            if value not in (None, "", "NA", "N/A"):
+                return str(value).strip()
+    return None
+
 
 def _build_endpoint_feature_rows(
     node_records_by_ref: dict[str, dict[str, str]],

@@ -674,10 +674,18 @@ def iter_graph_records(rows: Iterable[PubChemRow]) -> Iterator[Tuple[str, Dict]]
                 continue
             node("BindingDB", {"bindingdb_id": bindingdb_id}, _with_raw_fields({
                 "bindingdb_id": bindingdb_id,
+                "ligand_id": d.get("ligand_id"),
+                "target_uniprot_acc": d.get("target_uniprot_acc"),
                 "kd": d.get("kd"),
                 "ki": d.get("ki"),
                 "ic50": d.get("ic50"),
+                "affinity_type": d.get("affinity_type"),
+                "affinity_value": d.get("affinity_value"),
+                "smiles": d.get("smiles"),
+                "inchikey": d.get("inchikey"),
+                "parse_status": d.get("parse_status"),
                 "source_ref": d.get("source_ref"),
+                "source_url": d.get("source_url"),
             }, d))
             cid = _as_int(d.get("cid"))
             endpoint_id = _as_text(d.get("endpoint_id"))

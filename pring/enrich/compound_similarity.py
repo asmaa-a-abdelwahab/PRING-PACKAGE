@@ -148,13 +148,14 @@ def _rdkit_morgan_tanimoto(smiles_a: Optional[str], smiles_b: Optional[str]) -> 
         return None
     try:
         from rdkit import Chem, DataStructs  # type: ignore
-        from rdkit.Chem import AllChem  # type: ignore
+        from rdkit.Chem import rdFingerprintGenerator  # type: ignore
         mol_a = Chem.MolFromSmiles(str(smiles_a))
         mol_b = Chem.MolFromSmiles(str(smiles_b))
         if mol_a is None or mol_b is None:
             return None
-        fp_a = AllChem.GetMorganFingerprintAsBitVect(mol_a, radius=2, nBits=2048)
-        fp_b = AllChem.GetMorganFingerprintAsBitVect(mol_b, radius=2, nBits=2048)
+        generator = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
+        fp_a = generator.GetFingerprint(mol_a)
+        fp_b = generator.GetFingerprint(mol_b)
         return round(float(DataStructs.TanimotoSimilarity(fp_a, fp_b)), 6)
     except Exception:
         return None
