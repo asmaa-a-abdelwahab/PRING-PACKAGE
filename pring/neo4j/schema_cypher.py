@@ -54,8 +54,16 @@ def parse_schema_dot(path: Path) -> Tuple[List[str], List[DotEdge]]:
         lab = (attrs.get("label") or "").strip('"')
         if not lab:
             continue
+        # Relationship labels in the implementation schema may include rendered
+        # property annotations after a newline, e.g.
+        #   label="SIMILAR_TO\n{score?, edge_weight?, ...}"
+        # Downstream relationship-type normalization must see only the actual
+        # relationship type, not the annotation block.
+        lab_head = lab.replace("\\n", "\n").split("\n", 1)[0].strip()
+        if not lab_head:
+            continue
         style = (attrs.get("style") or "").strip('"') or None
-        edges.append(DotEdge(src=src, dst=dst, label=lab, style=style))
+        edges.append(DotEdge(src=src, dst=dst, label=lab_head, style=style))
     return nodes, edges
 
 

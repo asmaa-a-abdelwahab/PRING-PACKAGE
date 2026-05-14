@@ -16,6 +16,41 @@ from pring.transform.endpoint_normalization import normalize_endpoint_node_recor
 from pring.transform.metadata_normalization import normalize_metadata_node_record
 
 
+ML_ENDPOINT_AGG_FEATURE_COLUMNS = [
+    "best_value_molar",
+    "best_value_um",
+    "best_negative_log10_molar",
+    "min_ic50_molar",
+    "min_ki_molar",
+    "min_kd_molar",
+    "ic50_endpoint_count",
+    "ki_endpoint_count",
+    "kd_endpoint_count",
+    "endpoint_type_counts",
+    "active_endpoint_count",
+    "weak_endpoint_count",
+    "inactive_endpoint_count",
+]
+
+ML_BINDINGDB_FEATURE_COLUMNS = [
+    "bindingdb_has_record",
+    "bindingdb_record_count",
+    "bindingdb_best_affinity_value",
+    "bindingdb_best_affinity_type",
+    "bindingdb_min_kd_nm",
+    "bindingdb_min_ki_nm",
+    "bindingdb_min_ic50_nm",
+]
+
+ML_TEXTMINE_FEATURE_COLUMNS = [
+    "textmine_cooc_count",
+    "textmine_reference_count",
+    "textmine_score_max",
+    "textmine_score_mean",
+    "textmine_confidence_score",
+    "textmine_confidence",
+]
+
 ML_PAIR_COLUMNS = [
     "compound_node_id",
     "protein_node_id",
@@ -30,10 +65,9 @@ ML_PAIR_COLUMNS = [
     "evidence_count",
     "assay_count",
     "reference_count",
-    "textmine_cooc_count",
-    "textmine_reference_count",
-    "textmine_score_max",
-    "textmine_score_mean",
+    *ML_ENDPOINT_AGG_FEATURE_COLUMNS,
+    *ML_BINDINGDB_FEATURE_COLUMNS,
+    *ML_TEXTMINE_FEATURE_COLUMNS,
     "positive_endpoint_count",
     "negative_endpoint_count",
     "ambiguous_endpoint_count",
@@ -53,10 +87,11 @@ ML_CANDIDATE_COLUMNS = [
     "split_strategy",
     "candidate_sampling_method",
     "evidence_count",
-    "textmine_cooc_count",
-    "textmine_reference_count",
-    "textmine_score_max",
-    "textmine_score_mean",
+    "assay_count",
+    "reference_count",
+    *ML_ENDPOINT_AGG_FEATURE_COLUMNS,
+    *ML_BINDINGDB_FEATURE_COLUMNS,
+    *ML_TEXTMINE_FEATURE_COLUMNS,
 ]
 
 ML_NEGATIVE_COLUMNS = [
@@ -74,10 +109,9 @@ ML_NEGATIVE_COLUMNS = [
     "evidence_count",
     "assay_count",
     "reference_count",
-    "textmine_cooc_count",
-    "textmine_reference_count",
-    "textmine_score_max",
-    "textmine_score_mean",
+    *ML_ENDPOINT_AGG_FEATURE_COLUMNS,
+    *ML_BINDINGDB_FEATURE_COLUMNS,
+    *ML_TEXTMINE_FEATURE_COLUMNS,
     "positive_endpoint_count",
     "negative_endpoint_count",
     "ambiguous_endpoint_count",
@@ -85,6 +119,7 @@ ML_NEGATIVE_COLUMNS = [
     "evidence_references",
     "label_rule",
 ]
+
 
 
 class RunStore:
@@ -452,6 +487,8 @@ class RunStore:
         uniprot_acc_to_taxids: dict[str, set[int]] = {}
         reactome_ref_to_pathway: dict[str, dict[str, Any]] = {}
         protein_ref_to_reactomes: dict[str, set[str]] = {}
+        bindingdb_to_compounds: dict[str, set[str]] = {}
+        bindingdb_to_proteins: dict[str, set[str]] = {}
         default_taxids = _default_taxids_from_manifest(self.run_dir)
 
         for path in sorted(self.nodes_dir.glob("*.jsonl")):
@@ -527,6 +564,10 @@ class RunStore:
                     endpoint_to_refs.setdefault(start_ref, set()).add(end_ref)
                 elif schema_label == "MAPS_TO_REACTOME_PATHWAY" and sl == "Protein" and el == "Reactome":
                     protein_ref_to_reactomes.setdefault(start_ref, set()).add(end_ref)
+                elif schema_label == "HAS_BINDINGDB_RECORD" and sl == "Compound" and el == "BindingDB":
+                    bindingdb_to_compounds.setdefault(end_ref, set()).add(start_ref)
+                elif schema_label == "HAS_BINDINGDB_TARGET_RECORD" and sl == "Protein" and el == "BindingDB":
+                    bindingdb_to_proteins.setdefault(end_ref, set()).add(start_ref)
 
         added_nodes = 0
         added_rels = 0
@@ -717,6 +758,12 @@ class RunStore:
                             bucket["references"].update(endpoint_to_refs.get(endpoint_ref, set()))
                             bucket["organisms"].update(mg_to_organisms.get(mg_ref, set()))
 
+            bindingdb_pair_refs: dict[tuple[str, str], set[str]] = {}
+            for binding_ref in sorted(set(bindingdb_to_compounds) | set(bindingdb_to_proteins)):
+                for compound_ref in bindingdb_to_compounds.get(binding_ref, set()):
+                    for protein_ref in bindingdb_to_proteins.get(binding_ref, set()):
+                        bindingdb_pair_refs.setdefault((compound_ref, protein_ref), set()).add(binding_ref)
+
             expected_interaction_pairs = len(interaction_support)
             derived_interaction_label_counts = {
                 "curated_active": 0,
@@ -788,6 +835,8 @@ class RunStore:
                     add_rel("SUPPORTED_BY_REFERENCE", interaction_ref, ref_ref)
                 for organism_ref in sorted(support["organisms"]):
                     add_rel("SCOPED_TO_ORGANISM", interaction_ref, organism_ref)
+                for binding_ref in sorted(bindingdb_pair_refs.get((compound_ref, protein_ref), set())):
+                    add_rel("VALIDATED_BY_BINDINGDB", interaction_ref, binding_ref, {"derived_by": "PRING", "source_path": "Interaction pair matched to BindingDB compound and target records"})
 
         if generate_interactions:
             expected_interaction_pairs = locals().get("expected_interaction_pairs", 0)
@@ -816,6 +865,7 @@ class RunStore:
             "added_relationships": added_rels,
             "expected_interaction_pairs": locals().get("expected_interaction_pairs", 0),
             "interaction_label_counts": locals().get("derived_interaction_label_counts", {}),
+            "bindingdb_validated_interaction_pairs": len(locals().get("bindingdb_pair_refs", {})),
         })
 
         return {
@@ -830,6 +880,7 @@ class RunStore:
             "inferred_mg_organism_links": locals().get("inferred_mg_organism_links", 0),
             "expected_interaction_pairs": locals().get("expected_interaction_pairs", 0),
             "interaction_label_counts": locals().get("derived_interaction_label_counts", {}),
+            "bindingdb_validated_interaction_pairs": len(locals().get("bindingdb_pair_refs", {})),
         }
 
     def materialize_csv_mirrors(
@@ -960,6 +1011,9 @@ class RunStore:
         gene_to_proteins: dict[str, set[str]] = {}
         interaction_to_compounds: dict[str, set[str]] = {}
         interaction_to_proteins: dict[str, set[str]] = {}
+        bindingdb_to_compounds: dict[str, set[str]] = {}
+        bindingdb_to_proteins: dict[str, set[str]] = {}
+        bindingdb_to_endpoints: dict[str, set[str]] = {}
         seen_edge_keys: set[tuple[str, str, str, str]] = set()
         similarity_components = _UnionFind()
 
@@ -978,23 +1032,40 @@ class RunStore:
                 end_ref = _node_ref(end.get("label"), end.get("key") or {})
                 if schema_label == "SIMILAR_TO":
                     props = dict(props)
-                    exact_tanimoto = _as_float(props.get("tanimoto"))
+                    original_score = _as_float(props.get("score"))
+                    threshold_val = _as_float(props.get("threshold"))
+                    # PubChem similarity search may expose integer scores/thresholds
+                    # (for example 90) rather than exact pairwise Tanimoto. Preserve
+                    # that as provenance and put the locally-computed RDKit Tanimoto
+                    # in the ML-facing score/edge_weight when structures are present.
+                    if original_score is not None and original_score > 1:
+                        props.setdefault("pubchem_similarity_score", original_score)
+                    if threshold_val is not None:
+                        props.setdefault("threshold", threshold_val)
+                        props.setdefault("threshold_fraction", threshold_val / 100.0 if threshold_val > 1 else threshold_val)
+                    exact_tanimoto = _as_float(props.get("rdkit_tanimoto")) or _as_float(props.get("tanimoto"))
                     if exact_tanimoto is None and str(start.get("label") or "") == "Compound" and str(end.get("label") or "") == "Compound":
                         exact_tanimoto = _compute_rdkit_tanimoto_for_compound_refs(node_records_by_ref, start_ref, end_ref)
                     if exact_tanimoto is not None:
+                        props["rdkit_tanimoto"] = exact_tanimoto
                         props["tanimoto"] = exact_tanimoto
                         props["score"] = exact_tanimoto
                         props["edge_weight"] = exact_tanimoto
                         props["score_type"] = "rdkit_morgan_tanimoto"
                         props.setdefault("similarity_computation", "csv_export_from_structure_smiles")
                     else:
-                        score_val = _as_float(props.get("score"))
+                        score_val = original_score
                         if score_val is None:
-                            threshold_val = _as_float(props.get("threshold"))
                             if threshold_val is not None:
                                 score_val = threshold_val / 100.0 if threshold_val > 1 else threshold_val
                                 props.setdefault("score", score_val)
                                 props.setdefault("score_type", "threshold_lower_bound")
+                        elif score_val > 1:
+                            # Keep ML edge weights normalized even when only a
+                            # PubChem score/threshold is available.
+                            score_val = score_val / 100.0
+                            props["score"] = score_val
+                            props.setdefault("score_type", "pubchem_score_fraction")
                         if score_val is not None and props.get("edge_weight") in (None, ""):
                             props["edge_weight"] = score_val
                 edge_sig = (schema_label, start_ref, end_ref, _props_fingerprint(props))
@@ -1053,12 +1124,21 @@ class RunStore:
                     compound_similarity_degree[end_ref] = compound_similarity_degree.get(end_ref, 0) + 1
                 elif start_label_text == "Protein" and schema_label in {"HAS_UNIPROT_RECORD", "HAS_INTERPRO_DOMAIN", "HAS_GO_ANNOTATION", "MAPS_TO_REACTOME_PATHWAY", "HAS_PDB_STRUCTURE", "HAS_ALPHAFOLD_MODEL", "HAS_BINDINGDB_TARGET_RECORD"}:
                     protein_annotation_maps.setdefault(start_ref, {}).setdefault(schema_label, set()).add(end_ref)
+                    if schema_label == "HAS_BINDINGDB_TARGET_RECORD" and end_label_text == "BindingDB":
+                        bindingdb_to_proteins.setdefault(end_ref, set()).add(start_ref)
                 elif schema_label == "ENCODED_BY" and start_label_text == "Protein" and end_label_text == "Gene":
                     gene_to_proteins.setdefault(end_ref, set()).add(start_ref)
                 elif schema_label == "ASSERTS_CHEMICAL" and start_label_text == "Interaction" and end_label_text == "Compound":
                     interaction_to_compounds.setdefault(start_ref, set()).add(end_ref)
                 elif schema_label == "ASSERTS_TARGET" and start_label_text == "Interaction" and end_label_text == "Protein":
                     interaction_to_proteins.setdefault(start_ref, set()).add(end_ref)
+                elif schema_label == "HAS_BINDINGDB_RECORD" and start_label_text == "Compound" and end_label_text == "BindingDB":
+                    bindingdb_to_compounds.setdefault(end_ref, set()).add(start_ref)
+                elif schema_label == "HAS_BINDINGDB_TARGET_RECORD" and start_label_text == "Protein" and end_label_text == "BindingDB":
+                    bindingdb_to_proteins.setdefault(end_ref, set()).add(start_ref)
+                elif schema_label == "VALIDATED_BY_BINDINGDB" and end_label_text == "BindingDB":
+                    if start_label_text == "Endpoint":
+                        bindingdb_to_endpoints.setdefault(end_ref, set()).add(start_ref)
                 elif schema_label == "MENTIONS_COMPOUND" and start_label_text == "Cooc" and end_label_text == "Compound":
                     cooc_to_compounds.setdefault(start_ref, set()).add(end_ref)
                 elif schema_label == "MENTIONS_PROTEIN" and start_label_text == "Cooc" and end_label_text == "Protein":
@@ -1090,6 +1170,16 @@ class RunStore:
             endpoint_to_mgs=endpoint_to_mgs,
             endpoint_to_refs=endpoint_to_refs,
             mg_to_assays=mg_to_assays,
+        )
+        bindingdb_pair_features = _build_bindingdb_pair_features(
+            node_records_by_ref,
+            bindingdb_to_compounds=bindingdb_to_compounds,
+            bindingdb_to_proteins=bindingdb_to_proteins,
+            bindingdb_to_endpoints=bindingdb_to_endpoints,
+            endpoint_to_substance=endpoint_to_substance,
+            substance_to_compound=substance_to_compound,
+            endpoint_to_mgs=endpoint_to_mgs,
+            mg_to_proteins=mg_to_proteins,
         )
 
         for mg_idx, (mg_ref, endpoint_refs) in enumerate(mg_to_endpoints.items(), start=1):
@@ -1184,6 +1274,13 @@ class RunStore:
                 "evidence_references": " | ".join(sorted(rec.get("evidence_references", set()))),
                 "assay_count": len(rec.get("evidence_assays", set())),
                 "reference_count": len(rec.get("evidence_references", set())),
+                **_aggregate_endpoint_pair_features(
+                    rec.get("evidence_endpoints", set()),
+                    node_records_by_ref,
+                    activity_threshold_um=activity_threshold_um,
+                    weak_activity_as_negative=weak_activity_as_negative,
+                ),
+                **_bindingdb_feature_for_pair(bindingdb_pair_features, rec["compound_node_ref"], rec["protein_node_ref"]),
                 **_textmine_feature_for_pair(textmine_pair_features, rec["compound_node_ref"], rec["protein_node_ref"]),
                 "positive_endpoint_count": pos_n,
                 "negative_endpoint_count": neg_n,
@@ -1244,6 +1341,10 @@ class RunStore:
                 "split_strategy": "compound_similarity_component_holdout",
                 "candidate_sampling_method": sampling_method,
                 "evidence_count": 0,
+                "assay_count": 0,
+                "reference_count": 0,
+                **_empty_endpoint_pair_features(),
+                **_bindingdb_feature_for_pair(bindingdb_pair_features, compound_ref, protein_ref),
                 **_textmine_feature_for_pair(textmine_pair_features, compound_ref, protein_ref),
             }
 
@@ -1363,6 +1464,28 @@ class RunStore:
                 id_columns={"node_id", "node_ref", "endpoint_id", "endpoint_type", "activity_label_thresholded", "supervision_label"},
             ),
         }
+        tensor_summary = {
+            "compound": _write_strict_tensor_feature_table(
+                self.ml_dir / "node_features_compound_tensor.csv",
+                compound_feature_rows,
+                id_columns={"node_id", "node_ref", "cid", "preferred_name"},
+            ),
+            "protein": _write_strict_tensor_feature_table(
+                self.ml_dir / "node_features_protein_tensor.csv",
+                protein_feature_rows,
+                id_columns={"node_id", "node_ref", "protein_id", "uniprot_id", "name", "cyp_symbol"},
+            ),
+            "protembed": _write_strict_tensor_feature_table(
+                self.ml_dir / "node_features_protembed_tensor.csv",
+                protembed_feature_rows,
+                id_columns={"node_id", "node_ref", "embedding_id", "protein_id", "uniprot_acc", "method", "model_family", "model_name"},
+            ),
+            "endpoint": _write_strict_tensor_feature_table(
+                self.ml_dir / "node_features_endpoint_tensor.csv",
+                endpoint_feature_rows,
+                id_columns={"node_id", "node_ref", "endpoint_id", "endpoint_type", "activity_label_thresholded", "supervision_label"},
+            ),
+        }
 
         _write_rows_csv(self.ml_dir / "node_mapping.csv", node_mapping_rows)
         _write_rows_csv(self.ml_dir / "relation_mapping.csv", relation_mapping_rows)
@@ -1388,6 +1511,7 @@ class RunStore:
             train_edge_rows=edge_index_train_only_rows,
             training_pair_rows=training_pair_rows,
             candidate_rows=candidate_rows,
+            ml_dir=self.ml_dir,
         )
 
         ml_feature_export_summary = _build_ml_feature_export_summary(
@@ -1401,6 +1525,7 @@ class RunStore:
         )
         ml_feature_export_summary["normalization"] = normalization_summary
         ml_feature_export_summary["model_matrices"] = model_matrix_summary
+        ml_feature_export_summary["strict_numeric_tensors"] = tensor_summary
         ml_feature_export_summary["pyg_export"] = pyg_export_summary
         ml_feature_export_summary.setdefault("files", {})["node_features_compound_normalized.csv"] = {"written": True, **normalization_summary.get("compound", {})}
         ml_feature_export_summary.setdefault("files", {})["node_features_protein_normalized.csv"] = {"written": True, **normalization_summary.get("protein", {})}
@@ -1410,6 +1535,10 @@ class RunStore:
         ml_feature_export_summary.setdefault("files", {})["node_features_protein_model_matrix.csv"] = {"written": True, **model_matrix_summary.get("protein", {})}
         ml_feature_export_summary.setdefault("files", {})["node_features_protembed_model_matrix.csv"] = {"written": True, **model_matrix_summary.get("protembed", {})}
         ml_feature_export_summary.setdefault("files", {})["node_features_endpoint_model_matrix.csv"] = {"written": True, **model_matrix_summary.get("endpoint", {})}
+        ml_feature_export_summary.setdefault("files", {})["node_features_compound_tensor.csv"] = {"written": True, **tensor_summary.get("compound", {})}
+        ml_feature_export_summary.setdefault("files", {})["node_features_protein_tensor.csv"] = {"written": True, **tensor_summary.get("protein", {})}
+        ml_feature_export_summary.setdefault("files", {})["node_features_protembed_tensor.csv"] = {"written": True, **tensor_summary.get("protembed", {})}
+        ml_feature_export_summary.setdefault("files", {})["node_features_endpoint_tensor.csv"] = {"written": True, **tensor_summary.get("endpoint", {})}
         ml_feature_export_summary.setdefault("files", {})["candidate_missing_pairs_all_materialized_compounds.csv"] = {"rows": len(all_materialized_candidate_rows)}
         ml_feature_export_summary.setdefault("files", {})["candidate_missing_pairs_observed_compounds_only.csv"] = {"rows": len(observed_compound_candidate_rows)}
         ml_feature_export_summary.setdefault("files", {})["pyg_export/heterodata.pt"] = pyg_export_summary
@@ -1464,6 +1593,7 @@ class RunStore:
             "training_pair_records": len(training_pair_rows),
             "link_prediction_pair_records": len(link_prediction_pair_rows),
             "textmine_pair_features": len(textmine_pair_features),
+            "bindingdb_pair_features": len(bindingdb_pair_features),
             "skipped_relationships_missing_nodes": skipped_relationships_missing_nodes,
             "split_strategy": "compound_similarity_component_holdout",
             "label_semantics": "supervised labels use normalized endpoint evidence; unobserved compound-target pairs are exported as unknown candidates, not true negatives",
@@ -1471,6 +1601,7 @@ class RunStore:
             "leakage_control_export": ml_feature_export_summary.get("leakage_control_export", {}),
             "normalization_summary": normalization_summary,
             "model_matrix_summary": model_matrix_summary,
+            "strict_numeric_tensor_summary": tensor_summary,
             "pyg_export_summary": pyg_export_summary,
         }
         summary_path = self.graph_dir / "csv_export_summary.json"
@@ -2028,13 +2159,29 @@ def _schema_alignment_report(node_counts: Dict[str, int], relationship_counts: D
     schema_nodes = set(re.findall(r"^\s*([A-Za-z][A-Za-z0-9_]*)\s*\[label=", text, flags=re.MULTILINE))
     schema_nodes = {n for n in schema_nodes if not n.startswith("Conv")}
     labels: set[str] = set()
-    for match in re.finditer(r'label="([^"]+)"', text):
-        label_text = match.group(1)
-        if label_text.isupper() or " | " in label_text:
-            for part in re.split(r"\s*\|\s*", label_text.split("\\n", 1)[0]):
-                token = part.strip().split()[0]
-                if token and token.upper() == token:
-                    labels.add(token)
+    # Parse only EDGE statements, not graph/subgraph titles or node labels.
+    # Earlier versions scanned every ``label="..."`` attribute and therefore
+    # incorrectly treated section headings such as "A) Core entities" and graph
+    # titles such as "PRING ..." as relationship types.  Edge declarations in
+    # the implementation DOT schema consistently use ``Source -> Target [...]``.
+    edge_stmt_re = re.compile(
+        r"^\s*[A-Za-z][A-Za-z0-9_]*\s*->\s*[A-Za-z][A-Za-z0-9_]*\s*\[(.*?)\];",
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    for edge_match in edge_stmt_re.finditer(text):
+        attrs = edge_match.group(1)
+        label_match = re.search(r'label\s*=\s*"([^"]+)"', attrs, flags=re.DOTALL)
+        if not label_match:
+            continue
+        label_text = label_match.group(1)
+        # Relationship labels may be annotated over multiple rendered lines, e.g.
+        # label="SIMILAR_TO\n{score?, edge_weight?, ...}".  Validate only the
+        # first rendered line, and support alternatives separated by " | ".
+        label_head = re.split(r"\\n|\n", label_text, maxsplit=1)[0]
+        for part in re.split(r"\s*\|\s*", label_head):
+            token = part.strip().split()[0] if part.strip() else ""
+            if re.fullmatch(r"[A-Z][A-Z0-9_]*", token):
+                labels.add(token)
     return {
         "status": "evaluated",
         "schema_dot": str(dot_path),
@@ -2286,7 +2433,11 @@ def _build_ml_feature_export_summary(
     protembed_vectors = vector_cols(protembed_feature_rows)
     protein_vectors = vector_cols(protein_feature_rows)
     compound_vectors = vector_cols(compound_feature_rows)
-    required_pair_cols = {"compound_node_id", "protein_node_id", "compound_node_ref", "protein_node_ref", "label", "split"}
+    required_pair_cols = {
+        "compound_node_id", "protein_node_id", "compound_node_ref", "protein_node_ref", "label", "split",
+        "evidence_count", "best_value_molar", "best_negative_log10_molar", "active_endpoint_count",
+        "bindingdb_has_record", "bindingdb_record_count", "textmine_cooc_count", "textmine_confidence_score",
+    }
     pair_cols = cols(link_prediction_pair_rows) | cols(training_pair_rows) | cols(candidate_rows)
 
     blockers: list[str] = []
@@ -2380,6 +2531,8 @@ def _build_ml_feature_export_summary(
             "columns": sorted(pair_cols),
             "required_columns": sorted(required_pair_cols),
             "missing_required_columns": missing_pair_cols,
+            "pair_evidence_features": sorted((set(ML_ENDPOINT_AGG_FEATURE_COLUMNS) | set(ML_BINDINGDB_FEATURE_COLUMNS) | set(ML_TEXTMINE_FEATURE_COLUMNS)) & pair_cols),
+            "coverage": coverage(link_prediction_pair_rows, ML_ENDPOINT_AGG_FEATURE_COLUMNS + ML_BINDINGDB_FEATURE_COLUMNS + ML_TEXTMINE_FEATURE_COLUMNS),
         },
     }
 
@@ -2404,9 +2557,10 @@ def _build_ml_feature_export_summary(
             "candidate_pairs_are_unknown_not_negative": True,
         },
         "recommended_training_modes": [
-            "Heterogeneous link prediction with Compound and Protein as primary node types plus SIMILAR_TO, Interaction, Endpoint, ProtEmbed, GO, Reactome and InterPro relations.",
-            "Positive-unlabeled link prediction when curated negative/weak evidence is sparse.",
+            "HGT/R-GCN/HeteroGraphSAGE link prediction over Compound, Protein, ProtEmbed, Endpoint, Interaction, BindingDB, GO, Reactome, InterPro and SIMILAR_TO relations.",
+            "Positive-unlabeled ranking or PU learning when curated negative/weak evidence is sparse; exported unknown candidates are not true negatives.",
             "Supervised binary training only after enough threshold-derived negative/weak pairs are present or external confirmed negatives are added.",
+            "Tabular MLP/XGBoost baseline using compound_target_link_prediction_pairs.csv plus strict numeric node tensors for ablation.",
         ],
         "feature_column_manifest_file": "feature_column_manifest.json",
     }
@@ -2437,7 +2591,7 @@ def _build_ml_feature_export_summary(
             "0": "curated inactive or weak endpoint evidence when configured",
             "unknown": "unobserved compound-target candidate; not a true negative",
         },
-        "recommended_gnn_setup": "heterogeneous GNN/R-GCN/HGT using Compound, Protein, ProtEmbed, Endpoint, Interaction and SIMILAR_TO relations; homogeneous GCN can use flattened node_features_compound/protein plus compound-target pair files as a baseline",
+        "recommended_gnn_setup": "Prefer heterogeneous link prediction (HGT/R-GCN/HeteroGraphSAGE) using Compound, Protein, ProtEmbed, Endpoint, Interaction, BindingDB and SIMILAR_TO relations. Use edge_index_train_only.csv for validation/test message passing; homogeneous GCN over projected Compound/Protein nodes is a baseline only.",
     }
 
 
@@ -2603,6 +2757,100 @@ def _write_model_matrix_feature_table(path: Path, rows: list[dict[str, Any]], *,
     }
 
 
+def _write_strict_tensor_feature_table(path: Path, rows: list[dict[str, Any]], *, id_columns: set[str]) -> dict[str, Any]:
+    """Write a numeric-only tensor CSV plus a row-alignment metadata sidecar.
+
+    Unlike ``*_model_matrix.csv``, this file intentionally contains no node IDs,
+    labels, names, or other non-numeric columns. Every cell is finite and can be
+    loaded directly into ``torch.tensor(pd.read_csv(...).values, dtype=torch.float32)``.
+    The companion ``*_tensor_metadata.csv`` stores the row index to node mapping.
+    """
+    matrix_path = Path(path).with_name(Path(path).name.replace("_tensor.csv", "_model_matrix.csv"))
+    # Reuse the exact same numeric feature discovery/imputation rules as the
+    # model-matrix exporter to keep feature columns consistent.
+    temp_rows: list[dict[str, Any]] = []
+    numeric_values: dict[str, list[float]] = {}
+    rejected: set[str] = set()
+    id_cols_present = sorted({c for row in rows for c in row.keys() if c in id_columns})
+    for row in rows:
+        for key, value in row.items():
+            key_text = str(key)
+            if key in id_columns or key_text.startswith(("key_", "props_")):
+                continue
+            text = _stringify_cell(value).strip()
+            if not text:
+                continue
+            if text.lower() in {"true", "false", "yes", "no"}:
+                rejected.add(key_text)
+                continue
+            try:
+                fval = float(text)
+                if math.isfinite(fval):
+                    numeric_values.setdefault(key_text, []).append(fval)
+                else:
+                    rejected.add(key_text)
+            except Exception:
+                rejected.add(key_text)
+    numeric_cols = sorted(k for k, values in numeric_values.items() if k not in rejected and values)
+    stats: dict[str, dict[str, float]] = {}
+    for key in numeric_cols:
+        values = numeric_values[key]
+        mean = sum(values) / len(values)
+        var = sum((v - mean) ** 2 for v in values) / len(values) if values else 0.0
+        std = var ** 0.5
+        stats[key] = {"mean": mean, "std": std, "count": float(len(values))}
+
+    tensor_rows: list[dict[str, Any]] = []
+    metadata_rows: list[dict[str, Any]] = []
+    missing_cells = 0
+    for row_idx, row in enumerate(rows):
+        tensor_row: dict[str, Any] = {}
+        metadata_row = {"row_idx": row_idx, **{c: row.get(c, "") for c in id_cols_present}}
+        for key in numeric_cols:
+            text = _stringify_cell(row.get(key)).strip()
+            missing = not text
+            if missing:
+                value = stats[key]["mean"]
+                missing_cells += 1
+            else:
+                try:
+                    value = float(text)
+                    if not math.isfinite(value):
+                        value = stats[key]["mean"]
+                        missing = True
+                        missing_cells += 1
+                except Exception:
+                    value = stats[key]["mean"]
+                    missing = True
+                    missing_cells += 1
+            std = stats[key]["std"]
+            x_value = 0.0 if std == 0 else (value - stats[key]["mean"]) / std
+            safe = _safe_col(key)
+            tensor_row[f"x_{safe}"] = 0.0 if not math.isfinite(x_value) else x_value
+            tensor_row[f"missing_{safe}"] = int(missing)
+        tensor_rows.append(tensor_row)
+        metadata_rows.append(metadata_row)
+
+    tensor_cols = [f"x_{_safe_col(c)}" for c in numeric_cols] + [f"missing_{_safe_col(c)}" for c in numeric_cols]
+    metadata_path = path.with_name(path.stem + "_metadata.csv")
+    _write_rows_csv(path, tensor_rows, columns=tensor_cols)
+    _write_rows_csv(metadata_path, metadata_rows, columns=["row_idx"] + id_cols_present)
+    return {
+        "rows": len(rows),
+        "tensor_columns": len(tensor_cols),
+        "numeric_feature_columns": len(numeric_cols),
+        "metadata_file": metadata_path.name,
+        "missing_numeric_cells_imputed": missing_cells,
+        "numeric_only": True,
+        "identifier_free": True,
+        "nan_free": True,
+        "inf_free": True,
+        "missing_masks_written": True,
+        "model_matrix_reference": matrix_path.name,
+        "stats": stats,
+    }
+
+
 def _write_pyg_export(
     out_dir: Path,
     *,
@@ -2611,34 +2859,137 @@ def _write_pyg_export(
     train_edge_rows: list[dict[str, Any]],
     training_pair_rows: list[dict[str, Any]],
     candidate_rows: list[dict[str, Any]],
+    ml_dir: Optional[Path] = None,
 ) -> dict[str, Any]:
-    """Write lightweight PyTorch/PyG-friendly mapping exports.
+    """Write PyG/DGL-friendly heterogeneous graph exports.
 
-    This avoids a hard dependency on torch_geometric while still producing a
-    loadable ``heterodata.pt`` dictionary when PyTorch is installed. Feature
-    tensors are intentionally referenced through the no-NaN model-matrix CSVs so
-    downstream code can choose homogeneous GCN, R-GCN, HGT, GraphSAGE, or a
-    tabular baseline.
+    The export uses local node indices per node type, writes forward and reverse
+    edge-index tensors for message passing, and stores link-prediction labels on
+    Compound->Protein pairs. If ``torch_geometric`` is installed, a real
+    ``HeteroData`` object is saved as ``heterodata.pt``; otherwise the same
+    information is saved as a lightweight torch dictionary so training code can
+    still consume it.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    node_type_counts: dict[str, int] = {}
-    for row in node_mapping_rows:
-        label = str(row.get("label") or row.get("node_label") or "Unknown")
-        node_type_counts[label] = node_type_counts.get(label, 0) + 1
+    ml_dir = Path(ml_dir or out_dir.parent)
 
-    edge_type_counts: dict[str, int] = {}
-    for edge in edge_rows:
-        key = "|".join([
+    node_type_counts: dict[str, int] = {}
+    global_to_type: dict[int, str] = {}
+    fallback_global_to_local: dict[str, dict[int, int]] = {}
+    for row in sorted(node_mapping_rows, key=lambda r: int(r.get("node_id") or 0)):
+        label = str(row.get("label") or row.get("node_label") or "Unknown")
+        try:
+            node_id = int(row.get("node_id"))
+        except Exception:
+            continue
+        local = node_type_counts.get(label, 0)
+        node_type_counts[label] = local + 1
+        global_to_type[node_id] = label
+        fallback_global_to_local.setdefault(label, {})[node_id] = local
+
+    tensor_specs = {
+        "Compound": (ml_dir / "node_features_compound_tensor.csv", ml_dir / "node_features_compound_tensor_metadata.csv"),
+        "Protein": (ml_dir / "node_features_protein_tensor.csv", ml_dir / "node_features_protein_tensor_metadata.csv"),
+        "ProtEmbed": (ml_dir / "node_features_protembed_tensor.csv", ml_dir / "node_features_protembed_tensor_metadata.csv"),
+        "Endpoint": (ml_dir / "node_features_endpoint_tensor.csv", ml_dir / "node_features_endpoint_tensor_metadata.csv"),
+    }
+    tensor_metadata = {node_type: _read_tensor_metadata(meta_path) for node_type, (_tensor_path, meta_path) in tensor_specs.items()}
+    global_to_local = {k: dict(v) for k, v in fallback_global_to_local.items()}
+    for node_type, rows in tensor_metadata.items():
+        if rows:
+            global_to_local[node_type] = {
+                int(r["node_id"]): int(r["row_idx"])
+                for r in rows
+                if str(r.get("node_id") or "").strip().isdigit()
+            }
+            node_type_counts[node_type] = max(node_type_counts.get(node_type, 0), len(rows))
+
+    def type_edge_key(edge: dict[str, Any]) -> tuple[str, str, str]:
+        return (
             str(edge.get("start_label") or "Unknown"),
             str(edge.get("schema_label") or edge.get("type") or "RELATED_TO"),
             str(edge.get("end_label") or "Unknown"),
-        ])
-        edge_type_counts[key] = edge_type_counts.get(key, 0) + 1
+        )
 
+    def add_edges_by_type(rows: list[dict[str, Any]], *, add_reverse: bool) -> dict[tuple[str, str, str], list[list[int]]]:
+        by_type: dict[tuple[str, str, str], list[list[int]]] = {}
+        for edge in rows:
+            try:
+                src_global = int(edge.get("source_node_id"))
+                dst_global = int(edge.get("target_node_id"))
+            except Exception:
+                continue
+            src_type, rel, dst_type = type_edge_key(edge)
+            src_local = global_to_local.get(src_type, {}).get(src_global)
+            dst_local = global_to_local.get(dst_type, {}).get(dst_global)
+            if src_local is None or dst_local is None:
+                continue
+            by_type.setdefault((src_type, rel, dst_type), []).append([src_local, dst_local])
+            if add_reverse:
+                reverse_rel = rel if (src_type == dst_type and rel == "SIMILAR_TO") else f"rev_{rel}"
+                by_type.setdefault((dst_type, reverse_rel, src_type), []).append([dst_local, src_local])
+        return by_type
+
+    full_edges_by_type = add_edges_by_type(edge_rows, add_reverse=True)
+    train_edges_by_type = add_edges_by_type(train_edge_rows, add_reverse=True)
+    edge_type_counts = {"|".join(k): len(v) for k, v in sorted(full_edges_by_type.items())}
+    train_edge_type_counts = {"|".join(k): len(v) for k, v in sorted(train_edges_by_type.items())}
     node_type_mapping = {label: idx for idx, label in enumerate(sorted(node_type_counts))}
     edge_type_mapping = {label: idx for idx, label in enumerate(sorted(edge_type_counts))}
+
+    link_pairs: list[list[int]] = []
+    link_labels: list[int] = []
+    split_masks: dict[str, list[bool]] = {"train": [], "val": [], "test": [], "unknown": []}
+    split_edges_global: dict[str, list[list[int]]] = {"train": [], "val": [], "test": [], "unknown": []}
+    split_labels: dict[str, list[int]] = {"train": [], "val": [], "test": []}
+
+    for row in training_pair_rows + candidate_rows:
+        try:
+            c_global = int(row.get("compound_node_id"))
+            p_global = int(row.get("protein_node_id"))
+        except Exception:
+            continue
+        c_local = global_to_local.get("Compound", {}).get(c_global)
+        p_local = global_to_local.get("Protein", {}).get(p_global)
+        if c_local is None or p_local is None:
+            continue
+        raw_label = str(row.get("label") or "unknown").strip().lower()
+        split = str(row.get("split") or "train").strip().lower()
+        if split in {"valid", "validation"}:
+            split = "val"
+        is_unknown = raw_label == "unknown"
+        if is_unknown:
+            label = -1
+            split = "unknown"
+        else:
+            try:
+                label = int(float(raw_label))
+            except Exception:
+                continue
+            if split not in {"train", "val", "test"}:
+                split = "train"
+            split_edges_global[split].append([c_global, p_global])
+            split_labels[split].append(label)
+        split_edges_global.setdefault(split, []).append([c_global, p_global]) if split == "unknown" else None
+        link_pairs.append([c_local, p_local])
+        link_labels.append(label)
+        for mask_name in split_masks:
+            split_masks[mask_name].append(mask_name == split)
+
     feature_tensor_manifest = {
-        "format": "csv_model_matrices_plus_optional_torch_pt",
+        "format": "strict_numeric_tensor_csv_plus_optional_torch_pt",
+        "numeric_only_tensor_files": {
+            "Compound": "../node_features_compound_tensor.csv",
+            "Protein": "../node_features_protein_tensor.csv",
+            "ProtEmbed": "../node_features_protembed_tensor.csv",
+            "Endpoint": "../node_features_endpoint_tensor.csv",
+        },
+        "tensor_metadata_files": {
+            "Compound": "../node_features_compound_tensor_metadata.csv",
+            "Protein": "../node_features_protein_tensor_metadata.csv",
+            "ProtEmbed": "../node_features_protembed_tensor_metadata.csv",
+            "Endpoint": "../node_features_endpoint_tensor_metadata.csv",
+        },
         "nan_free_model_matrix_files": {
             "Compound": "../node_features_compound_model_matrix.csv",
             "Protein": "../node_features_protein_model_matrix.csv",
@@ -2647,97 +2998,139 @@ def _write_pyg_export(
         },
         "node_type_counts": node_type_counts,
         "edge_type_counts": edge_type_counts,
-        "recommended_models": ["HGT", "R-GCN", "HeteroGraphSAGE", "HAN", "GCN baseline after homogeneous projection", "XGBoost/MLP baseline"],
+        "train_only_edge_type_counts": train_edge_type_counts,
+        "recommended_models": ["HGT", "R-GCN", "HeteroGraphSAGE", "HAN", "GCN baseline after homogeneous projection", "positive-unlabeled ranking model", "XGBoost/MLP baseline"],
         "label_semantics": {
             "1": "curated active/potent interaction evidence",
             "0": "curated inactive or weak evidence under threshold rule",
-            "unknown": "unobserved candidate pair; not a true negative",
+            "-1": "unobserved candidate pair; not a true negative",
         },
+        "leakage_note": "Use train_edge_index_by_type/train-only graph for validation/test scoring to avoid evidence-path leakage.",
     }
     (out_dir / "node_type_mapping.json").write_text(json.dumps(node_type_mapping, indent=2, ensure_ascii=False), encoding="utf-8")
     (out_dir / "edge_type_mapping.json").write_text(json.dumps(edge_type_mapping, indent=2, ensure_ascii=False), encoding="utf-8")
     (out_dir / "feature_tensor_manifest.json").write_text(json.dumps(feature_tensor_manifest, indent=2, ensure_ascii=False), encoding="utf-8")
-
-    split_edges: dict[str, list[list[int]]] = {"train": [], "val": [], "test": [], "unknown": []}
-    split_labels: dict[str, list[int]] = {"train": [], "val": [], "test": []}
-    for row in training_pair_rows:
-        try:
-            src = int(row.get("compound_node_id"))
-            dst = int(row.get("protein_node_id"))
-            label = int(float(str(row.get("label"))))
-        except Exception:
-            continue
-        split = str(row.get("split") or "train").lower()
-        if split == "valid":
-            split = "val"
-        if split not in {"train", "val", "test"}:
-            split = "train"
-        split_edges[split].append([src, dst])
-        split_labels[split].append(label)
-    for row in candidate_rows:
-        try:
-            split_edges["unknown"].append([int(row.get("compound_node_id")), int(row.get("protein_node_id"))])
-        except Exception:
-            continue
-    (out_dir / "train_val_test_edges.json").write_text(json.dumps({"edges": split_edges, "labels": split_labels}, indent=2), encoding="utf-8")
+    (out_dir / "train_val_test_edges.json").write_text(json.dumps({"edges": split_edges_global, "labels": split_labels}, indent=2), encoding="utf-8")
 
     torch_written = False
+    torch_geometric_written = False
     torch_error = None
     try:
         import torch  # type: ignore
-        by_type: dict[str, list[list[int]]] = {}
-        for edge in edge_rows:
-            try:
-                key = "|".join([
-                    str(edge.get("start_label") or "Unknown"),
-                    str(edge.get("schema_label") or edge.get("type") or "RELATED_TO"),
-                    str(edge.get("end_label") or "Unknown"),
-                ])
-                by_type.setdefault(key, []).append([int(edge.get("source_node_id")), int(edge.get("target_node_id"))])
-            except Exception:
-                continue
-        torch_edges = {
-            key: (torch.tensor(vals, dtype=torch.long).t().contiguous() if vals else torch.empty((2, 0), dtype=torch.long))
-            for key, vals in by_type.items()
+
+        def tensor_edge_dict(data: dict[tuple[str, str, str], list[list[int]]]) -> dict[tuple[str, str, str], Any]:
+            return {
+                key: (torch.tensor(vals, dtype=torch.long).t().contiguous() if vals else torch.empty((2, 0), dtype=torch.long))
+                for key, vals in data.items()
+            }
+
+        x_by_type = {
+            node_type: _read_tensor_csv_as_torch(tensor_path, torch)
+            for node_type, (tensor_path, _meta_path) in tensor_specs.items()
+            if tensor_path.exists()
         }
-        torch_splits = {}
-        for split, vals in split_edges.items():
-            torch_splits[split] = torch.tensor(vals, dtype=torch.long).t().contiguous() if vals else torch.empty((2, 0), dtype=torch.long)
-        torch_labels = {split: torch.tensor(vals, dtype=torch.long) for split, vals in split_labels.items()}
+        edge_index_by_type = tensor_edge_dict(full_edges_by_type)
+        train_edge_index_by_type = tensor_edge_dict(train_edges_by_type)
+        link_edge_label_index = torch.tensor(link_pairs, dtype=torch.long).t().contiguous() if link_pairs else torch.empty((2, 0), dtype=torch.long)
+        link_edge_label = torch.tensor(link_labels, dtype=torch.long) if link_labels else torch.empty((0,), dtype=torch.long)
+        link_masks = {name: torch.tensor(vals, dtype=torch.bool) for name, vals in split_masks.items()}
         payload = {
-            "format": "pring_lightweight_heterodata_v1",
+            "format": "pring_heterogeneous_link_prediction_tensors_v2",
             "node_type_mapping": node_type_mapping,
             "edge_type_mapping": edge_type_mapping,
             "node_type_counts": node_type_counts,
-            "edge_index_by_type": torch_edges,
-            "split_edges": torch_splits,
-            "split_labels": torch_labels,
+            "x_by_type": x_by_type,
+            "edge_index_by_type": edge_index_by_type,
+            "train_edge_index_by_type": train_edge_index_by_type,
+            "link_prediction": {
+                "edge_type": ("Compound", "interacts_with", "Protein"),
+                "edge_label_index": link_edge_label_index,
+                "edge_label": link_edge_label,
+                "masks": link_masks,
+            },
             "feature_tensor_manifest": feature_tensor_manifest,
         }
-        torch.save(payload, out_dir / "heterodata.pt")
-        torch.save({"edges": torch_splits, "labels": torch_labels}, out_dir / "train_val_test_edges.pt")
+        try:
+            from torch_geometric.data import HeteroData  # type: ignore
+            data = HeteroData()
+            for node_type, x in x_by_type.items():
+                data[node_type].x = x.float()
+                data[node_type].num_nodes = int(x.shape[0])
+            for node_type, count in node_type_counts.items():
+                if node_type not in x_by_type:
+                    data[node_type].num_nodes = int(count)
+            for edge_type, edge_index in edge_index_by_type.items():
+                data[edge_type].edge_index = edge_index
+            link_store = data[("Compound", "interacts_with", "Protein")]
+            link_store.edge_label_index = link_edge_label_index
+            link_store.edge_label = link_edge_label
+            for mask_name, mask_tensor in link_masks.items():
+                setattr(link_store, f"{mask_name}_mask", mask_tensor)
+            torch.save(data, out_dir / "heterodata.pt")
+            torch_geometric_written = True
+        except Exception:
+            torch.save(payload, out_dir / "heterodata.pt")
+        torch.save(payload, out_dir / "heterodata_payload.pt")
+        torch.save({"edges": split_edges_global, "labels": split_labels}, out_dir / "train_val_test_edges.pt")
         torch_written = True
     except Exception as exc:  # pragma: no cover - depends on optional torch install
         torch_error = str(exc)
+
     (out_dir / "README.md").write_text(
         "# PRING PyG/DGL-friendly export\n\n"
-        "Use the no-NaN `node_features_*_model_matrix.csv` files for features. "
-        "If PyTorch was available during export, `heterodata.pt` contains edge-index tensors grouped by heterogeneous edge type and split pair tensors. "
-        "This export is intentionally lightweight and does not require `torch_geometric` at package runtime.\n",
+        "This folder contains heterogeneous graph/link-prediction exports for the CYP450 case study. "
+        "Use `heterodata.pt` directly when PyTorch/PyG is available; otherwise load the CSV tensor files and mappings. "
+        "The export includes reverse edge types and a train-only edge-index set for leakage-safe validation/test scoring.\n",
         encoding="utf-8",
     )
     return {
         "written": True,
         "directory": str(out_dir),
         "torch_available": torch_written,
+        "torch_geometric_heterodata": torch_geometric_written,
         "torch_error": torch_error,
         "node_type_count": len(node_type_mapping),
         "edge_type_count": len(edge_type_mapping),
-        "train_pair_edges": len(split_edges.get("train", [])),
-        "val_pair_edges": len(split_edges.get("val", [])),
-        "test_pair_edges": len(split_edges.get("test", [])),
-        "unknown_pair_edges": len(split_edges.get("unknown", [])),
+        "reverse_edges_written": True,
+        "local_node_indices": True,
+        "strict_numeric_tensor_inputs": True,
+        "train_only_graph_written": bool(train_edge_rows),
+        "link_prediction_pairs": len(link_pairs),
+        "train_pair_edges": sum(split_masks["train"]),
+        "val_pair_edges": sum(split_masks["val"]),
+        "test_pair_edges": sum(split_masks["test"]),
+        "unknown_pair_edges": sum(split_masks["unknown"]),
     }
+
+
+
+def _read_tensor_metadata(path: Path) -> list[dict[str, str]]:
+    if not Path(path).exists():
+        return []
+    with Path(path).open("r", newline="", encoding="utf-8-sig") as f:
+        return [dict(row) for row in csv.DictReader(f)]
+
+
+def _read_tensor_csv_as_torch(path: Path, torch_module: Any) -> Any:
+    rows: list[list[float]] = []
+    with Path(path).open("r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        cols = reader.fieldnames or []
+        for row in reader:
+            values = []
+            for col in cols:
+                try:
+                    value = float(row.get(col, 0.0) or 0.0)
+                    if not math.isfinite(value):
+                        value = 0.0
+                except Exception:
+                    value = 0.0
+                values.append(value)
+            rows.append(values)
+    if not rows:
+        return torch_module.empty((0, 0), dtype=torch_module.float32)
+    return torch_module.tensor(rows, dtype=torch_module.float32)
+
 
 def _write_rows_csv(path: Path, rows: list[dict[str, Any]], *, columns: Optional[list[str]] = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -3013,12 +3406,197 @@ def _build_textmine_pair_features(
 
 
 def _textmine_feature_for_pair(feature_map: dict[tuple[str, str], dict[str, Any]], compound_ref: str, protein_ref: str) -> dict[str, Any]:
+    rec = feature_map.get((compound_ref, protein_ref), {})
+    score = _as_float(rec.get("textmine_score_max"))
+    count = int(_as_float(rec.get("textmine_cooc_count")) or 0)
+    ref_count = int(_as_float(rec.get("textmine_reference_count")) or 0)
+    confidence_score = 0.0
+    confidence = "none"
+    if score is not None or count or ref_count:
+        base_score = float(score if score is not None else 0.25)
+        confidence_score = max(0.0, min(1.0, base_score + min(count, 10) * 0.03 + min(ref_count, 10) * 0.02))
+        confidence = "strong" if confidence_score >= 0.75 else ("medium" if confidence_score >= 0.45 else "weak")
     return {
-        "textmine_cooc_count": feature_map.get((compound_ref, protein_ref), {}).get("textmine_cooc_count", 0),
-        "textmine_reference_count": feature_map.get((compound_ref, protein_ref), {}).get("textmine_reference_count", 0),
-        "textmine_score_max": feature_map.get((compound_ref, protein_ref), {}).get("textmine_score_max", ""),
-        "textmine_score_mean": feature_map.get((compound_ref, protein_ref), {}).get("textmine_score_mean", ""),
+        "textmine_cooc_count": rec.get("textmine_cooc_count", 0),
+        "textmine_reference_count": rec.get("textmine_reference_count", 0),
+        "textmine_score_max": rec.get("textmine_score_max", ""),
+        "textmine_score_mean": rec.get("textmine_score_mean", ""),
+        "textmine_confidence_score": confidence_score,
+        "textmine_confidence": confidence,
     }
+
+
+def _empty_endpoint_pair_features() -> dict[str, Any]:
+    return {
+        "best_value_molar": "",
+        "best_value_um": "",
+        "best_negative_log10_molar": "",
+        "min_ic50_molar": "",
+        "min_ki_molar": "",
+        "min_kd_molar": "",
+        "ic50_endpoint_count": 0,
+        "ki_endpoint_count": 0,
+        "kd_endpoint_count": 0,
+        "endpoint_type_counts": "",
+        "active_endpoint_count": 0,
+        "weak_endpoint_count": 0,
+        "inactive_endpoint_count": 0,
+    }
+
+
+def _aggregate_endpoint_pair_features(
+    endpoint_refs: Iterable[str],
+    node_records_by_ref: dict[str, dict[str, Any]],
+    *,
+    activity_threshold_um: Optional[float] = None,
+    weak_activity_as_negative: bool = False,
+) -> dict[str, Any]:
+    out = _empty_endpoint_pair_features()
+    molar_values: list[float] = []
+    neglog_values: list[float] = []
+    by_type: dict[str, list[float]] = {}
+    type_counts: dict[str, int] = {}
+    active = weak = inactive = 0
+
+    for endpoint_ref in sorted(set(endpoint_refs or [])):
+        rec = node_records_by_ref.get(endpoint_ref, {}) or {}
+        endpoint_type = _norm_label(_first_nonempty_prop(rec, "props_endpoint_type", "endpoint_type", "props_type", "type")) or "unknown"
+        endpoint_type = endpoint_type.lower()
+        type_counts[endpoint_type] = type_counts.get(endpoint_type, 0) + 1
+        label = _endpoint_supervision_label(
+            rec,
+            activity_threshold_um=activity_threshold_um,
+            weak_activity_as_negative=weak_activity_as_negative,
+        )
+        if label == 1:
+            active += 1
+        elif label == 0:
+            if _endpoint_is_threshold_weak(rec, activity_threshold_um=activity_threshold_um) or "weak" in str(_first_nonempty_prop(rec, "props_supervision_label_name", "supervision_label_name") or "").lower():
+                weak += 1
+            else:
+                inactive += 1
+
+        molar = _as_float(_first_nonempty_prop(rec, "props_value_molar", "value_molar"))
+        if molar is not None and math.isfinite(molar):
+            molar_values.append(molar)
+            by_type.setdefault(endpoint_type, []).append(molar)
+            if molar > 0:
+                neglog_values.append(-math.log10(molar))
+        neglog = _as_float(_first_nonempty_prop(rec, "props_negative_log10_molar", "negative_log10_molar"))
+        if neglog is not None and math.isfinite(neglog):
+            neglog_values.append(neglog)
+
+    out.update({
+        "best_value_molar": min(molar_values) if molar_values else "",
+        "best_value_um": (min(molar_values) * 1e6) if molar_values else "",
+        "best_negative_log10_molar": max(neglog_values) if neglog_values else "",
+        "min_ic50_molar": min(by_type.get("ic50", [])) if by_type.get("ic50") else "",
+        "min_ki_molar": min(by_type.get("ki", [])) if by_type.get("ki") else "",
+        "min_kd_molar": min(by_type.get("kd", [])) if by_type.get("kd") else "",
+        "ic50_endpoint_count": type_counts.get("ic50", 0),
+        "ki_endpoint_count": type_counts.get("ki", 0),
+        "kd_endpoint_count": type_counts.get("kd", 0),
+        "endpoint_type_counts": ";".join(f"{k}={v}" for k, v in sorted(type_counts.items()) if k),
+        "active_endpoint_count": active,
+        "weak_endpoint_count": weak,
+        "inactive_endpoint_count": inactive,
+    })
+    return out
+
+
+def _endpoint_is_threshold_weak(endpoint_record: dict[str, Any], *, activity_threshold_um: Optional[float]) -> bool:
+    if activity_threshold_um is None:
+        return False
+    molar = _as_float(_first_nonempty_prop(endpoint_record, "props_value_molar", "value_molar"))
+    if molar is None:
+        return False
+    try:
+        return molar > float(activity_threshold_um) * 1e-6
+    except Exception:
+        return False
+
+
+def _build_bindingdb_pair_features(
+    node_records_by_ref: dict[str, dict[str, Any]],
+    *,
+    bindingdb_to_compounds: dict[str, set[str]],
+    bindingdb_to_proteins: dict[str, set[str]],
+    bindingdb_to_endpoints: dict[str, set[str]],
+    endpoint_to_substance: dict[str, str],
+    substance_to_compound: dict[str, str],
+    endpoint_to_mgs: dict[str, set[str]],
+    mg_to_proteins: dict[str, set[str]],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    pair_to_refs: dict[tuple[str, str], set[str]] = {}
+
+    def add_pair(compound_ref: str, protein_ref: str, binding_ref: str) -> None:
+        if compound_ref and protein_ref and binding_ref:
+            pair_to_refs.setdefault((compound_ref, protein_ref), set()).add(binding_ref)
+
+    for binding_ref in sorted(set(bindingdb_to_compounds) | set(bindingdb_to_proteins)):
+        for c_ref in bindingdb_to_compounds.get(binding_ref, set()):
+            for p_ref in bindingdb_to_proteins.get(binding_ref, set()):
+                add_pair(c_ref, p_ref, binding_ref)
+
+    for binding_ref, endpoint_refs in bindingdb_to_endpoints.items():
+        for endpoint_ref in endpoint_refs:
+            substance_ref = endpoint_to_substance.get(endpoint_ref, "")
+            compound_ref = substance_to_compound.get(substance_ref, "")
+            for mg_ref in endpoint_to_mgs.get(endpoint_ref, set()):
+                for protein_ref in mg_to_proteins.get(mg_ref, set()):
+                    add_pair(compound_ref, protein_ref, binding_ref)
+
+    out: dict[tuple[str, str], dict[str, Any]] = {}
+    for pair, refs in sorted(pair_to_refs.items()):
+        best_value: Optional[float] = None
+        best_type = ""
+        kd_values: list[float] = []
+        ki_values: list[float] = []
+        ic50_values: list[float] = []
+        for binding_ref in sorted(refs):
+            rec = node_records_by_ref.get(binding_ref, {}) or {}
+            candidates = [
+                ("kd", _as_float(_first_nonempty_prop(rec, "props_kd", "kd"))),
+                ("ki", _as_float(_first_nonempty_prop(rec, "props_ki", "ki"))),
+                ("ic50", _as_float(_first_nonempty_prop(rec, "props_ic50", "ic50"))),
+                (str(_first_nonempty_prop(rec, "props_affinity_type", "affinity_type") or "affinity"), _as_float(_first_nonempty_prop(rec, "props_affinity_value", "affinity_value"))),
+            ]
+            for typ, value in candidates:
+                if value is None or not math.isfinite(value):
+                    continue
+                typ_norm = _norm_label(typ) or str(typ).lower()
+                if typ_norm == "kd":
+                    kd_values.append(value)
+                elif typ_norm == "ki":
+                    ki_values.append(value)
+                elif typ_norm == "ic50":
+                    ic50_values.append(value)
+                if best_value is None or value < best_value:
+                    best_value = value
+                    best_type = typ_norm
+        out[pair] = {
+            "bindingdb_has_record": 1,
+            "bindingdb_record_count": len(refs),
+            "bindingdb_best_affinity_value": best_value if best_value is not None else "",
+            "bindingdb_best_affinity_type": best_type,
+            "bindingdb_min_kd_nm": min(kd_values) if kd_values else "",
+            "bindingdb_min_ki_nm": min(ki_values) if ki_values else "",
+            "bindingdb_min_ic50_nm": min(ic50_values) if ic50_values else "",
+        }
+    return out
+
+
+def _bindingdb_feature_for_pair(feature_map: dict[tuple[str, str], dict[str, Any]], compound_ref: str, protein_ref: str) -> dict[str, Any]:
+    return feature_map.get((compound_ref, protein_ref), {
+        "bindingdb_has_record": 0,
+        "bindingdb_record_count": 0,
+        "bindingdb_best_affinity_value": "",
+        "bindingdb_best_affinity_type": "",
+        "bindingdb_min_kd_nm": "",
+        "bindingdb_min_ki_nm": "",
+        "bindingdb_min_ic50_nm": "",
+    })
+
 
 def _build_compound_feature_rows(
     node_records_by_ref: dict[str, dict[str, str]],

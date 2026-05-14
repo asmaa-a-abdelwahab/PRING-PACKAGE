@@ -224,6 +224,7 @@ digraph PRING_Final_ImplementationReady_Thesis {
   Interaction -> BioAssay [label="SUPPORTED_BY_ASSAY", style=dashed];
   Interaction -> Reference [label="SUPPORTED_BY_REFERENCE", style=dashed];
   Interaction -> Organism [label="SCOPED_TO_ORGANISM", style=dashed];
+  Interaction -> BindingDB [label="VALIDATED_BY_BINDINGDB", style=dashed];
 
   Compound -> Protein [
     style=dashed,
