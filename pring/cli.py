@@ -321,6 +321,14 @@ def _count_jsonl_records(path: Path) -> int:
         return sum(1 for line in f if line.strip())
 
 
+def _count_values(values) -> dict:
+    out = {}
+    for value in values:
+        key = str(value or "missing")
+        out[key] = out.get(key, 0) + 1
+    return dict(sorted(out.items()))
+
+
 def _count_jsonl_files(folder: Path) -> int:
     total = 0
     if not folder.exists():
@@ -1746,6 +1754,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     # Optional additive layers. These do not change the selected core scope; they
     # only add separate evidence/enrichment records over the extracted/searched entities.
     textmine_rows = textmine_nodes = textmine_rels = 0
+    textmining_attempts: list[dict[str, object]] = []
     if settings.flags.include_textmining:
         source = str(getattr(settings, "textmining_source", "auto") or "auto").lower()
         use_file = settings.textmining_file is not None and settings.textmining_file.exists()
@@ -1753,6 +1762,7 @@ def main(argv: Optional[List[str]] = None) -> None:
 
         if source == "file" and not use_file:
             template = _write_textmining_template(run_dir)
+            textmining_attempts.append({"source": "file", "status": "skipped_missing_file", "path": str(settings.textmining_file) if settings.textmining_file else None, "template": str(template)})
             log.warning(
                 "Text-mining source=file but file was not found: %s; skipping text-mining rows. A template was written to %s",
                 settings.textmining_file,
@@ -1761,6 +1771,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         elif use_file and source in {"auto", "file"}:
             textmine_iter = iter_textmining_csv_rows(settings.textmining_file, max_records=settings.caps.max_textmine_records)
             textmine_rows, textmine_nodes, textmine_rels = _append_layer_rows(textmine_iter, store, guard)
+            textmining_attempts.append({"source": "file", "status": "materialized" if textmine_rows else "empty", "rows": int(textmine_rows), "nodes": int(textmine_nodes), "relationships": int(textmine_rels), "path": str(settings.textmining_file)})
             node_count += textmine_nodes
             rel_count += textmine_rels
             row_count += textmine_rows
@@ -1772,8 +1783,12 @@ def main(argv: Optional[List[str]] = None) -> None:
             # 1) PubChemRDF co-occurrence endpoint path.
             if source in {"auto", "pubchem"}:
                 if not (protein_terms or gene_terms):
+                    textmining_attempts.append({"source": "pubchem", "status": "skipped_no_target_terms", "protein_terms": len(protein_terms), "gene_terms": len(gene_terms)})
                     log.warning("Text-mining endpoint requested, but no Protein/Gene nodes were available from the extracted graph; skipping PubChemRDF text-mining query.")
                 else:
+                    pubchem_before_rows = int(textmine_rows)
+                    pubchem_before_nodes = int(textmine_nodes)
+                    pubchem_before_rels = int(textmine_rels)
                     sparql_cache = (settings.cache_dir / "sparql_textmining") if settings.save_raw_http_cache else None
                     text_client = _make_sparql_client(settings, sparql_cache)
                     try:
@@ -1791,16 +1806,22 @@ def main(argv: Optional[List[str]] = None) -> None:
                             textmine_rows += r
                             textmine_nodes += n
                             textmine_rels += e
-                        except Exception:
+                        except Exception as exc:
                             # Text mining is weak/additive evidence. It must not
                             # invalidate a curated PubChem evidence run when the
                             # public endpoint is unavailable or throttled.
+                            textmining_attempts.append({"source": "pubchem", "status": "failed", "error": str(exc)[:500]})
                             log.warning("PubChem text-mining endpoint failed; will try configured fallback if enabled.", exc_info=True)
                     finally:
                         try:
                             text_client.close()
                         except Exception:
                             pass
+                    pubchem_added_rows = int(textmine_rows) - pubchem_before_rows
+                    pubchem_added_nodes = int(textmine_nodes) - pubchem_before_nodes
+                    pubchem_added_rels = int(textmine_rels) - pubchem_before_rels
+                    if not any(a.get("source") == "pubchem" and a.get("status") == "failed" for a in textmining_attempts[-1:]):
+                        textmining_attempts.append({"source": "pubchem", "status": "materialized" if pubchem_added_rows else "empty", "rows": pubchem_added_rows, "nodes": pubchem_added_nodes, "relationships": pubchem_added_rels, "protein_terms": len(protein_terms), "gene_terms": len(gene_terms), "compound_terms": len(compound_terms)})
                     log.info("PubChem text-mining endpoint layer: rows=%d nodes=%d rels=%d", textmine_rows, textmine_nodes, textmine_rels)
 
             after_pubchem_cooc = _count_jsonl_records(store.nodes_dir / "Cooc.jsonl")
@@ -1814,6 +1835,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 compound_entities = _compound_entities_from_artifacts(store, chem_ids)
                 target_entities = _target_entities_from_artifacts(store)
                 if not compound_entities or not target_entities:
+                    textmining_attempts.append({"source": "pubmed", "status": "skipped_missing_entities", "compound_entities": len(compound_entities), "target_entities": len(target_entities)})
                     log.warning(
                         "PubMed text-mining fallback skipped because compound_entities=%d target_entities=%d.",
                         len(compound_entities),
@@ -1844,8 +1866,10 @@ def main(argv: Optional[List[str]] = None) -> None:
                         textmine_rows += r
                         textmine_nodes += n
                         textmine_rels += e
+                        textmining_attempts.append({"source": "pubmed", "status": "materialized" if r else "empty", "rows": int(r), "nodes": int(n), "relationships": int(e), "compound_entities": len(compound_entities), "target_entities": len(target_entities)})
                         log.info("PubMed fallback text-mining layer: rows=%d nodes=%d rels=%d", r, n, e)
-                    except Exception:
+                    except Exception as exc:
+                        textmining_attempts.append({"source": "pubmed", "status": "failed", "error": str(exc)[:500]})
                         log.warning("PubMed text-mining fallback failed; continuing without fallback rows.", exc_info=True)
                     finally:
                         try:
@@ -1867,6 +1891,8 @@ def main(argv: Optional[List[str]] = None) -> None:
             "cooc_nodes_after": int(_count_jsonl_records(store.nodes_dir / "Cooc.jsonl")),
             "pubmed_fallback_enabled": bool(getattr(settings, "textmining_pubmed_fallback", True)),
             "textmining_file": str(settings.textmining_file) if settings.textmining_file else None,
+            "attempts": textmining_attempts,
+            "attempt_status_counts": _count_values(a.get("status") for a in textmining_attempts),
             "status": "materialized" if _count_jsonl_records(store.nodes_dir / "Cooc.jsonl") > before_cooc else "empty_or_unavailable",
         }
         try:

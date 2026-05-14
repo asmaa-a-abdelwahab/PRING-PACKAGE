@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import math
 import random
 import re
 from dataclasses import asdict, is_dataclass
@@ -1229,13 +1230,10 @@ class RunStore:
             candidate_limit = max(0, min(len(unknown_candidates), int(max_candidate_missing_pairs)))
         else:
             candidate_limit = min(len(unknown_candidates), max(1000, len(pair_rows) * 10 if pair_rows else 1000))
-        candidate_rows = []
-        for cand_idx, (compound_ref, protein_ref) in enumerate(unknown_candidates[:candidate_limit], start=1):
-            if guard is not None and cand_idx % 100 == 0:
-                guard.checkpoint(f"ml:candidate-rows:{cand_idx}", force=True)
+        def _candidate_row(compound_ref: str, protein_ref: str, *, sampling_method: str) -> dict[str, Any]:
             split_group = similarity_components.find(compound_ref)
             split = _deterministic_split(split_group)
-            candidate_rows.append({
+            return {
                 "compound_node_id": node_id_by_ref.get(compound_ref, ""),
                 "protein_node_id": node_id_by_ref.get(protein_ref, ""),
                 "compound_node_ref": compound_ref,
@@ -1244,10 +1242,30 @@ class RunStore:
                 "split": split,
                 "split_group": split_group,
                 "split_strategy": "compound_similarity_component_holdout",
-                "candidate_sampling_method": "unobserved_within_extracted_scope",
+                "candidate_sampling_method": sampling_method,
                 "evidence_count": 0,
                 **_textmine_feature_for_pair(textmine_pair_features, compound_ref, protein_ref),
-            })
+            }
+
+        candidate_rows: list[dict[str, Any]] = []
+        for cand_idx, (compound_ref, protein_ref) in enumerate(unknown_candidates[:candidate_limit], start=1):
+            if guard is not None and cand_idx % 100 == 0:
+                guard.checkpoint(f"ml:candidate-rows:{cand_idx}", force=True)
+            candidate_rows.append(_candidate_row(compound_ref, protein_ref, sampling_method="unobserved_within_extracted_scope"))
+
+        all_materialized_candidate_rows: list[dict[str, Any]] = []
+        for cand_idx, (compound_ref, protein_ref) in enumerate(unknown_candidates, start=1):
+            if guard is not None and cand_idx % 500 == 0:
+                guard.checkpoint(f"ml:candidate-all-materialized:{cand_idx}", force=True)
+            all_materialized_candidate_rows.append(_candidate_row(compound_ref, protein_ref, sampling_method="all_materialized_unobserved_within_extracted_scope"))
+
+        observed_compound_refs = {compound_ref for compound_ref, _protein_ref in observed_pair_keys}
+        observed_compound_candidate_rows = [
+            _candidate_row(compound_ref, protein_ref, sampling_method="observed_compounds_only_unobserved_targets")
+            for compound_ref, protein_ref in unknown_candidates
+            if compound_ref in observed_compound_refs
+        ]
+
         training_pair_rows = pair_rows + negative_rows
         link_prediction_pair_rows = training_pair_rows + candidate_rows
 
@@ -1312,8 +1330,35 @@ class RunStore:
                 protein_feature_rows,
                 id_columns={"node_id", "node_ref", "protein_id", "uniprot_id", "name", "cyp_symbol"},
             ),
+            "protembed": _write_normalized_feature_table(
+                self.ml_dir / "node_features_protembed_normalized.csv",
+                protembed_feature_rows,
+                id_columns={"node_id", "node_ref", "embedding_id", "protein_id", "uniprot_acc", "method", "model_family", "model_name"},
+            ),
             "endpoint": _write_normalized_feature_table(
                 self.ml_dir / "node_features_endpoint_normalized.csv",
+                endpoint_feature_rows,
+                id_columns={"node_id", "node_ref", "endpoint_id", "endpoint_type", "activity_label_thresholded", "supervision_label"},
+            ),
+        }
+        model_matrix_summary = {
+            "compound": _write_model_matrix_feature_table(
+                self.ml_dir / "node_features_compound_model_matrix.csv",
+                compound_feature_rows,
+                id_columns={"node_id", "node_ref", "cid", "preferred_name"},
+            ),
+            "protein": _write_model_matrix_feature_table(
+                self.ml_dir / "node_features_protein_model_matrix.csv",
+                protein_feature_rows,
+                id_columns={"node_id", "node_ref", "protein_id", "uniprot_id", "name", "cyp_symbol"},
+            ),
+            "protembed": _write_model_matrix_feature_table(
+                self.ml_dir / "node_features_protembed_model_matrix.csv",
+                protembed_feature_rows,
+                id_columns={"node_id", "node_ref", "embedding_id", "protein_id", "uniprot_acc", "method", "model_family", "model_name"},
+            ),
+            "endpoint": _write_model_matrix_feature_table(
+                self.ml_dir / "node_features_endpoint_model_matrix.csv",
                 endpoint_feature_rows,
                 id_columns={"node_id", "node_ref", "endpoint_id", "endpoint_type", "activity_label_thresholded", "supervision_label"},
             ),
@@ -1331,8 +1376,19 @@ class RunStore:
         _write_rows_csv(self.ml_dir / "positive_compound_target_pairs.csv", pair_rows, columns=ML_PAIR_COLUMNS)
         _write_rows_csv(self.ml_dir / "negative_compound_target_pairs.csv", negative_rows, columns=ML_NEGATIVE_COLUMNS)
         _write_rows_csv(self.ml_dir / "candidate_missing_compound_target_pairs.csv", candidate_rows, columns=ML_CANDIDATE_COLUMNS)
+        _write_rows_csv(self.ml_dir / "candidate_missing_pairs_all_materialized_compounds.csv", all_materialized_candidate_rows, columns=ML_CANDIDATE_COLUMNS)
+        _write_rows_csv(self.ml_dir / "candidate_missing_pairs_observed_compounds_only.csv", observed_compound_candidate_rows, columns=ML_CANDIDATE_COLUMNS)
         _write_rows_csv(self.ml_dir / "compound_target_training_pairs.csv", training_pair_rows, columns=ML_PAIR_COLUMNS)
         _write_rows_csv(self.ml_dir / "compound_target_link_prediction_pairs.csv", link_prediction_pair_rows, columns=_columns(link_prediction_pair_rows) or list(dict.fromkeys(ML_PAIR_COLUMNS + ML_NEGATIVE_COLUMNS + ML_CANDIDATE_COLUMNS)))
+
+        pyg_export_summary = _write_pyg_export(
+            self.ml_dir / "pyg_export",
+            node_mapping_rows=node_mapping_rows,
+            edge_rows=edge_rows,
+            train_edge_rows=edge_index_train_only_rows,
+            training_pair_rows=training_pair_rows,
+            candidate_rows=candidate_rows,
+        )
 
         ml_feature_export_summary = _build_ml_feature_export_summary(
             compound_feature_rows=compound_feature_rows,
@@ -1344,9 +1400,19 @@ class RunStore:
             link_prediction_pair_rows=link_prediction_pair_rows,
         )
         ml_feature_export_summary["normalization"] = normalization_summary
+        ml_feature_export_summary["model_matrices"] = model_matrix_summary
+        ml_feature_export_summary["pyg_export"] = pyg_export_summary
         ml_feature_export_summary.setdefault("files", {})["node_features_compound_normalized.csv"] = {"written": True, **normalization_summary.get("compound", {})}
         ml_feature_export_summary.setdefault("files", {})["node_features_protein_normalized.csv"] = {"written": True, **normalization_summary.get("protein", {})}
+        ml_feature_export_summary.setdefault("files", {})["node_features_protembed_normalized.csv"] = {"written": True, **normalization_summary.get("protembed", {})}
         ml_feature_export_summary.setdefault("files", {})["node_features_endpoint_normalized.csv"] = {"written": True, **normalization_summary.get("endpoint", {})}
+        ml_feature_export_summary.setdefault("files", {})["node_features_compound_model_matrix.csv"] = {"written": True, **model_matrix_summary.get("compound", {})}
+        ml_feature_export_summary.setdefault("files", {})["node_features_protein_model_matrix.csv"] = {"written": True, **model_matrix_summary.get("protein", {})}
+        ml_feature_export_summary.setdefault("files", {})["node_features_protembed_model_matrix.csv"] = {"written": True, **model_matrix_summary.get("protembed", {})}
+        ml_feature_export_summary.setdefault("files", {})["node_features_endpoint_model_matrix.csv"] = {"written": True, **model_matrix_summary.get("endpoint", {})}
+        ml_feature_export_summary.setdefault("files", {})["candidate_missing_pairs_all_materialized_compounds.csv"] = {"rows": len(all_materialized_candidate_rows)}
+        ml_feature_export_summary.setdefault("files", {})["candidate_missing_pairs_observed_compounds_only.csv"] = {"rows": len(observed_compound_candidate_rows)}
+        ml_feature_export_summary.setdefault("files", {})["pyg_export/heterodata.pt"] = pyg_export_summary
         ml_feature_export_summary.setdefault("files", {})["edge_index_train_only.csv"] = {"rows": len(edge_index_train_only_rows)}
         ml_feature_export_summary.setdefault("files", {})["edge_index_holdout_removed_edges.csv"] = {"rows": len(edge_index_holdout_removed_rows)}
         ml_feature_export_summary["leakage_control_export"] = {
@@ -1390,6 +1456,8 @@ class RunStore:
             "candidate_missing_compound_target_pairs": len(candidate_rows),
             "candidate_missing_pair_mode": mode,
             "candidate_missing_pair_limit": candidate_limit,
+            "candidate_missing_pairs_all_materialized_compounds": len(all_materialized_candidate_rows),
+            "candidate_missing_pairs_observed_compounds_only": len(observed_compound_candidate_rows),
             "total_unobserved_compound_target_pairs": len(unknown_candidates),
             "ambiguous_or_unlabeled_observed_pairs": len(ambiguous_pair_keys),
             "observed_compound_target_pairs": len(observed_pair_keys),
@@ -1402,6 +1470,8 @@ class RunStore:
             "feature_export_summary": ml_feature_export_summary,
             "leakage_control_export": ml_feature_export_summary.get("leakage_control_export", {}),
             "normalization_summary": normalization_summary,
+            "model_matrix_summary": model_matrix_summary,
+            "pyg_export_summary": pyg_export_summary,
         }
         summary_path = self.graph_dir / "csv_export_summary.json"
         summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -2185,6 +2255,21 @@ def _build_ml_feature_export_summary(
             for key in wanted
         }
 
+    def coverage_aliases(rows: list[dict[str, Any]], wanted: dict[str, list[str]]) -> dict[str, Any]:
+        row_count = len(rows)
+        out: dict[str, Any] = {}
+        for canonical, aliases in wanted.items():
+            keys = [canonical] + [k for k in aliases if k != canonical]
+            non_empty_rows = sum(1 for row in rows if any(non_empty(row, key) for key in keys))
+            present_aliases = sorted({key for key in keys if any(key in row for row in rows)})
+            out[canonical] = {
+                "present": bool(present_aliases),
+                "present_aliases": present_aliases,
+                "non_empty_rows": non_empty_rows,
+                "coverage_fraction": round((non_empty_rows / row_count), 6) if row_count else 0.0,
+            }
+        return out
+
     def columns_by_prefix(columns: set[str], prefixes: tuple[str, ...]) -> dict[str, int]:
         out: dict[str, int] = {}
         for c in columns:
@@ -2236,33 +2321,48 @@ def _build_ml_feature_export_summary(
         warnings.append("valid/test split is empty; small scoped tests can do this, but the 5-CYP final run should have non-empty validation/test splits")
 
     gcn_ready = not blockers
-    compound_required = [
-        "molecular_weight", "xlogp3", "tpsa", "hbond_donor_count",
-        "hbond_acceptor_count", "rotatable_bond_count", "formula_atom_count",
-        "formula_heavy_atom_count", "similarity_degree",
-    ]
-    protein_required = [
-        "uniprot_sequence_length", "uniprot_molecular_weight", "go_count",
-        "reactome_count", "interpro_count", "protein_embedding_node_count",
-    ]
-    endpoint_required = [
-        "value_float", "value_molar", "activity_label_thresholded", "supervision_label",
-        "activity_threshold_um", "endpoint_type", "unit_curie",
-    ]
+    compound_required_aliases = {
+        "molecular_weight": ["molecular_weight", "properties_molecular_weight", "molgraph_molecular_weight"],
+        "xlogp": ["xlogp", "xlogp3", "properties_xlogp3", "molgraph_xlogp"],
+        "tpsa": ["tpsa", "properties_tpsa", "molgraph_tpsa"],
+        "hbond_donor_count": ["hbond_donor_count", "properties_hbond_donor_count", "molgraph_hbond_donor_count"],
+        "hbond_acceptor_count": ["hbond_acceptor_count", "properties_hbond_acceptor_count", "molgraph_hbond_acceptor_count"],
+        "rotatable_bond_count": ["rotatable_bond_count", "properties_rotatable_bond_count", "molgraph_rotatable_bond_count"],
+        "formula_atom_count": ["formula_atom_count", "properties_formula_atom_count", "molgraph_formula_atom_count"],
+        "formula_heavy_atom_count": ["formula_heavy_atom_count", "properties_formula_heavy_atom_count", "molgraph_formula_heavy_atom_count", "properties_heavy_atom_count", "molgraph_heavy_atom_count"],
+        "similarity_degree": ["similarity_degree"],
+    }
+    protein_required_aliases = {
+        "sequence_length": ["uniprot_sequence_length", "sequence_length", "props_sequence_length"],
+        "molecular_weight": ["uniprot_molecular_weight", "molecular_weight", "props_molecular_weight"],
+        "go_count": ["go_count"],
+        "reactome_count": ["reactome_count"],
+        "interpro_count": ["interpro_count"],
+        "protein_embedding_node_count": ["protein_embedding_node_count", "protembed_node_count"],
+    }
+    endpoint_required_aliases = {
+        "value_float": ["value_float", "props_value_float"],
+        "value_molar": ["value_molar", "props_value_molar"],
+        "activity_label_thresholded": ["activity_label_thresholded", "props_activity_label_thresholded"],
+        "supervision_label": ["supervision_label", "props_supervision_label"],
+        "activity_threshold_um": ["activity_threshold_um", "props_activity_threshold_um"],
+        "endpoint_type": ["endpoint_type", "props_endpoint_type"],
+        "unit_curie": ["unit_curie", "props_unit_curie"],
+    }
 
     feature_column_manifest = {
         "compound": {
             "columns": sorted(compound_cols),
             "vector_columns": compound_vectors,
             "vector_column_count": len(compound_vectors),
-            "coverage": coverage(compound_feature_rows, compound_required),
+            "coverage": coverage_aliases(compound_feature_rows, compound_required_aliases),
             "column_groups": columns_by_prefix(compound_cols, ("fp_", "molgraph_", "properties_", "structure_", "formula_", "similarity_")),
         },
         "protein": {
             "columns": sorted(protein_cols),
             "vector_columns": protein_vectors,
             "vector_column_count": len(protein_vectors),
-            "coverage": coverage(protein_feature_rows, protein_required),
+            "coverage": coverage_aliases(protein_feature_rows, protein_required_aliases),
             "column_groups": columns_by_prefix(protein_cols, ("protembed_", "uniprot_", "go_", "reactome_", "interpro_", "pdb_", "alphafold_", "bindingdb_")),
         },
         "protembed": {
@@ -2274,7 +2374,7 @@ def _build_ml_feature_export_summary(
         },
         "endpoint": {
             "columns": sorted(endpoint_cols),
-            "coverage": coverage(endpoint_feature_rows, endpoint_required),
+            "coverage": coverage_aliases(endpoint_feature_rows, endpoint_required_aliases),
         },
         "pairs": {
             "columns": sorted(pair_cols),
@@ -2384,23 +2484,259 @@ def _write_normalized_feature_table(path: Path, rows: list[dict[str, Any]], *, i
         stats[key] = {"mean": mean, "std": std, "count": float(len(values))}
 
     normalized_rows: list[dict[str, Any]] = []
+    missing_cells = 0
     for row in rows:
         out = dict(row)
         for key in numeric_cols:
             text = _stringify_cell(row.get(key)).strip()
-            if not text:
-                out[f"z_{key}"] = ""
-                continue
-            value = float(text)
+            missing = not text
+            if missing:
+                value = stats[key]["mean"]
+                missing_cells += 1
+            else:
+                try:
+                    value = float(text)
+                    if not math.isfinite(value):
+                        value = stats[key]["mean"]
+                        missing = True
+                        missing_cells += 1
+                except Exception:
+                    value = stats[key]["mean"]
+                    missing = True
+                    missing_cells += 1
             std = stats[key]["std"]
-            out[f"z_{key}"] = 0.0 if std == 0 else (value - stats[key]["mean"]) / std
+            z_value = 0.0 if std == 0 else (value - stats[key]["mean"]) / std
+            out[f"z_{key}"] = 0.0 if not math.isfinite(z_value) else z_value
+            out[f"z_{key}_missing"] = int(missing)
         normalized_rows.append(out)
     _write_rows_csv(path, normalized_rows, columns=_columns(normalized_rows) or _columns(rows))
     return {
         "rows": len(rows),
         "normalized_numeric_columns": len(numeric_cols),
         "numeric_columns": numeric_cols,
+        "missing_numeric_cells_imputed": missing_cells,
+        "missing_masks_written": True,
+        "nan_free": True,
         "stats": stats,
+    }
+
+
+def _write_model_matrix_feature_table(path: Path, rows: list[dict[str, Any]], *, id_columns: set[str]) -> dict[str, Any]:
+    """Write a tensor-ready numeric feature matrix with no NaN/inf values.
+
+    The output keeps only stable identifier columns plus numeric ``x_*`` feature
+    columns and ``missing_*`` masks. Missing numeric values are imputed with the
+    column mean before z-normalization, then represented by a mask column. This
+    file is intended for direct PyTorch Geometric, DGL, scikit-learn, or XGBoost
+    loaders without pandas-side imputation.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    numeric_values: dict[str, list[float]] = {}
+    rejected: set[str] = set()
+    id_cols_present = sorted({c for row in rows for c in row.keys() if c in id_columns})
+    for row in rows:
+        for key, value in row.items():
+            key_text = str(key)
+            if key in id_columns or key_text.startswith(("key_", "props_")):
+                continue
+            text = _stringify_cell(value).strip()
+            if not text:
+                continue
+            if text.lower() in {"true", "false", "yes", "no"}:
+                rejected.add(key_text)
+                continue
+            try:
+                fval = float(text)
+                if math.isfinite(fval):
+                    numeric_values.setdefault(key_text, []).append(fval)
+                else:
+                    rejected.add(key_text)
+            except Exception:
+                rejected.add(key_text)
+    numeric_cols = sorted(k for k, values in numeric_values.items() if k not in rejected and values)
+    stats: dict[str, dict[str, float]] = {}
+    for key in numeric_cols:
+        values = numeric_values[key]
+        mean = sum(values) / len(values)
+        var = sum((v - mean) ** 2 for v in values) / len(values) if values else 0.0
+        std = var ** 0.5
+        stats[key] = {"mean": mean, "std": std, "count": float(len(values))}
+
+    matrix_rows: list[dict[str, Any]] = []
+    missing_cells = 0
+    for row in rows:
+        out = {c: row.get(c, "") for c in id_cols_present}
+        for key in numeric_cols:
+            text = _stringify_cell(row.get(key)).strip()
+            missing = not text
+            if missing:
+                value = stats[key]["mean"]
+                missing_cells += 1
+            else:
+                try:
+                    value = float(text)
+                    if not math.isfinite(value):
+                        value = stats[key]["mean"]
+                        missing = True
+                        missing_cells += 1
+                except Exception:
+                    value = stats[key]["mean"]
+                    missing = True
+                    missing_cells += 1
+            std = stats[key]["std"]
+            x_value = 0.0 if std == 0 else (value - stats[key]["mean"]) / std
+            safe = _safe_col(key)
+            out[f"x_{safe}"] = 0.0 if not math.isfinite(x_value) else x_value
+            out[f"missing_{safe}"] = int(missing)
+        matrix_rows.append(out)
+    cols = id_cols_present + [f"x_{_safe_col(c)}" for c in numeric_cols] + [f"missing_{_safe_col(c)}" for c in numeric_cols]
+    _write_rows_csv(path, matrix_rows, columns=cols)
+    return {
+        "rows": len(rows),
+        "numeric_feature_columns": len(numeric_cols),
+        "matrix_columns": len(cols),
+        "missing_numeric_cells_imputed": missing_cells,
+        "nan_free": True,
+        "inf_free": True,
+        "missing_masks_written": True,
+        "stats": stats,
+    }
+
+
+def _write_pyg_export(
+    out_dir: Path,
+    *,
+    node_mapping_rows: list[dict[str, Any]],
+    edge_rows: list[dict[str, Any]],
+    train_edge_rows: list[dict[str, Any]],
+    training_pair_rows: list[dict[str, Any]],
+    candidate_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Write lightweight PyTorch/PyG-friendly mapping exports.
+
+    This avoids a hard dependency on torch_geometric while still producing a
+    loadable ``heterodata.pt`` dictionary when PyTorch is installed. Feature
+    tensors are intentionally referenced through the no-NaN model-matrix CSVs so
+    downstream code can choose homogeneous GCN, R-GCN, HGT, GraphSAGE, or a
+    tabular baseline.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    node_type_counts: dict[str, int] = {}
+    for row in node_mapping_rows:
+        label = str(row.get("label") or row.get("node_label") or "Unknown")
+        node_type_counts[label] = node_type_counts.get(label, 0) + 1
+
+    edge_type_counts: dict[str, int] = {}
+    for edge in edge_rows:
+        key = "|".join([
+            str(edge.get("start_label") or "Unknown"),
+            str(edge.get("schema_label") or edge.get("type") or "RELATED_TO"),
+            str(edge.get("end_label") or "Unknown"),
+        ])
+        edge_type_counts[key] = edge_type_counts.get(key, 0) + 1
+
+    node_type_mapping = {label: idx for idx, label in enumerate(sorted(node_type_counts))}
+    edge_type_mapping = {label: idx for idx, label in enumerate(sorted(edge_type_counts))}
+    feature_tensor_manifest = {
+        "format": "csv_model_matrices_plus_optional_torch_pt",
+        "nan_free_model_matrix_files": {
+            "Compound": "../node_features_compound_model_matrix.csv",
+            "Protein": "../node_features_protein_model_matrix.csv",
+            "ProtEmbed": "../node_features_protembed_model_matrix.csv",
+            "Endpoint": "../node_features_endpoint_model_matrix.csv",
+        },
+        "node_type_counts": node_type_counts,
+        "edge_type_counts": edge_type_counts,
+        "recommended_models": ["HGT", "R-GCN", "HeteroGraphSAGE", "HAN", "GCN baseline after homogeneous projection", "XGBoost/MLP baseline"],
+        "label_semantics": {
+            "1": "curated active/potent interaction evidence",
+            "0": "curated inactive or weak evidence under threshold rule",
+            "unknown": "unobserved candidate pair; not a true negative",
+        },
+    }
+    (out_dir / "node_type_mapping.json").write_text(json.dumps(node_type_mapping, indent=2, ensure_ascii=False), encoding="utf-8")
+    (out_dir / "edge_type_mapping.json").write_text(json.dumps(edge_type_mapping, indent=2, ensure_ascii=False), encoding="utf-8")
+    (out_dir / "feature_tensor_manifest.json").write_text(json.dumps(feature_tensor_manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    split_edges: dict[str, list[list[int]]] = {"train": [], "val": [], "test": [], "unknown": []}
+    split_labels: dict[str, list[int]] = {"train": [], "val": [], "test": []}
+    for row in training_pair_rows:
+        try:
+            src = int(row.get("compound_node_id"))
+            dst = int(row.get("protein_node_id"))
+            label = int(float(str(row.get("label"))))
+        except Exception:
+            continue
+        split = str(row.get("split") or "train").lower()
+        if split == "valid":
+            split = "val"
+        if split not in {"train", "val", "test"}:
+            split = "train"
+        split_edges[split].append([src, dst])
+        split_labels[split].append(label)
+    for row in candidate_rows:
+        try:
+            split_edges["unknown"].append([int(row.get("compound_node_id")), int(row.get("protein_node_id"))])
+        except Exception:
+            continue
+    (out_dir / "train_val_test_edges.json").write_text(json.dumps({"edges": split_edges, "labels": split_labels}, indent=2), encoding="utf-8")
+
+    torch_written = False
+    torch_error = None
+    try:
+        import torch  # type: ignore
+        by_type: dict[str, list[list[int]]] = {}
+        for edge in edge_rows:
+            try:
+                key = "|".join([
+                    str(edge.get("start_label") or "Unknown"),
+                    str(edge.get("schema_label") or edge.get("type") or "RELATED_TO"),
+                    str(edge.get("end_label") or "Unknown"),
+                ])
+                by_type.setdefault(key, []).append([int(edge.get("source_node_id")), int(edge.get("target_node_id"))])
+            except Exception:
+                continue
+        torch_edges = {
+            key: (torch.tensor(vals, dtype=torch.long).t().contiguous() if vals else torch.empty((2, 0), dtype=torch.long))
+            for key, vals in by_type.items()
+        }
+        torch_splits = {}
+        for split, vals in split_edges.items():
+            torch_splits[split] = torch.tensor(vals, dtype=torch.long).t().contiguous() if vals else torch.empty((2, 0), dtype=torch.long)
+        torch_labels = {split: torch.tensor(vals, dtype=torch.long) for split, vals in split_labels.items()}
+        payload = {
+            "format": "pring_lightweight_heterodata_v1",
+            "node_type_mapping": node_type_mapping,
+            "edge_type_mapping": edge_type_mapping,
+            "node_type_counts": node_type_counts,
+            "edge_index_by_type": torch_edges,
+            "split_edges": torch_splits,
+            "split_labels": torch_labels,
+            "feature_tensor_manifest": feature_tensor_manifest,
+        }
+        torch.save(payload, out_dir / "heterodata.pt")
+        torch.save({"edges": torch_splits, "labels": torch_labels}, out_dir / "train_val_test_edges.pt")
+        torch_written = True
+    except Exception as exc:  # pragma: no cover - depends on optional torch install
+        torch_error = str(exc)
+    (out_dir / "README.md").write_text(
+        "# PRING PyG/DGL-friendly export\n\n"
+        "Use the no-NaN `node_features_*_model_matrix.csv` files for features. "
+        "If PyTorch was available during export, `heterodata.pt` contains edge-index tensors grouped by heterogeneous edge type and split pair tensors. "
+        "This export is intentionally lightweight and does not require `torch_geometric` at package runtime.\n",
+        encoding="utf-8",
+    )
+    return {
+        "written": True,
+        "directory": str(out_dir),
+        "torch_available": torch_written,
+        "torch_error": torch_error,
+        "node_type_count": len(node_type_mapping),
+        "edge_type_count": len(edge_type_mapping),
+        "train_pair_edges": len(split_edges.get("train", [])),
+        "val_pair_edges": len(split_edges.get("val", [])),
+        "test_pair_edges": len(split_edges.get("test", [])),
+        "unknown_pair_edges": len(split_edges.get("unknown", [])),
     }
 
 def _write_rows_csv(path: Path, rows: list[dict[str, Any]], *, columns: Optional[list[str]] = None) -> None:
