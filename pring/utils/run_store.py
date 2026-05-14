@@ -255,10 +255,12 @@ class RunStore:
         cap_completeness_report = _cap_completeness_report(self.run_dir)
 
         ml_summary = (csv_summary or {}).get("ml", {}) if isinstance(csv_summary, dict) else {}
+        export_skipped_relationship_counts = (ml_summary.get("skipped_relationships_missing_nodes") or {}) if isinstance(ml_summary, dict) else {}
         cyp450_gcn_readiness_report = _cyp450_gcn_readiness_report(
             unique_node_counts=unique_node_counts,
             unique_relationship_counts=unique_relationship_counts,
             dangling_relationship_counts=dangling_relationship_counts,
+            export_skipped_relationship_counts=export_skipped_relationship_counts,
             similarity_report=similarity_report,
             optional_layer_report=optional_layer_report,
             schema_alignment_report=schema_alignment_report,
@@ -273,7 +275,8 @@ class RunStore:
             "duplicate_node_counts": {k: max(0, node_counts.get(k, 0) - unique_node_counts.get(k, 0)) for k in node_counts},
             "relationship_counts_raw": relationship_counts,
             "relationship_counts_unique_by_file": unique_relationship_counts,
-            "dangling_relationship_counts": dangling_relationship_counts,
+            "dangling_relationship_counts_raw_jsonl": dangling_relationship_counts,
+            "export_skipped_relationship_counts": export_skipped_relationship_counts,
             "endpoint_label_distribution": endpoint_label_distribution,
             "endpoint_label_distribution_thresholded": endpoint_label_distribution_thresholded,
             "label_config": {
@@ -296,7 +299,8 @@ class RunStore:
             "csv_summary": csv_summary or {},
             "stage_markers": stage_markers,
             "quality_flags": {
-                "has_dangling_relationships": bool(dangling_relationship_counts),
+                "has_raw_jsonl_dangling_relationships": bool(dangling_relationship_counts),
+                "has_export_skipped_relationships": bool(export_skipped_relationship_counts),
                 "has_dangling_similarity_edges": bool(similarity_report.get("similarity_missing_target_compounds")),
                 "missing_schema_node_labels": schema_alignment_report.get("missing_node_labels", []),
                 "missing_schema_relationship_types": schema_alignment_report.get("missing_relationship_types", []),
@@ -953,6 +957,8 @@ class RunStore:
         cooc_to_genes: dict[str, set[str]] = {}
         cooc_to_refs: dict[str, set[str]] = {}
         gene_to_proteins: dict[str, set[str]] = {}
+        interaction_to_compounds: dict[str, set[str]] = {}
+        interaction_to_proteins: dict[str, set[str]] = {}
         seen_edge_keys: set[tuple[str, str, str, str]] = set()
         similarity_components = _UnionFind()
 
@@ -1048,6 +1054,10 @@ class RunStore:
                     protein_annotation_maps.setdefault(start_ref, {}).setdefault(schema_label, set()).add(end_ref)
                 elif schema_label == "ENCODED_BY" and start_label_text == "Protein" and end_label_text == "Gene":
                     gene_to_proteins.setdefault(end_ref, set()).add(start_ref)
+                elif schema_label == "ASSERTS_CHEMICAL" and start_label_text == "Interaction" and end_label_text == "Compound":
+                    interaction_to_compounds.setdefault(start_ref, set()).add(end_ref)
+                elif schema_label == "ASSERTS_TARGET" and start_label_text == "Interaction" and end_label_text == "Protein":
+                    interaction_to_proteins.setdefault(start_ref, set()).add(end_ref)
                 elif schema_label == "MENTIONS_COMPOUND" and start_label_text == "Cooc" and end_label_text == "Compound":
                     cooc_to_compounds.setdefault(start_ref, set()).add(end_ref)
                 elif schema_label == "MENTIONS_PROTEIN" and start_label_text == "Cooc" and end_label_text == "Protein":
@@ -1241,6 +1251,37 @@ class RunStore:
         training_pair_rows = pair_rows + negative_rows
         link_prediction_pair_rows = training_pair_rows + candidate_rows
 
+        heldout_pair_keys = {
+            (str(r.get("compound_node_ref") or ""), str(r.get("protein_node_ref") or ""))
+            for r in training_pair_rows
+            if str(r.get("split") or "").lower() in {"val", "valid", "validation", "test"}
+        }
+        heldout_endpoint_refs: set[str] = set()
+        heldout_measuregroup_refs: set[str] = set()
+        for r in training_pair_rows:
+            pair_key = (str(r.get("compound_node_ref") or ""), str(r.get("protein_node_ref") or ""))
+            if pair_key not in heldout_pair_keys:
+                continue
+            heldout_endpoint_refs.update(_split_ref_list(r.get("evidence_endpoints")))
+            heldout_measuregroup_refs.update(_split_ref_list(r.get("evidence_measuregroups")))
+        heldout_interaction_refs: set[str] = set()
+        for interaction_ref, compounds in interaction_to_compounds.items():
+            proteins = interaction_to_proteins.get(interaction_ref, set())
+            if any((c, p) in heldout_pair_keys for c in compounds for p in proteins):
+                heldout_interaction_refs.add(interaction_ref)
+        heldout_evidence_nodes = heldout_interaction_refs | heldout_endpoint_refs | heldout_measuregroup_refs
+        edge_index_train_only_rows = []
+        edge_index_holdout_removed_rows = []
+        for edge in edge_rows:
+            touches_heldout = (
+                str(edge.get("start_node_ref") or "") in heldout_evidence_nodes
+                or str(edge.get("end_node_ref") or "") in heldout_evidence_nodes
+            )
+            if touches_heldout:
+                edge_index_holdout_removed_rows.append(dict(edge))
+            else:
+                edge_index_train_only_rows.append(dict(edge))
+
         if guard is not None:
             guard.checkpoint("ml:features:before", force=True)
         compound_feature_rows = _build_compound_feature_rows(node_records_by_ref, node_id_by_ref, compound_similarity_degree=compound_similarity_degree)
@@ -1260,9 +1301,29 @@ class RunStore:
         if guard is not None:
             guard.checkpoint("ml:features:endpoint", force=True)
 
+        normalization_summary = {
+            "compound": _write_normalized_feature_table(
+                self.ml_dir / "node_features_compound_normalized.csv",
+                compound_feature_rows,
+                id_columns={"node_id", "node_ref", "cid", "preferred_name"},
+            ),
+            "protein": _write_normalized_feature_table(
+                self.ml_dir / "node_features_protein_normalized.csv",
+                protein_feature_rows,
+                id_columns={"node_id", "node_ref", "protein_id", "uniprot_id", "name", "cyp_symbol"},
+            ),
+            "endpoint": _write_normalized_feature_table(
+                self.ml_dir / "node_features_endpoint_normalized.csv",
+                endpoint_feature_rows,
+                id_columns={"node_id", "node_ref", "endpoint_id", "endpoint_type", "activity_label_thresholded", "supervision_label"},
+            ),
+        }
+
         _write_rows_csv(self.ml_dir / "node_mapping.csv", node_mapping_rows)
         _write_rows_csv(self.ml_dir / "relation_mapping.csv", relation_mapping_rows)
         _write_rows_csv(self.ml_dir / "edge_index.csv", edge_rows)
+        _write_rows_csv(self.ml_dir / "edge_index_train_only.csv", edge_index_train_only_rows)
+        _write_rows_csv(self.ml_dir / "edge_index_holdout_removed_edges.csv", edge_index_holdout_removed_rows)
         _write_rows_csv(self.ml_dir / "node_features_compound.csv", compound_feature_rows)
         _write_rows_csv(self.ml_dir / "node_features_protein.csv", protein_feature_rows)
         _write_rows_csv(self.ml_dir / "node_features_protembed.csv", protembed_feature_rows)
@@ -1282,6 +1343,24 @@ class RunStore:
             candidate_rows=candidate_rows,
             link_prediction_pair_rows=link_prediction_pair_rows,
         )
+        ml_feature_export_summary["normalization"] = normalization_summary
+        ml_feature_export_summary.setdefault("files", {})["node_features_compound_normalized.csv"] = {"written": True, **normalization_summary.get("compound", {})}
+        ml_feature_export_summary.setdefault("files", {})["node_features_protein_normalized.csv"] = {"written": True, **normalization_summary.get("protein", {})}
+        ml_feature_export_summary.setdefault("files", {})["node_features_endpoint_normalized.csv"] = {"written": True, **normalization_summary.get("endpoint", {})}
+        ml_feature_export_summary.setdefault("files", {})["edge_index_train_only.csv"] = {"rows": len(edge_index_train_only_rows)}
+        ml_feature_export_summary.setdefault("files", {})["edge_index_holdout_removed_edges.csv"] = {"rows": len(edge_index_holdout_removed_rows)}
+        ml_feature_export_summary["leakage_control_export"] = {
+            "train_only_edge_index_file": "edge_index_train_only.csv",
+            "removed_holdout_edge_file": "edge_index_holdout_removed_edges.csv",
+            "heldout_pair_count": len(heldout_pair_keys),
+            "heldout_interaction_nodes": len(heldout_interaction_refs),
+            "heldout_endpoint_nodes": len(heldout_endpoint_refs),
+            "heldout_measuregroup_nodes": len(heldout_measuregroup_refs),
+            "removed_edge_count": len(edge_index_holdout_removed_rows),
+            "note": "Use edge_index_train_only.csv for message passing when validating/test-scoring held-out curated links to avoid evidence-path leakage.",
+        }
+        ml_feature_export_summary.setdefault("case_study_report", {}).setdefault("leakage_control", {}).update(ml_feature_export_summary["leakage_control_export"])
+        (self.ml_dir / "normalization_stats.json").write_text(json.dumps(normalization_summary, indent=2, ensure_ascii=False), encoding="utf-8")
         (self.ml_dir / "modeling_readiness_manifest.json").write_text(json.dumps(ml_feature_export_summary, indent=2, ensure_ascii=False), encoding="utf-8")
         (self.ml_dir / "gcn_case_study_report.json").write_text(
             json.dumps(ml_feature_export_summary.get("case_study_report", {}), indent=2, ensure_ascii=False),
@@ -1300,6 +1379,8 @@ class RunStore:
             "node_mapping_records": len(node_mapping_rows),
             "relation_mapping_records": len(relation_mapping_rows),
             "edge_index_records": len(edge_rows),
+            "edge_index_train_only_records": len(edge_index_train_only_rows),
+            "edge_index_holdout_removed_records": len(edge_index_holdout_removed_rows),
             "compound_feature_records": len(compound_feature_rows),
             "protein_feature_records": len(protein_feature_rows),
             "protein_embedding_feature_records": len(protembed_feature_rows),
@@ -1319,6 +1400,8 @@ class RunStore:
             "split_strategy": "compound_similarity_component_holdout",
             "label_semantics": "supervised labels use normalized endpoint evidence; unobserved compound-target pairs are exported as unknown candidates, not true negatives",
             "feature_export_summary": ml_feature_export_summary,
+            "leakage_control_export": ml_feature_export_summary.get("leakage_control_export", {}),
+            "normalization_summary": normalization_summary,
         }
         summary_path = self.graph_dir / "csv_export_summary.json"
         summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1501,7 +1584,8 @@ def _cyp450_gcn_readiness_report(
     unique_node_counts: Dict[str, int],
     unique_relationship_counts: Dict[str, int],
     dangling_relationship_counts: Dict[str, int],
-    similarity_report: Dict[str, Any],
+    export_skipped_relationship_counts: Optional[Dict[str, int]] = None,
+    similarity_report: Dict[str, Any] = None,
     optional_layer_report: Dict[str, Any],
     schema_alignment_report: Dict[str, Any],
     feature_completeness_report: Dict[str, Any],
@@ -1516,8 +1600,12 @@ def _cyp450_gcn_readiness_report(
     blockers: list[str] = []
     warnings: list[str] = []
 
+    export_skipped_relationship_counts = export_skipped_relationship_counts or {}
+    similarity_report = similarity_report or {}
+    if export_skipped_relationship_counts:
+        warnings.append("some_raw_relationships_skipped_from_export_due_to_missing_nodes")
     if dangling_relationship_counts:
-        blockers.append("dangling_relationships_present")
+        warnings.append("raw_jsonl_contains_relationships_to_nodes_not_materialized_in_raw_artifacts")
     if similarity_report.get("similarity_missing_target_compounds"):
         blockers.append("dangling_similarity_edges_present")
     if int(unique_node_counts.get("Compound", 0)) == 0 or int(unique_node_counts.get("Protein", 0)) == 0:
@@ -2142,7 +2230,7 @@ def _build_ml_feature_export_summary(
 
     split_distribution = split_counts(link_prediction_pair_rows)
     train_labels = split_distribution.get("train", {})
-    valid_labels = split_distribution.get("valid", {})
+    valid_labels = split_distribution.get("val", {}) or split_distribution.get("valid", {}) or split_distribution.get("validation", {})
     test_labels = split_distribution.get("test", {})
     if link_prediction_pair_rows and (not valid_labels or not test_labels):
         warnings.append("valid/test split is empty; small scoped tests can do this, but the 5-CYP final run should have non-empty validation/test splits")
@@ -2250,6 +2338,69 @@ def _build_ml_feature_export_summary(
             "unknown": "unobserved compound-target candidate; not a true negative",
         },
         "recommended_gnn_setup": "heterogeneous GNN/R-GCN/HGT using Compound, Protein, ProtEmbed, Endpoint, Interaction and SIMILAR_TO relations; homogeneous GCN can use flattened node_features_compound/protein plus compound-target pair files as a baseline",
+    }
+
+
+def _split_ref_list(value: Any) -> set[str]:
+    """Parse PRING pipe-delimited node-ref lists from ML evidence columns."""
+    text = _stringify_cell(value)
+    if not text:
+        return set()
+    return {part.strip() for part in text.split("|") if part.strip()}
+
+
+def _write_normalized_feature_table(path: Path, rows: list[dict[str, Any]], *, id_columns: set[str]) -> dict[str, Any]:
+    """Write an augmented feature table with z-scored numeric columns.
+
+    The original feature exports remain untouched. This companion table keeps
+    identifiers and non-numeric columns, and adds ``z_<column>`` for every column
+    whose non-empty values are fully numeric and non-boolean. It is intended for
+    quick baseline GCN/ML experiments; production loaders may still apply their
+    own split-specific scaling.
+    """
+    numeric_values: dict[str, list[float]] = {}
+    rejected: set[str] = set()
+    for row in rows:
+        for key, value in row.items():
+            if key in id_columns or str(key).startswith(("key_", "props_")):
+                continue
+            text = _stringify_cell(value).strip()
+            if not text:
+                continue
+            if text.lower() in {"true", "false", "yes", "no"}:
+                rejected.add(key)
+                continue
+            try:
+                numeric_values.setdefault(key, []).append(float(text))
+            except Exception:
+                rejected.add(key)
+    numeric_cols = sorted(k for k, values in numeric_values.items() if k not in rejected and values)
+    stats: dict[str, dict[str, float]] = {}
+    for key in numeric_cols:
+        values = numeric_values[key]
+        mean = sum(values) / len(values)
+        var = sum((v - mean) ** 2 for v in values) / len(values) if values else 0.0
+        std = var ** 0.5
+        stats[key] = {"mean": mean, "std": std, "count": float(len(values))}
+
+    normalized_rows: list[dict[str, Any]] = []
+    for row in rows:
+        out = dict(row)
+        for key in numeric_cols:
+            text = _stringify_cell(row.get(key)).strip()
+            if not text:
+                out[f"z_{key}"] = ""
+                continue
+            value = float(text)
+            std = stats[key]["std"]
+            out[f"z_{key}"] = 0.0 if std == 0 else (value - stats[key]["mean"]) / std
+        normalized_rows.append(out)
+    _write_rows_csv(path, normalized_rows, columns=_columns(normalized_rows) or _columns(rows))
+    return {
+        "rows": len(rows),
+        "normalized_numeric_columns": len(numeric_cols),
+        "numeric_columns": numeric_cols,
+        "stats": stats,
     }
 
 def _write_rows_csv(path: Path, rows: list[dict[str, Any]], *, columns: Optional[list[str]] = None) -> None:

@@ -690,6 +690,14 @@ def iter_graph_records(rows: Iterable[PubChemRow]) -> Iterator[Tuple[str, Dict]]
             cid = _as_int(d.get("cid"))
             endpoint_id = _as_text(d.get("endpoint_id"))
             if cid is not None:
+                # BindingDB often returns ligands that are not already part of the
+                # PubChem assay-derived compound set. Materialize a minimal but
+                # model-usable Compound sidecar from BindingDB SMILES so the
+                # Compound -> BindingDB validation edge is not dropped during CSV
+                # export and the ligand can still receive RDKit features. When a
+                # richer PubChem Compound node is present, CSV rematerialization
+                # merges these supplemental fields by key.
+                _materialize_bindingdb_compound_sidecars(node, rel, cid=cid, data=d)
                 rel("HAS_BINDINGDB_RECORD", {"label": "Compound", "key": {"cid": cid}}, {"label": "BindingDB", "key": {"bindingdb_id": bindingdb_id}})
             protein_id = _as_text(d.get("protein_id"))
             if protein_id:
@@ -800,6 +808,131 @@ def _listify(value: Any) -> List[Any]:
 def _has_non_key_payload(props: Dict[str, Any], key_name: str) -> bool:
     return any(v is not None for k, v in props.items() if k != key_name)
 
+
+
+def _materialize_bindingdb_compound_sidecars(node_fn, rel_fn, *, cid: int, data: Dict[str, Any]) -> None:
+    """Create minimal Compound/Structure/Properties/MolGraph records for BindingDB-only ligands.
+
+    BindingDB target-centric enrichment may return PubChem CIDs that were not
+    seen in the PubChem assay expansion. Creating these sidecars prevents
+    dangling ``HAS_BINDINGDB_RECORD`` relationships and keeps the ML exports
+    usable for GCN/HGT models. RDKit descriptors are best-effort and local-only;
+    failures leave a valid Compound node plus any source SMILES/InChIKey fields.
+    """
+    compound_key = {"label": "Compound", "key": {"cid": cid}}
+    ligand_id = _first_nonempty(data, "ligand_id", "bindingdb_ligand_id")
+    smiles = _first_nonempty(data, "smiles", "canonical_smiles", "isomeric_smiles")
+    inchi = _first_nonempty(data, "inchi", "InChI")
+    inchikey = _first_nonempty(data, "inchikey", "InChIKey")
+
+    node_fn("Compound", {"cid": cid}, _with_raw_fields({
+        "cid": cid,
+        "supplemental_source": "BindingDB",
+        "bindingdb_ligand_id": ligand_id,
+        "bindingdb_target_uniprot_acc": data.get("target_uniprot_acc"),
+    }, data))
+
+    structure_props = {
+        "cid": cid,
+        "smiles": smiles,
+        "canonical_smiles": smiles,
+        "isomeric_smiles": _first_nonempty(data, "isomeric_smiles"),
+        "inchi": inchi,
+        "inchikey": inchikey,
+        "source": "BindingDB",
+    }
+    if _has_non_key_payload(structure_props, "cid"):
+        node_fn("Structure", {"cid": cid}, _with_raw_fields(structure_props, data))
+        rel_fn("HAS_STRUCTURE", compound_key, {"label": "Structure", "key": {"cid": cid}})
+
+    descriptor_props, molgraph_props = _rdkit_features_from_smiles(cid, smiles)
+    if descriptor_props:
+        descriptor_props.setdefault("source", "BindingDB_RDKit")
+        node_fn("Properties", {"cid": cid}, descriptor_props)
+        rel_fn("HAS_PROPERTIES", compound_key, {"label": "Properties", "key": {"cid": cid}})
+    if molgraph_props:
+        repr_id = f"molgraph:CID{cid}:pubchem_features_v1"
+        molgraph_props.setdefault("repr_id", repr_id)
+        molgraph_props.setdefault("source", "BindingDB_RDKit")
+        node_fn("MolGraph", {"repr_id": repr_id}, molgraph_props)
+        rel_fn("HAS_MOLECULAR_REPRESENTATION", compound_key, {"label": "MolGraph", "key": {"repr_id": repr_id}})
+
+
+def _rdkit_features_from_smiles(cid: int, smiles: Any) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Return descriptor and Morgan fingerprint properties from a SMILES string."""
+    text = _as_text(smiles)
+    if not text:
+        return {}, {}
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import AllChem, Crippen, Descriptors, rdMolDescriptors
+    except Exception:
+        return {}, {}
+    try:
+        mol = Chem.MolFromSmiles(text)
+        if mol is None:
+            return {}, {}
+        formula = rdMolDescriptors.CalcMolFormula(mol)
+        descriptor_props: Dict[str, Any] = {
+            "cid": cid,
+            "formula": formula,
+            "molecular_weight": float(Descriptors.MolWt(mol)),
+            "exact_mass": float(Descriptors.ExactMolWt(mol)),
+            "xlogp3": float(Crippen.MolLogP(mol)),
+            "tpsa": float(rdMolDescriptors.CalcTPSA(mol)),
+            "hbond_donor_count": int(rdMolDescriptors.CalcNumHBD(mol)),
+            "hbond_acceptor_count": int(rdMolDescriptors.CalcNumHBA(mol)),
+            "rotatable_bond_count": int(rdMolDescriptors.CalcNumRotatableBonds(mol)),
+            "heavy_atom_count": int(mol.GetNumHeavyAtoms()),
+        }
+        descriptor_props.update(_formula_descriptor_counts(formula))
+        fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=256)
+        on_bits = list(fp.GetOnBits())
+        molgraph_props: Dict[str, Any] = {
+            "cid": cid,
+            "smiles": text,
+            "canonical_smiles": Chem.MolToSmiles(mol, canonical=True),
+            "formula": formula,
+            "molecular_weight": descriptor_props["molecular_weight"],
+            "xlogp": descriptor_props["xlogp3"],
+            "tpsa": descriptor_props["tpsa"],
+            "hbond_donor_count": descriptor_props["hbond_donor_count"],
+            "hbond_acceptor_count": descriptor_props["hbond_acceptor_count"],
+            "rotatable_bond_count": descriptor_props["rotatable_bond_count"],
+            "heavy_atom_count": descriptor_props["heavy_atom_count"],
+            "fingerprint_available": True,
+            "fingerprint_method": "rdkit_morgan_radius2",
+            "fingerprint_nbits": 256,
+            "fingerprint_on_bits": on_bits,
+        }
+        molgraph_props.update({f"fp_{i}": int(fp.GetBit(i)) for i in range(256)})
+        molgraph_props.update(_formula_descriptor_counts(formula))
+        return _drop_none(descriptor_props), _drop_none(molgraph_props)
+    except Exception:
+        return {}, {}
+
+
+def _formula_descriptor_counts(formula: Any) -> Dict[str, Any]:
+    """Parse simple formula-derived descriptors used by the compound ML export."""
+    text = _as_text(formula) or ""
+    counts: Dict[str, int] = {}
+    for element, raw_count in re.findall(r"([A-Z][a-z]?)(\d*)", text):
+        counts[element] = counts.get(element, 0) + (int(raw_count) if raw_count else 1)
+    halogens = sum(counts.get(x, 0) for x in ("F", "Cl", "Br", "I"))
+    heavy = sum(v for k, v in counts.items() if k != "H")
+    hetero = sum(v for k, v in counts.items() if k not in {"C", "H"})
+    return {
+        "formula_atom_count": sum(counts.values()) if counts else None,
+        "formula_heavy_atom_count": heavy if counts else None,
+        "formula_c_count": counts.get("C", 0) if counts else None,
+        "formula_h_count": counts.get("H", 0) if counts else None,
+        "formula_n_count": counts.get("N", 0) if counts else None,
+        "formula_o_count": counts.get("O", 0) if counts else None,
+        "formula_s_count": counts.get("S", 0) if counts else None,
+        "formula_halogen_count": halogens if counts else None,
+        "formula_hetero_atom_count": hetero if counts else None,
+        "formula_element_count": len(counts) if counts else None,
+    }
 
 def _source_display_name(value: Any) -> str | None:
     txt = _as_text(value)
