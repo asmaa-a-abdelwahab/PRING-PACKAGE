@@ -236,6 +236,7 @@ digraph PRING_Final_ImplementationReady_Thesis {
   // =========================
   Protein -> UniProt   [style=dashed, label="HAS_UNIPROT_RECORD"];
   UniProt -> ProtEmbed [style=dashed, label="HAS_PROTEIN_EMBEDDING"];
+  Protein -> ProtEmbed [style=dashed, label="HAS_PROTEIN_EMBEDDING"];
 
   Protein -> InterPro  [style=dashed, label="HAS_INTERPRO_DOMAIN"];
   Protein -> GO        [style=dashed, label="HAS_GO_ANNOTATION"];

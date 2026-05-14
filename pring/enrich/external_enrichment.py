@@ -1185,17 +1185,40 @@ def _bindingdb_file_rows(path: Path, inputs: EnrichmentInputs, *, max_records: O
     prot_ids = {str(p.get("protein_id")) for p in inputs.proteins if p.get("protein_id")}
     accs = {str(p.get("uniprot_acc")) for p in inputs.proteins if p.get("uniprot_acc")}
     for row in _iter_table(path, max_records=max_records):
-        cid = row.get("cid") or row.get("PubChem CID") or row.get("pubchem_cid")
-        acc = row.get("uniprot_acc") or row.get("UniProt") or row.get("target_uniprot_acc")
-        protein_id = row.get("protein_id") or (f"ACC{acc}" if acc else None)
-        if cid and str(cid) not in cid_set:
+        nrow = {_norm_bindingdb_key(k): v for k, v in row.items()}
+        cid = _first_bindingdb_value(nrow, "cid", "pubchem cid", "pubchem_cid", "pubchemcid", "pubchemcompoundid", "pubchemcompoundcid")
+        acc = _first_bindingdb_value(nrow, "uniprot_acc", "uniprot", "target_uniprot_acc", "targetuniprot", "uniprotid")
+        protein_id = _first_bindingdb_value(nrow, "protein_id", "proteinid", "target_protein_id") or (f"ACC{acc}" if acc else None)
+        # Keep rows that map to the extracted target set. A row with neither CID
+        # nor target is ignored; otherwise the CID filter is applied only when a
+        # CID is actually present because BindingDB target-level rows are useful
+        # evidence even before PubChem CID resolution.
+        if cid and cid_set and str(_as_int(cid) or cid) not in cid_set:
             continue
         if protein_id and protein_id not in prot_ids and acc and acc not in accs:
             continue
-        bid = row.get("bindingdb_id") or row.get("BindingDB ID") or row.get("monomerid") or row.get("BindingDB MonomerID")
+        if not protein_id and acc:
+            protein_id = f"ACC{acc}"
+        bid = _first_bindingdb_value(nrow, "bindingdb_id", "bindingdb id", "monomerid", "bindingdb monomerid", "bindingdbmonomerid", "ligandid")
         if not bid:
-            bid = _stable_id(json.dumps(row, sort_keys=True), "bindingdb")
-        yield {"bindingdb_id": str(bid), "cid": _as_int(cid), "protein_id": protein_id, **row, "source": row.get("source") or "BindingDB local import"}
+            bid = _stable_id(json.dumps(row, sort_keys=True, default=str), "bindingdb")
+        yield {
+            "bindingdb_id": str(bid),
+            "cid": _as_int(cid),
+            "protein_id": protein_id,
+            "target_uniprot_acc": acc,
+            "kd": _first_bindingdb_value(nrow, "kd", "kdnm"),
+            "ki": _first_bindingdb_value(nrow, "ki", "kinm"),
+            "ic50": _first_bindingdb_value(nrow, "ic50", "ic50nm"),
+            "affinity_value": _first_bindingdb_value(nrow, "affinity", "affinityvalue", "value", "affinitynm"),
+            "affinity_type": _first_bindingdb_value(nrow, "affinitytype", "type", "affinitykind"),
+            "smiles": _first_bindingdb_value(nrow, "smiles", "ligandsmiles", "canonicalsmiles", "isomericsmiles"),
+            "inchikey": _first_bindingdb_value(nrow, "inchikey", "inchi_key", "ligandinchikey", "standardinchikey"),
+            "source_ref": _first_bindingdb_value(nrow, "pmid", "pubmedid", "doi", "reference", "articleid"),
+            **row,
+            "source": row.get("source") or "BindingDB local import",
+            "parse_status": "compound_mapped" if _as_int(cid) is not None else "target_level_no_pubchem_cid",
+        }
 
 
 def _drugbank_file_rows(path: Path, inputs: EnrichmentInputs, *, max_records: Optional[int]) -> Iterator[Dict[str, Any]]:

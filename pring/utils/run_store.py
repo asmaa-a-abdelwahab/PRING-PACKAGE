@@ -36,6 +36,8 @@ ML_PAIR_COLUMNS = [
     "positive_endpoint_count",
     "negative_endpoint_count",
     "ambiguous_endpoint_count",
+    "evidence_assays",
+    "evidence_references",
     "label_rule",
 ]
 
@@ -78,6 +80,8 @@ ML_NEGATIVE_COLUMNS = [
     "positive_endpoint_count",
     "negative_endpoint_count",
     "ambiguous_endpoint_count",
+    "evidence_assays",
+    "evidence_references",
     "label_rule",
 ]
 
@@ -1607,17 +1611,31 @@ def _feature_completeness_report(
 
     protein_refs: set[str] = set()
     protein_with_sequence_or_len: set[str] = set()
+    protein_to_uniprot: dict[str, set[str]] = {}
+    for rec in _read_jsonl(rels_dir / "HAS_UNIPROT_RECORD.jsonl"):
+        start = rec.get("start") or {}
+        end = rec.get("end") or {}
+        if start.get("label") == "Protein" and end.get("label") == "UniProt":
+            protein_to_uniprot.setdefault(_node_ref("Protein", start.get("key") or {}), set()).add(_node_ref("UniProt", end.get("key") or {}))
+    uniprot_refs_with_len: set[str] = set()
+    uniprot_with_len = 0
+    for rec in _read_jsonl(nodes_dir / "UniProt.jsonl"):
+        props = rec.get("props") or {}
+        ref = _node_ref("UniProt", rec.get("key") or {})
+        if props.get("sequence_length") or props.get("sequence"):
+            uniprot_with_len += 1
+            uniprot_refs_with_len.add(ref)
     for rec in _read_jsonl(nodes_dir / "Protein.jsonl"):
         ref = _node_ref("Protein", rec.get("key") or {})
         protein_refs.add(ref)
         props = rec.get("props") or {}
-        if props.get("sequence") or props.get("sequence_length") or props.get("uniprot_sequence_length"):
+        if (
+            props.get("sequence")
+            or props.get("sequence_length")
+            or props.get("uniprot_sequence_length")
+            or bool(protein_to_uniprot.get(ref, set()) & uniprot_refs_with_len)
+        ):
             protein_with_sequence_or_len.add(ref)
-    uniprot_with_len = 0
-    for rec in _read_jsonl(nodes_dir / "UniProt.jsonl"):
-        props = rec.get("props") or {}
-        if props.get("sequence_length") or props.get("sequence"):
-            uniprot_with_len += 1
 
     endpoint_total = int(node_counts.get("Endpoint", 0))
     endpoint_numeric = 0

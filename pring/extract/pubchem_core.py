@@ -596,6 +596,9 @@ def iter_graph_records(rows: Iterable[PubChemRow]) -> Iterator[Tuple[str, Dict]]
             uniprot_acc = _as_text(d.get("uniprot_acc"))
             if uniprot_acc:
                 rel("HAS_PROTEIN_EMBEDDING", {"label": "UniProt", "key": {"uniprot_acc": uniprot_acc}}, {"label": "ProtEmbed", "key": {"embedding_id": embedding_id}})
+            protein_id = _as_text(d.get("protein_id"))
+            if protein_id:
+                rel("HAS_PROTEIN_EMBEDDING", {"label": "Protein", "key": {"protein_id": protein_id}}, {"label": "ProtEmbed", "key": {"embedding_id": embedding_id}})
 
         elif r.kind in {"molgraph", "molecular_representation"}:
             repr_id = _as_text(_first_nonempty(d, "repr_id", "id"))

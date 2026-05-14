@@ -345,6 +345,31 @@ def _validate_existing_run_dir(run_dir: Path) -> None:
         raise FileNotFoundError(f"Existing run has no relationship JSONL artifacts: {rels_dir}")
 
 
+def _protect_build_run_dir(run_dir: Path, *, overwrite: bool = False, resume: bool = False) -> None:
+    """Prevent accidental append/duplication when a build run-id is reused.
+
+    PRING JSONL artifacts are append-oriented. Re-running ``pring build`` with
+    the same ``--run-id`` can duplicate nodes/relationships and distort QA/ML
+    exports. By default, refuse an existing non-empty run directory. Users must
+    choose explicit overwrite or resume semantics.
+    """
+    if not run_dir.exists():
+        return
+    has_artifacts = any((run_dir / sub).exists() for sub in ["graph", "logs", "raw"]) or any(run_dir.iterdir())
+    if not has_artifacts:
+        return
+    if overwrite:
+        shutil.rmtree(run_dir)
+        return
+    if resume:
+        return
+    raise FileExistsError(
+        f"Output run directory already exists: {run_dir}. "
+        "Use a new --run-id, or pass --overwrite-run true to delete/rebuild it, "
+        "or --resume-run true only if you intentionally want to continue writing into it."
+    )
+
+
 def _copy_existing_run_artifacts(source_run_dir: Path, target_run_dir: Path) -> None:
     """Copy canonical run artifacts for non-destructive ``load-run --run-id``.
 
@@ -987,6 +1012,10 @@ def _add_shared_args(parser: argparse.ArgumentParser, *, default_suppress: bool 
     # Output + logging
     parser.add_argument("--out-dir", type=str, default=argparse.SUPPRESS if default_suppress else "runs", help="Where to store run artifacts (logs, cached responses, extracted graph).")
     parser.add_argument("--run-id", type=str, default=default, help="Run identifier (default: timestamp).")
+    parser.add_argument("--overwrite-run", type=str, choices=["true", "false"], default=default,
+                        help="If the output run directory already exists, delete it before building. Default: false.")
+    parser.add_argument("--resume-run", type=str, choices=["true", "false"], default=default,
+                        help="Allow writing into an existing run directory. Use only for intentional resume/debug workflows; default build behavior refuses existing run IDs.")
     parser.add_argument("--save-raw", type=str, choices=["true", "false"], default=argparse.SUPPRESS if default_suppress else "true",
                         help="Save raw PubChem RDF-REST responses locally (default: true).")
     parser.add_argument("--save-extracted", type=str, choices=["true", "false"], default=argparse.SUPPRESS if default_suppress else "true",
@@ -1152,6 +1181,19 @@ def main(argv: Optional[List[str]] = None) -> None:
     else:
         run_dir = Path(args.out_dir) / run_id
         save_csv_mirrors = settings.resources.write_csv_mirrors
+    # Build/demo runs are append-oriented, so protect against accidental
+    # reuse of a run-id before RunStore creates directories. load-run is handled
+    # separately because it may intentionally rematerialize an existing folder.
+    if getattr(args, "cmd", None) in {"build", "demo"}:
+        try:
+            _protect_build_run_dir(
+                run_dir,
+                overwrite=(getattr(args, "overwrite_run", None) == "true"),
+                resume=(getattr(args, "resume_run", None) == "true"),
+            )
+        except FileExistsError as exc:
+            raise SystemExit(str(exc)) from exc
+
     store = RunStore(
         run_dir=run_dir,
         save_raw=settings.save_raw_http_cache,
