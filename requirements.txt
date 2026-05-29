@@ -1,7 +1,16 @@
-rdflib
-rdflib-neo4j
+# PRING HPC GPU dependencies.
+# Install CUDA PyTorch separately before this file.
+
+transformers
+sentencepiece
+protobuf
+accelerate
+safetensors
+pandas
+matplotlib
+numpy
+rdkit
 neo4j
-neo4j-driver
 requests
 tenacity
 pyyaml
