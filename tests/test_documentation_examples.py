@@ -38,7 +38,7 @@ def test_readme_documents_core_user_workflows():
     for section in required_sections:
         assert section in readme
 
-    for command in ["build", "load-run", "schema", "demo"]:
+    for command in ["build", "load-run", "schema", "demo", "eda"]:
         assert command in readme
 
     for scope in ["expand-from-targets", "expand-from-compounds", "intersection"]:
@@ -58,9 +58,12 @@ def test_examples_exist_for_local_hpc_and_python_users():
         "examples/local/02_build_intersection_gcn_ready.ps1",
         "examples/local/03_load_existing_run_to_neo4j.sh",
         "examples/local/03_load_existing_run_to_neo4j.ps1",
+        "examples/local/04_explore_run_data.sh",
+        "examples/local/04_explore_run_data.ps1",
         "examples/hpc/01_slurm_build_cyp450_cpu.sbatch",
         "examples/hpc/02_slurm_build_with_embeddings_gpu.sbatch",
         "examples/hpc/03_slurm_load_run_to_neo4j.sbatch",
+        "examples/hpc/04_slurm_run_eda.sbatch",
         "examples/python/run_build_from_python.py",
     ]
     for rel_path in expected_files:
@@ -70,7 +73,7 @@ def test_examples_exist_for_local_hpc_and_python_users():
 def test_example_scripts_reference_public_cli_and_known_commands():
     parser = cli.build_argparser()
     help_text = parser.format_help()
-    for command in ["build", "load-run", "schema", "demo"]:
+    for command in ["build", "load-run", "schema", "demo", "eda"]:
         assert command in help_text
 
     scripts = list((ROOT / "examples").glob("**/*.sh"))
@@ -83,6 +86,7 @@ def test_example_scripts_reference_public_cli_and_known_commands():
     assert "python -m pring" in combined or '"-m",' in combined
     assert "--load-neo4j false" in combined or '"--load-neo4j"' in combined
     assert "sbatch" in _read("examples/README.md")
+    assert "python -m pring eda" in combined
 
 
 def test_tests_readme_explains_default_coverage_live_and_neo4j_runs():

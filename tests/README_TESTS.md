@@ -131,3 +131,18 @@ When adding a new feature, add at least one offline unit/smoke test for:
 - documentation/example updates if the feature changes user-facing behavior.
 
 Live tests should be small and explicitly guarded by environment variables.
+
+## EDA pipeline tests
+
+The package-level EDA command is covered by `tests/test_eda_cli.py`. It builds a minimal synthetic PRING run folder and checks that:
+
+- `python -m pring eda` can be dispatched through the public CLI;
+- `eda_report.html`, `eda_report.md`, and `eda_summary.json` are created;
+- key tables such as graph counts and pair label counts are written;
+- at least one PNG figure is generated.
+
+For full-size real run folders, use:
+
+```bash
+python -m pring eda --run-path runs/YOUR_RUN_ID --output-dir runs/YOUR_RUN_ID/analysis/eda --top-n 30
+```

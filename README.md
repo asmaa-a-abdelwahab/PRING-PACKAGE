@@ -89,6 +89,14 @@ Optional transformer protein embeddings:
 python -m pip install -r requirements-optional-embeddings.txt
 ```
 
+Analysis/EDA reporting dependencies:
+
+```bash
+python -m pip install -e ".[analysis]"
+# or
+python -m pip install -r requirements-analysis.txt
+```
+
 Install PyTorch separately for your CPU/CUDA environment before running GPU embedding jobs. See `install_pytorch_cuda.md` and `examples/hpc/02_slurm_build_with_embeddings_gpu.sbatch`.
 
 ### 1.5 Check that the CLI works
@@ -301,9 +309,22 @@ For a new case study:
 
 ---
 
+## 4.5. Explore run data with EDA
+
+After a build or `load-run` rematerialization, generate a modeling-focused exploratory analysis report directly from the package:
+
+```bash
+python -m pring eda \
+  --run-path runs/cyp450_5enzymes_uncapped_gcn_ready \
+  --output-dir runs/cyp450_5enzymes_uncapped_gcn_ready/analysis/eda \
+  --top-n 30
+```
+
+The EDA command works with either a run directory or a ZIP archive and writes `eda_report.html`, `eda_report.md`, `eda_summary.json`, `tables/*.csv`, and `figures/*.png`. Install plotting dependencies with `python -m pip install -e ".[analysis]"` or `python -m pip install -r requirements-analysis.txt`.
+
 ## 5. CLI command reference
 
-PRING exposes four subcommands.
+PRING exposes five subcommands.
 
 ### 5.1 `build`
 
@@ -359,6 +380,17 @@ Create a tiny demonstration graph.
 python -m pring demo --load-neo4j false
 ```
 
+### 5.5 `eda`
+
+Explore an existing run directory or ZIP and generate EDA reports, tables, and figures without querying PubChem or Neo4j.
+
+```bash
+python -m pring eda \
+  --run-path runs/cyp450_intersection_gcn \
+  --output-dir runs/cyp450_intersection_gcn/analysis/eda \
+  --top-n 30
+```
+
 ---
 
 ## 6. Important options
@@ -368,6 +400,7 @@ The full CLI help is always available with:
 ```bash
 python -m pring build --help
 python -m pring load-run --help
+python -m pring eda --help
 ```
 
 ### 6.1 Inputs and schema

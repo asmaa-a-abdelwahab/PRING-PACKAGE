@@ -52,3 +52,22 @@ After extraction, use `load-run` to refresh derived artifacts and load Neo4j wit
 export PRING_RUN_DIR=/path/to/runs/<run_id>
 sbatch examples/hpc/03_slurm_load_run_to_neo4j.sbatch
 ```
+
+## 6. Explore run data with EDA
+
+After a run finishes, generate the EDA report on a CPU node without querying PubChem or Neo4j:
+
+```bash
+RUN_ID=<run_id> sbatch examples/hpc/04_slurm_run_eda.sbatch
+```
+
+or with an explicit path:
+
+```bash
+RUN_PATH=/path/to/runs/<run_id> \
+OUTPUT_DIR=/path/to/runs/<run_id>/analysis/eda \
+TOP_N=30 \
+sbatch examples/hpc/04_slurm_run_eda.sbatch
+```
+
+The job writes `eda_report.html`, `eda_report.md`, `eda_summary.json`, `tables/*.csv`, and `figures/*.png`.

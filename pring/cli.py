@@ -1107,6 +1107,19 @@ def build_argparser() -> argparse.ArgumentParser:
                           help="Repair historical similarity edges by fetching full Compound/Structure/Properties/Synonyms nodes for missing SIMILAR_TO target CIDs. Default: false.")
     load_run.add_argument("--allow-network", type=str, choices=["true", "false"], default="false",
                           help="Allow load-run repair steps to query PubChem. Default: false, so load-run remains offline/reproducible unless explicitly enabled.")
+
+    eda = sub.add_parser(
+        "eda",
+        help="Explore an existing PRING run directory or ZIP and generate EDA reports, tables, and figures.",
+        description="Create reproducible exploratory-analysis outputs from existing PRING run data without querying PubChem or Neo4j.",
+    )
+    eda.add_argument("--run-path", required=True, help="Path to a PRING run directory or a ZIP containing a PRING run.")
+    eda.add_argument(
+        "--output-dir",
+        default=None,
+        help="Output directory for eda_report.html, eda_report.md, eda_summary.json, tables/, and figures/. Default: <run>/analysis/eda for directories or analysis/<zip-stem> for ZIP files.",
+    )
+    eda.add_argument("--top-n", type=int, default=25, help="Number of top categories to display in selected plots and tables.")
     return ap
 
 
@@ -1123,6 +1136,13 @@ def _demo_rows() -> List[PubChemRow]:
 def main(argv: Optional[List[str]] = None) -> None:
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
     args = build_argparser().parse_args(argv)
+
+    if getattr(args, "cmd", None) == "eda":
+        from pring.analysis.run_eda import run_analysis
+
+        run_analysis(args)
+        return
+
     settings = Settings.from_env()
 
     profile = getattr(args, "resource_profile", None) or settings.resources.profile

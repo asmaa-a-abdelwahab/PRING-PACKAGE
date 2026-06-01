@@ -1,0 +1,9 @@
+# Dependencies required for `pring eda` reports and figures.
+# Install after installing PRING, for example:
+#   python -m pip install -e ".[analysis]"
+# or:
+#   python -m pip install -r requirements-analysis.txt
+
+pandas>=2.0
+numpy>=1.23
+matplotlib>=3.7

@@ -17,8 +17,9 @@ examples/
 1. Run the demo without Neo4j.
 2. Run a small target-centered CYP450 build without Neo4j.
 3. Run an intersection build for GCN/link-prediction outputs.
-4. Load an existing run into Neo4j.
-5. Move the same command to an HPC Slurm template.
+4. Explore an existing run with the built-in EDA command.
+5. Load an existing run into Neo4j.
+6. Move the same command to an HPC Slurm template.
 
 ## Local examples
 
@@ -28,6 +29,7 @@ examples/
 | `local/01_build_cyp450_targets_small.sh` / `.ps1` | Small target-centered run for five CYP450 enzymes. |
 | `local/02_build_intersection_gcn_ready.sh` / `.ps1` | Strict compound-target intersection with GCN-ready options. |
 | `local/03_load_existing_run_to_neo4j.sh` / `.ps1` | Load an existing run folder into Neo4j. |
+| `local/04_explore_run_data.sh` / `.ps1` | Generate EDA reports, tables, and figures from an existing run or ZIP. |
 
 ## HPC examples
 
@@ -36,6 +38,7 @@ examples/
 | `hpc/01_slurm_build_cyp450_cpu.sbatch` | CPU-only target-centered or intersection extraction. |
 | `hpc/02_slurm_build_with_embeddings_gpu.sbatch` | GPU job template for optional transformer protein embeddings. |
 | `hpc/03_slurm_load_run_to_neo4j.sbatch` | Load existing run data into Neo4j from a compute node. |
+| `hpc/04_slurm_run_eda.sbatch` | Generate EDA reports from an existing run or ZIP on a CPU node. |
 
 Before submitting Slurm jobs, edit these placeholders:
 
@@ -61,3 +64,4 @@ Before submitting Slurm jobs, edit these placeholders:
 - Local examples use small caps to avoid long runs.
 - HPC examples still use conservative caps by default; increase them only after a successful small run.
 - For final CYP450 modeling, avoid caps that remove relevant evidence or candidate pairs.
+- EDA examples call `python -m pring eda`, so they do not query PubChem or require Neo4j.
