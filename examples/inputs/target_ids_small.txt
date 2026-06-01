@@ -1,0 +1,3 @@
+# Small target file for smoke/intersection tests.
+P08684
+P05177

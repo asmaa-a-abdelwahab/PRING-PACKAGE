@@ -1,0 +1,9 @@
+# Optional dependencies for protein transformer embeddings.
+# Install PyTorch separately using the command recommended for your CPU/CUDA setup.
+# Example CUDA installation is documented in install_pytorch_cuda.md.
+
+transformers>=4.40
+sentencepiece>=0.1.99
+protobuf>=4.25
+accelerate>=0.29
+safetensors>=0.4

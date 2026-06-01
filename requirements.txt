@@ -1,20 +1,16 @@
-# PRING HPC GPU dependencies.
-# Install CUDA PyTorch separately before this file.
+# Core PRING runtime dependencies.
+# Recommended installation for development/users:
+#   python -m pip install -e .
+# or:
+#   python -m pip install -r requirements.txt
 
-transformers
-sentencepiece
-protobuf
-accelerate
-safetensors
-pandas
-matplotlib
-numpy
-rdkit
-neo4j
-requests
-tenacity
-pyyaml
-pydantic
-pydot
-httpx
-psutil
+neo4j>=5.0
+requests>=2.31
+tenacity>=8.2
+PyYAML>=6.0
+pydantic>=2.0
+pydot>=1.4
+httpx>=0.24
+psutil>=5.9
+pandas>=2.0
+numpy>=1.23

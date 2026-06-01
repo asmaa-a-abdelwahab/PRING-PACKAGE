@@ -1,0 +1,90 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pring"
+version = "0.1.0"
+description = "PubChem RDF Interaction Knowledge Graph Builder for Neo4j and GCN-ready compound-target modeling data."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "PRING contributors" }
+]
+keywords = [
+  "PubChem",
+  "Neo4j",
+  "knowledge-graph",
+  "CYP450",
+  "GCN",
+  "ADMET",
+  "chemical-biology"
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+  "neo4j>=5.0",
+  "requests>=2.31",
+  "tenacity>=8.2",
+  "PyYAML>=6.0",
+  "pydantic>=2.0",
+  "pydot>=1.4",
+  "httpx>=0.24",
+  "psutil>=5.9",
+  "pandas>=2.0",
+  "numpy>=1.23",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.4",
+  "pytest-cov>=4.1",
+]
+chem = [
+  "rdkit>=2023.9",
+]
+embeddings = [
+  "transformers>=4.40",
+  "sentencepiece>=0.1.99",
+  "protobuf>=4.25",
+  "accelerate>=0.29",
+  "safetensors>=0.4",
+]
+all = [
+  "pytest>=7.4",
+  "pytest-cov>=4.1",
+  "rdkit>=2023.9",
+  "transformers>=4.40",
+  "sentencepiece>=0.1.99",
+  "protobuf>=4.25",
+  "accelerate>=0.29",
+  "safetensors>=0.4",
+]
+
+
+[project.scripts]
+pring = "pring.cli:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pring*"]
+exclude = ["tests*", "examples*"]
+
+[tool.pytest.ini_options]
+markers = [
+  "live: requires external PubChem or other network services",
+  "neo4j: requires a running Neo4j instance",
+]
+filterwarnings = [
+  "ignore:.*setParseAction.*deprecated.*:pyparsing.exceptions.PyparsingDeprecationWarning",
+]

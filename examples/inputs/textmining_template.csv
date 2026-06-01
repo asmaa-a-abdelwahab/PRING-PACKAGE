@@ -1,0 +1,2 @@
+compound_id,target_id,compound_name,target_name,score,source,reference_id,snippet
+CID2244,P08684,aspirin,CYP3A4,0.75,local_example,PMID:00000000,"Example co-occurrence snippet. Replace with real evidence."

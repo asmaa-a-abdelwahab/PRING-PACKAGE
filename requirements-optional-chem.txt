@@ -1,0 +1,2 @@
+# Optional chemistry dependencies for molecular representations/features.
+rdkit>=2023.9

@@ -1,0 +1,11 @@
+# Five main human CYP450 enzymes for the case study.
+# P08684 = CYP3A4
+# P05177 = CYP1A2
+# P33261 = CYP2C19
+# P11712 = CYP2C9
+# P10635 = CYP2D6
+P08684
+P05177
+P33261
+P11712
+P10635

@@ -1,0 +1,4 @@
+# Small PubChem CID file for smoke/intersection tests.
+2244
+2519
+3672
