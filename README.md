@@ -320,7 +320,7 @@ python -m pring eda \
   --top-n 30
 ```
 
-The EDA command works with either a run directory or a ZIP archive and writes `eda_report.html`, `eda_report.md`, `eda_summary.json`, `tables/*.csv`, and `figures/*.png`. Install plotting dependencies with `python -m pip install -e ".[analysis]"` or `python -m pip install -r requirements-analysis.txt`.
+The EDA command works with either a run directory or a ZIP archive and writes `eda_report.html`, `eda_report.md`, `eda_summary.json`, `tables/*.csv`, and `figures/*.png`. It also writes `modeling_decision_report.md` and `modeling_decision_summary.json`, which interpret the run as a modeling dataset and flag issues such as positive/negative imbalance, unknown-pair dominance, identifier leakage, endpoint-quality problems, split leakage, and non-informative features. Install plotting dependencies with `python -m pip install -e ".[analysis]"` or `python -m pip install -r requirements-analysis.txt`.
 
 ## 5. CLI command reference
 
@@ -382,7 +382,7 @@ python -m pring demo --load-neo4j false
 
 ### 5.5 `eda`
 
-Explore an existing run directory or ZIP and generate EDA reports, tables, and figures without querying PubChem or Neo4j.
+Explore an existing run directory or ZIP and generate EDA reports, modeling-decision tables, figures, and a standalone modeling decision report without querying PubChem or Neo4j.
 
 ```bash
 python -m pring eda \

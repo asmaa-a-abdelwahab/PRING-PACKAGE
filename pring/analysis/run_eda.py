@@ -1612,7 +1612,10 @@ def analyze_endpoint_modeling_figures(ctx: RunContext, top_n: int) -> Dict[str, 
     value_cols = [c for c in ["negative_log10_molar", "value_molar", "value_float", "value"] if c in endpoints.columns]
 
     if type_col and label_col:
-        counts = endpoints.groupby([type_col, label_col]).size().reset_index(name="count")
+        work = endpoints[[type_col, label_col]].copy()
+        work[type_col] = work[type_col].fillna("<missing>").astype(str).replace({"": "<missing>"})
+        work[label_col] = work[label_col].fillna("<missing>").astype(str).replace({"": "<missing>"})
+        counts = work.groupby([type_col, label_col], dropna=False).size().reset_index(name="count")
         _write_df(ctx.tables_dir / "endpoint_type_by_label_counts.csv", counts)
         pivot = counts.pivot_table(index=type_col, columns=label_col, values="count", fill_value=0, aggfunc="sum")
         fig = _plot_heatmap_like(pivot, "Endpoint type × activity label", ctx.figures_dir / "endpoint_type_label_matrix.png")
@@ -1726,6 +1729,639 @@ def analyze_modeling_recommendations(ctx: RunContext) -> Dict[str, Any]:
     return {"checks": checks, "figures": [fig] if fig else [], "tables": ["tables/modeling_preparation_checklist.csv"]}
 
 
+# -----------------------------------------------------------------------------
+# Modeling decision support
+# -----------------------------------------------------------------------------
+
+
+_IDENTIFIER_RE = re.compile(
+    r"(^|_)(node_?id|node_?ref|cid|sid|aid|mg_?id|endpoint_?id|protein_?id|"
+    r"uniprot(_?acc)?|accession|inchi_?key|inchikey|source_?id|pubchem_?cid|"
+    r"pubchem_?sid|canonical_?smiles|isomeric_?smiles|smiles|synonym|name)(_|$)",
+    re.IGNORECASE,
+)
+_HIGH_CARDINALITY_HINT_RE = re.compile(r"(^|_)(id|ref|key|acc|cid|sid|aid)(_|$)", re.IGNORECASE)
+
+
+def _normalize_pair_label(value: Any) -> str:
+    """Map heterogeneous pair labels to positive/negative/unknown strings."""
+
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return "unknown"
+    text = str(value).strip().lower()
+    if text in {"1", "1.0", "positive", "pos", "active", "true", "yes"}:
+        return "positive"
+    if text in {"0", "0.0", "negative", "neg", "inactive", "false", "no"}:
+        return "negative"
+    if text in {"unknown", "unk", "nan", "na", "none", "", "missing", "unlabeled"}:
+        return "unknown"
+    if "unknown" in text or "unlabel" in text:
+        return "unknown"
+    return text
+
+
+def _risk_from_ratio(value: float, *, warning: float, high: float) -> str:
+    """Return pass/review/high-risk from a numeric ratio."""
+
+    if not np.isfinite(value):
+        return "review"
+    if value >= high:
+        return "high-risk"
+    if value >= warning:
+        return "review"
+    return "pass"
+
+
+def _find_compound_ref_column(df: pd.DataFrame) -> Optional[str]:
+    """Return the most likely compound reference column."""
+
+    return _pick_column(df, ["compound_node_ref", "compound_ref", "source_node_ref", "node_ref", "compound_id", "cid"])
+
+
+def _find_target_ref_column(df: pd.DataFrame) -> Optional[str]:
+    """Return the most likely protein/target reference column."""
+
+    return _pick_column(df, ["protein_node_ref", "target_node_ref", "protein_ref", "target_uniprot_acc", "protein_id", "uniprot_acc"])
+
+
+def _is_identifier_like_feature(name: str) -> bool:
+    """Return True if a feature name is likely to leak identifiers or metadata."""
+
+    n = str(name).strip().lower()
+    if n in {"node_id", "node_ref", "id", "cid", "sid", "aid", "protein_id", "endpoint_id"}:
+        return True
+    if _IDENTIFIER_RE.search(n):
+        # Avoid treating useful physicochemical descriptors as identifiers.
+        safe_substrings = {"xlogp", "hbond", "rotatable", "heavy_atom", "atom_count", "hetero_atom", "molecular_weight", "exact_mass", "tpsa"}
+        if any(safe in n for safe in safe_substrings):
+            return False
+        return True
+    return False
+
+
+def _feature_recommendation_for_column(
+    *,
+    column: str,
+    missing_percent: float,
+    zero_percent: Optional[float],
+    unique_ratio: Optional[float],
+    is_numeric: bool,
+) -> tuple[str, str]:
+    """Classify a feature for modeling use."""
+
+    reasons: List[str] = []
+    if _is_identifier_like_feature(column):
+        reasons.append("identifier_or_metadata_name")
+        return "drop_identifier_or_keep_metadata_only", ";".join(reasons)
+    if unique_ratio is not None and unique_ratio > 0.98 and _HIGH_CARDINALITY_HINT_RE.search(column):
+        reasons.append("near_unique_identifier_like_numeric_column")
+        return "drop_identifier", ";".join(reasons)
+    if missing_percent >= 95:
+        reasons.append("very_high_missingness")
+        return "drop_high_missingness", ";".join(reasons)
+    if zero_percent is not None and zero_percent >= 99.9:
+        reasons.append("almost_all_zero")
+        return "drop_noninformative_or_review", ";".join(reasons)
+    if not is_numeric:
+        reasons.append("non_numeric_metadata")
+        return "keep_metadata_only", ";".join(reasons)
+    if missing_percent >= 50:
+        reasons.append("high_missingness")
+        return "review_imputation_or_subset", ";".join(reasons)
+    return "keep", "usable_numeric_feature"
+
+
+def analyze_target_modeling_readiness(ctx: RunContext) -> Dict[str, Any]:
+    """Create one-row-per-target modeling readiness diagnostics."""
+
+    pairs = _load_pair_table(ctx)
+    if pairs.empty:
+        return {"available": False, "reason": "No pair table found."}
+
+    target_col = _find_target_ref_column(pairs)
+    compound_col = _find_compound_ref_column(pairs)
+    label_col = "label" if "label" in pairs.columns else None
+    split_col = "split" if "split" in pairs.columns else None
+    if target_col is None or label_col is None:
+        return {"available": False, "reason": "Pair table lacks target or label columns."}
+
+    work = pairs[[c for c in [target_col, compound_col, label_col, split_col] if c]].copy()
+    work["label_class"] = work[label_col].map(_normalize_pair_label)
+
+    descriptor_coverage: Optional[pd.Series] = None
+    if compound_col:
+        compound_features = _read_csv(ctx.graph_dir / "ml" / "node_features_compound.csv")
+        ref_col = _pick_column(compound_features, ["node_ref", "compound_node_ref", "compound_ref", "cid"])
+        if not compound_features.empty and ref_col:
+            descriptor_cols = [
+                c for c in compound_features.columns
+                if c != ref_col and not _is_identifier_like_feature(c)
+                and ("molgraph" in c.lower() or "fingerprint" in c.lower() or re.search(r"fp_\d+$", c))
+            ]
+            if descriptor_cols:
+                has_descriptor = compound_features[descriptor_cols].notna().any(axis=1)
+                descriptor_map = pd.Series(has_descriptor.values, index=compound_features[ref_col].astype(str))
+                descriptor_coverage = work[compound_col].astype(str).map(descriptor_map).fillna(False)
+                work["has_compound_descriptor"] = descriptor_coverage.astype(bool)
+
+    records: List[Dict[str, Any]] = []
+    grouped = work.groupby(target_col, dropna=False)
+    for target, group in grouped:
+        label_counts = group["label_class"].value_counts(dropna=False).to_dict()
+        positive = int(label_counts.get("positive", 0))
+        negative = int(label_counts.get("negative", 0))
+        unknown = int(label_counts.get("unknown", 0))
+        labeled = positive + negative
+        total = int(len(group))
+        pos_neg_ratio = float(positive / negative) if negative else math.inf if positive else 0.0
+        unknown_percent = float(unknown / max(total, 1) * 100)
+        labeled_percent = float(labeled / max(total, 1) * 100)
+        risk = "pass"
+        recommendation = "Target is usable for modeling diagnostics."
+        if negative < 50 or positive < 100:
+            risk = "high-risk"
+            recommendation = "Too few curated labels for reliable per-target evaluation; use only with pooled training or collect more evidence."
+        elif unknown_percent > 90 or pos_neg_ratio > 10 or pos_neg_ratio < 0.1:
+            risk = "review"
+            recommendation = "Use PU/ranking formulation, class weighting, and per-target PR-AUC/top-k metrics."
+
+        rec: Dict[str, Any] = {
+            "target": str(target),
+            "total_pairs": total,
+            "positive_pairs": positive,
+            "negative_pairs": negative,
+            "unknown_pairs": unknown,
+            "labeled_pairs": labeled,
+            "positive_negative_ratio": round(pos_neg_ratio, 4) if np.isfinite(pos_neg_ratio) else "inf",
+            "labeled_percent": round(labeled_percent, 4),
+            "unknown_percent": round(unknown_percent, 4),
+            "risk_level": risk,
+            "recommendation": recommendation,
+        }
+        if "has_compound_descriptor" in group.columns:
+            rec["descriptor_coverage_percent"] = round(float(group["has_compound_descriptor"].mean() * 100), 4)
+        if split_col:
+            for split, split_group in group.groupby(split_col, dropna=False):
+                split_key = _safe_name(str(split)).lower()
+                split_counts = split_group["label_class"].value_counts(dropna=False).to_dict()
+                for lab in ["positive", "negative", "unknown"]:
+                    rec[f"{split_key}_{lab}"] = int(split_counts.get(lab, 0))
+        records.append(rec)
+
+    readiness = pd.DataFrame(records).sort_values(["risk_level", "target"])
+    _write_df(ctx.tables_dir / "target_modeling_readiness.csv", readiness)
+    fig = None
+    if not readiness.empty:
+        plot_df = readiness[["target", "positive_pairs", "negative_pairs"]].set_index("target")
+        fig = _plot_stacked_bar(plot_df, "Labeled pair counts per target", ctx.figures_dir / "target_labeled_pair_counts.png", xlabel="target", rotate=30)
+    return {
+        "available": True,
+        "targets": int(len(readiness)),
+        "high_risk_targets": int((readiness.get("risk_level") == "high-risk").sum()) if "risk_level" in readiness else 0,
+        "review_targets": int((readiness.get("risk_level") == "review").sum()) if "risk_level" in readiness else 0,
+        "tables": ["tables/target_modeling_readiness.csv"],
+        "figures": [fig] if fig else [],
+        "records": readiness.to_dict("records"),
+    }
+
+
+def analyze_feature_leakage_audit(ctx: RunContext) -> Dict[str, Any]:
+    """Flag identifier-like and high-risk feature columns before modeling."""
+
+    ml = ctx.graph_dir / "ml"
+    files = sorted(ml.glob("node_features_*.csv"))
+    records: List[Dict[str, Any]] = []
+    for path in files:
+        df = _read_csv(path)
+        if df.empty:
+            continue
+        for col in df.columns:
+            if not _is_identifier_like_feature(col):
+                continue
+            s = df[col]
+            numeric = pd.to_numeric(s, errors="coerce")
+            records.append({
+                "file": path.name,
+                "feature": col,
+                "risk_level": "high-risk",
+                "reason": "identifier_like_feature_name",
+                "non_missing_percent": round(float(s.notna().mean() * 100), 4),
+                "unique_ratio": round(float(s.nunique(dropna=True) / max(s.notna().sum(), 1)), 6),
+                "is_numeric": bool(numeric.notna().any()),
+                "recommended_action": "drop_from_model_input_keep_as_metadata_only",
+            })
+
+        numeric_cols = _numeric_columns(df, exclude=[])
+        # Catch numeric near-unique identifier-like fields that did not match the strict name regex.
+        for col in numeric_cols:
+            if _is_identifier_like_feature(col):
+                continue
+            if not _HIGH_CARDINALITY_HINT_RE.search(col):
+                continue
+            s = df[col]
+            non_missing = int(s.notna().sum())
+            unique_ratio = float(s.nunique(dropna=True) / max(non_missing, 1))
+            if non_missing >= 10 and unique_ratio > 0.98:
+                records.append({
+                    "file": path.name,
+                    "feature": col,
+                    "risk_level": "review",
+                    "reason": "near_unique_identifier_like_numeric_column",
+                    "non_missing_percent": round(float(s.notna().mean() * 100), 4),
+                    "unique_ratio": round(unique_ratio, 6),
+                    "is_numeric": True,
+                    "recommended_action": "review_and_usually_drop_from_model_input",
+                })
+
+    audit = pd.DataFrame(records)
+    if audit.empty:
+        audit = pd.DataFrame(columns=["file", "feature", "risk_level", "reason", "non_missing_percent", "unique_ratio", "is_numeric", "recommended_action"])
+    _write_df(ctx.tables_dir / "feature_leakage_audit.csv", audit)
+    return {
+        "available": True,
+        "flagged_features": int(len(audit)),
+        "high_risk_features": int((audit["risk_level"] == "high-risk").sum()) if not audit.empty else 0,
+        "tables": ["tables/feature_leakage_audit.csv"],
+        "records": audit.head(50).to_dict("records"),
+    }
+
+
+def analyze_model_feature_recommendations(ctx: RunContext) -> Dict[str, Any]:
+    """Classify feature columns as keep/drop/review for downstream models."""
+
+    ml = ctx.graph_dir / "ml"
+    files = sorted(ml.glob("node_features_*.csv"))
+    records: List[Dict[str, Any]] = []
+    for path in files:
+        df = _read_csv(path)
+        if df.empty:
+            continue
+        numeric_cols = set(_numeric_columns(df, exclude=[]))
+        for col in df.columns:
+            s = df[col]
+            is_numeric = col in numeric_cols
+            missing_percent = float(s.isna().mean() * 100)
+            zero_percent: Optional[float] = None
+            if is_numeric:
+                numeric = pd.to_numeric(s, errors="coerce")
+                zero_percent = float((numeric.fillna(0) == 0).mean() * 100)
+            unique_ratio: Optional[float] = None
+            non_missing = int(s.notna().sum())
+            if non_missing:
+                unique_ratio = float(s.nunique(dropna=True) / non_missing)
+            action, reason = _feature_recommendation_for_column(
+                column=col,
+                missing_percent=missing_percent,
+                zero_percent=zero_percent,
+                unique_ratio=unique_ratio,
+                is_numeric=is_numeric,
+            )
+            records.append({
+                "file": path.name,
+                "feature": col,
+                "recommendation": action,
+                "reason": reason,
+                "is_numeric": is_numeric,
+                "missing_percent": round(missing_percent, 4),
+                "zero_percent": round(zero_percent, 4) if zero_percent is not None else math.nan,
+                "unique_ratio": round(unique_ratio, 6) if unique_ratio is not None else math.nan,
+            })
+
+    recs = pd.DataFrame(records)
+    _write_df(ctx.tables_dir / "model_feature_recommendations.csv", recs)
+    if not recs.empty:
+        counts = _series_value_counts(recs, "recommendation")
+        _write_df(ctx.tables_dir / "model_feature_recommendation_counts.csv", counts)
+        fig = _plot_bar(counts, "recommendation", "count", "Feature recommendations", ctx.figures_dir / "model_feature_recommendations.png", rotate=45)
+    else:
+        fig = None
+    return {
+        "available": bool(records),
+        "feature_count": int(len(recs)),
+        "drop_or_review_count": int(recs["recommendation"].astype(str).str.contains("drop|review", regex=True).sum()) if not recs.empty else 0,
+        "tables": ["tables/model_feature_recommendations.csv", "tables/model_feature_recommendation_counts.csv"],
+        "figures": [fig] if fig else [],
+    }
+
+
+def analyze_endpoint_quality_audit(ctx: RunContext) -> Dict[str, Any]:
+    """Audit endpoint labels, units, and numeric plausibility for modeling."""
+
+    endpoint_path = _first_existing(ctx.graph_dir, ["ml/node_features_endpoint.csv", "rows_csv/endpoint.csv", "nodes_csv/Endpoint.csv"])
+    endpoints = _load_csv_or_empty(endpoint_path)
+    if endpoints.empty:
+        return {"available": False, "reason": "No endpoint table found."}
+
+    type_col = _pick_column(endpoints, ["endpoint_type", "props_endpoint_type", "endpoint_term", "type"])
+    label_col = _pick_column(endpoints, ["supervision_label_name", "supervision_label", "outcome_label_normalized", "outcome_label", "outcome"])
+    unit_col = _pick_column(endpoints, ["unit_symbol", "unit_raw", "unit", "props_unit_symbol", "props_unit"])
+    molar_col = _pick_column(endpoints, ["value_molar", "props_value_molar"])
+    value_col = _pick_column(endpoints, ["value_float", "value", "props_value_float", "props_value"])
+    neglog_col = _pick_column(endpoints, ["negative_log10_molar", "props_negative_log10_molar"])
+
+    n = len(endpoints)
+    records: List[Dict[str, Any]] = []
+
+    def add(issue: str, severity: str, count: int, recommendation: str) -> None:
+        records.append({
+            "issue": issue,
+            "severity": severity,
+            "count": int(count),
+            "percent": round(float(count / max(n, 1) * 100), 4),
+            "recommendation": recommendation,
+        })
+
+    if type_col:
+        add("missing_endpoint_type", "review", int(endpoints[type_col].isna().sum() + (endpoints[type_col].astype(str).str.strip() == "").sum()), "Keep missing as an explicit category in EDA; review endpoint extraction/normalization before endpoint-type-specific modeling.")
+    if label_col:
+        labels = endpoints[label_col].fillna("<missing>").astype(str).str.lower()
+        add("missing_activity_label", "high-risk", int((labels == "<missing>").sum()), "Rows without supervision labels should not define positive/negative training labels.")
+        add("ambiguous_or_weak_activity_label", "review", int(labels.str.contains("ambiguous|weak|inconclusive|uncertain", regex=True).sum()), "Use ambiguous/weak labels only with explicit policy; do not mix with strong negatives silently.")
+    if unit_col:
+        add("missing_unit", "review", int(endpoints[unit_col].isna().sum() + (endpoints[unit_col].astype(str).str.strip() == "").sum()), "Review unit normalization before potency regression or threshold-based labels.")
+    if molar_col:
+        molar = pd.to_numeric(endpoints[molar_col], errors="coerce")
+        add("missing_or_non_numeric_molar_value", "review", int(molar.isna().sum()), "Non-numeric molar values cannot be used for potency features without imputation/exclusion.")
+        add("non_positive_molar_value", "high-risk", int((molar <= 0).sum()), "Drop or correct non-positive molar values before log transformation.")
+        add("implausibly_high_molar_value_gt_1M", "high-risk", int((molar > 1).sum()), "Inspect units/source values; values >1 M are usually not suitable as direct potency evidence.")
+    if neglog_col:
+        neglog = pd.to_numeric(endpoints[neglog_col], errors="coerce")
+        add("negative_log10_molar_lt_0", "review", int((neglog < 0).sum()), "Inspect very weak/non-standard values; avoid using as high-confidence potency evidence.")
+        add("negative_log10_molar_gt_12", "review", int((neglog > 12).sum()), "Inspect extreme potency values for unit-conversion or parsing errors.")
+    if value_col:
+        raw_value = pd.to_numeric(endpoints[value_col], errors="coerce")
+        add("raw_value_gt_1e9", "review", int((raw_value > 1e9).sum()), "Large raw values may indicate mixed units; rely on normalized molar values when possible.")
+
+    audit = pd.DataFrame(records)
+    _write_df(ctx.tables_dir / "endpoint_quality_audit.csv", audit)
+    fig = None
+    if not audit.empty:
+        fig = _plot_bar(audit, "issue", "count", "Endpoint quality audit", ctx.figures_dir / "endpoint_quality_audit.png", rotate=75)
+    return {
+        "available": True,
+        "issues": int(len(audit)),
+        "high_risk_issues": int((audit["severity"] == "high-risk").sum()) if not audit.empty else 0,
+        "tables": ["tables/endpoint_quality_audit.csv"],
+        "figures": [fig] if fig else [],
+        "records": audit.to_dict("records"),
+    }
+
+
+def analyze_split_leakage_audit(ctx: RunContext) -> Dict[str, Any]:
+    """Audit split balance and obvious compound/split overlap risks."""
+
+    pairs = _load_pair_table(ctx)
+    ml = ctx.graph_dir / "ml"
+    if pairs.empty:
+        return {"available": False, "reason": "No pair table found."}
+    split_col = "split" if "split" in pairs.columns else None
+    label_col = "label" if "label" in pairs.columns else None
+    compound_col = _find_compound_ref_column(pairs)
+    if not split_col:
+        return {"available": False, "reason": "Pair table lacks split column."}
+
+    work = pairs[[c for c in [split_col, label_col, compound_col] if c]].copy()
+    if label_col:
+        work["label_class"] = work[label_col].map(_normalize_pair_label)
+
+    records: List[Dict[str, Any]] = []
+    if label_col:
+        balance = work.groupby([split_col, "label_class"], dropna=False).size().reset_index(name="count")
+        _write_df(ctx.tables_dir / "split_label_balance_diagnostic.csv", balance)
+        totals = work.groupby(split_col, dropna=False).size().to_dict()
+        for split, group in work.groupby(split_col, dropna=False):
+            counts = group["label_class"].value_counts().to_dict()
+            pos = int(counts.get("positive", 0))
+            neg = int(counts.get("negative", 0))
+            unk = int(counts.get("unknown", 0))
+            ratio = float(pos / neg) if neg else math.inf if pos else 0.0
+            records.append({
+                "check": f"label_balance_{split}",
+                "status": _risk_from_ratio(ratio, warning=5, high=15),
+                "detail": f"positive={pos}; negative={neg}; unknown={unk}; positive_negative_ratio={ratio if np.isfinite(ratio) else 'inf'}; total={totals.get(split)}",
+                "recommendation": "Use PR-AUC/top-k metrics and avoid threshold tuning on unbalanced validation data." if ratio > 5 or unk > (pos + neg) else "Split label balance is acceptable for diagnostics.",
+            })
+
+    if compound_col:
+        split_sets = {str(split): set(group[compound_col].astype(str).dropna()) for split, group in work.groupby(split_col, dropna=False)}
+        names = sorted(split_sets)
+        for i, a in enumerate(names):
+            for b in names[i + 1:]:
+                overlap = len(split_sets[a] & split_sets[b])
+                records.append({
+                    "check": f"compound_overlap_{a}_vs_{b}",
+                    "status": "high-risk" if overlap else "pass",
+                    "detail": f"overlap_compounds={overlap}",
+                    "recommendation": "Use compound/component holdout; overlapping compounds can inflate validation/test performance." if overlap else "No direct compound overlap detected.",
+                })
+
+    edge_index = _read_csv(ml / "edge_index.csv")
+    train_edges = _read_csv(ml / "edge_index_train_only.csv")
+    holdout_edges = _read_csv(ml / "edge_index_holdout_removed_edges.csv")
+    records.append({
+        "check": "train_only_edge_index_available",
+        "status": "pass" if not train_edges.empty and len(train_edges) <= max(len(edge_index), 1) else "review",
+        "detail": f"full_edges={len(edge_index)}; train_only_edges={len(train_edges)}; holdout_removed_edges={len(holdout_edges)}",
+        "recommendation": "Use edge_index_train_only.csv for validation/test message passing; do not evaluate held-out pairs on full edge_index.csv.",
+    })
+
+    audit = pd.DataFrame(records)
+    _write_df(ctx.tables_dir / "split_leakage_audit.csv", audit)
+    status_counts = _series_value_counts(audit, "status") if not audit.empty else pd.DataFrame()
+    fig = _plot_bar(status_counts, "status", "count", "Split/leakage audit status", ctx.figures_dir / "split_leakage_audit_status.png", rotate=0) if not status_counts.empty else None
+    return {
+        "available": True,
+        "checks": int(len(audit)),
+        "high_risk_checks": int((audit["status"] == "high-risk").sum()) if not audit.empty else 0,
+        "tables": ["tables/split_leakage_audit.csv", "tables/split_label_balance_diagnostic.csv"],
+        "figures": [fig] if fig else [],
+        "records": audit.to_dict("records"),
+    }
+
+
+def analyze_candidate_ranking_space(ctx: RunContext) -> Dict[str, Any]:
+    """Summarize candidate-ranking space implied by unknown compound-target pairs."""
+
+    pairs = _load_pair_table(ctx)
+    if pairs.empty:
+        return {"available": False, "reason": "No pair table found."}
+    target_col = _find_target_ref_column(pairs)
+    compound_col = _find_compound_ref_column(pairs)
+    label_col = "label" if "label" in pairs.columns else None
+    if not target_col or not label_col:
+        return {"available": False, "reason": "Pair table lacks target or label columns."}
+
+    work = pairs[[c for c in [target_col, compound_col, label_col] if c]].copy()
+    work["label_class"] = work[label_col].map(_normalize_pair_label)
+    records: List[Dict[str, Any]] = []
+    for target, group in work.groupby(target_col, dropna=False):
+        counts = group["label_class"].value_counts().to_dict()
+        positive = int(counts.get("positive", 0))
+        negative = int(counts.get("negative", 0))
+        unknown = int(counts.get("unknown", 0))
+        total = len(group)
+        unknown_percent = float(unknown / max(total, 1) * 100)
+        if unknown_percent >= 50 and positive > 0:
+            recommended_task = "positive_unlabeled_candidate_ranking"
+        elif positive > 0 and negative > 0:
+            recommended_task = "supervised_binary_classification_with_imbalance_controls"
+        else:
+            recommended_task = "insufficient_labels_for_supervised_training"
+        records.append({
+            "target": str(target),
+            "candidate_pairs_total": int(total),
+            "known_positive_pairs": positive,
+            "curated_negative_pairs": negative,
+            "unknown_candidate_pairs": unknown,
+            "unknown_percent": round(unknown_percent, 4),
+            "recommended_task": recommended_task,
+            "ranking_decision": "Rank unknown pairs; do not treat them as true negatives." if unknown_percent >= 50 else "Binary modeling is possible, but still report top-k ranking metrics.",
+        })
+    ranking = pd.DataFrame(records)
+    _write_df(ctx.tables_dir / "candidate_ranking_analysis.csv", ranking)
+    fig = None
+    if not ranking.empty:
+        plot_df = ranking[["target", "known_positive_pairs", "curated_negative_pairs", "unknown_candidate_pairs"]].set_index("target")
+        fig = _plot_stacked_bar(plot_df, "Candidate ranking space per target", ctx.figures_dir / "candidate_ranking_space.png", xlabel="target", rotate=30)
+    return {
+        "available": True,
+        "targets": int(len(ranking)),
+        "tables": ["tables/candidate_ranking_analysis.csv"],
+        "figures": [fig] if fig else [],
+        "records": ranking.to_dict("records"),
+    }
+
+
+def build_modeling_decision_summary(ctx: RunContext, sections: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert EDA diagnostics into a high-level modeling decision summary."""
+
+    pairs_section = sections.get("pairs", {}) or {}
+    label_counts = {str(r.get("label", r.get("label_class", ""))).lower(): r.get("count", 0) for r in pairs_section.get("label_counts", [])}
+    positive = int(label_counts.get("1", label_counts.get("positive", label_counts.get("active", 0))) or 0)
+    negative = int(label_counts.get("0", label_counts.get("negative", label_counts.get("inactive", 0))) or 0)
+    unknown = int(label_counts.get("unknown", label_counts.get("<missing>", 0)) or 0)
+    total = positive + negative + unknown
+    unknown_percent = float(unknown / max(total, 1) * 100)
+    pos_neg_ratio = float(positive / negative) if negative else math.inf if positive else 0.0
+
+    recommended_task = "positive-unlabeled candidate ranking / link prediction"
+    if unknown_percent < 50 and positive and negative:
+        recommended_task = "imbalanced supervised binary link prediction with ranking diagnostics"
+    elif positive == 0 or negative == 0:
+        recommended_task = "insufficient fully labeled data; use descriptive ranking or collect more labels"
+
+    risks: List[Dict[str, Any]] = []
+    def add_risk(name: str, severity: str, detail: str, action: str) -> None:
+        risks.append({"risk": name, "severity": severity, "detail": detail, "recommended_action": action})
+
+    if unknown_percent >= 50:
+        add_risk("unknown_pairs_dominate", "high-risk" if unknown_percent >= 90 else "review", f"unknown_percent={unknown_percent:.2f}", "Do not treat unknown pairs as negatives; use PU learning/ranking and top-k evaluation.")
+    if positive and negative and (pos_neg_ratio > 5 or pos_neg_ratio < 0.2):
+        add_risk("positive_negative_imbalance", "review", f"positive_negative_ratio={pos_neg_ratio if np.isfinite(pos_neg_ratio) else 'inf'}", "Use class weighting, balanced mini-batches, focal loss, and per-target PR-AUC.")
+
+    leakage = sections.get("feature_leakage_audit", {}) or {}
+    if leakage.get("flagged_features", 0):
+        add_risk("identifier_feature_leakage", "high-risk", f"flagged_features={leakage.get('flagged_features')}", "Drop identifier-like columns from tensors and keep them only as metadata for joins/traceability.")
+
+    endpoint_quality = sections.get("endpoint_quality_audit", {}) or {}
+    if endpoint_quality.get("high_risk_issues", 0):
+        add_risk("endpoint_value_or_label_quality", "high-risk", f"high_risk_issues={endpoint_quality.get('high_risk_issues')}", "Audit units, implausible molar values, missing labels, and weak/ambiguous activity before potency-based labels.")
+
+    split_audit = sections.get("split_leakage_audit", {}) or {}
+    if split_audit.get("high_risk_checks", 0):
+        add_risk("split_or_compound_leakage", "high-risk", f"high_risk_checks={split_audit.get('high_risk_checks')}", "Use compound/component holdout and train-only edge_index for validation/test.")
+
+    target_readiness = sections.get("target_modeling_readiness", {}) or {}
+    if target_readiness.get("high_risk_targets", 0) or target_readiness.get("review_targets", 0):
+        add_risk("target_specific_label_limitations", "review", f"high_risk_targets={target_readiness.get('high_risk_targets', 0)}; review_targets={target_readiness.get('review_targets', 0)}", "Report metrics per CYP450 target and avoid relying only on global metrics.")
+
+    summary = {
+        "recommended_task": recommended_task,
+        "recommended_first_models": [
+            "Leakage-clean tabular baseline using compound descriptors/fingerprints + target identity",
+            "Positive-unlabeled or ranking baseline for unknown candidate pairs",
+            "Heterogeneous GraphSAGE/HGT after train-only graph leakage checks",
+        ],
+        "primary_metrics": ["PR-AUC", "ROC-AUC", "per-target PR-AUC", "top-k recall", "enrichment factor", "calibration curves"],
+        "do_not_use": [
+            "Unknown pairs as true negatives",
+            "CID/node_id/accession/name/SMILES columns as numeric model features",
+            "Full edge_index.csv for held-out validation/test message passing",
+            "Accuracy as the main metric under severe imbalance",
+        ],
+        "label_summary": {
+            "positive_pairs": positive,
+            "negative_pairs": negative,
+            "unknown_pairs": unknown,
+            "unknown_percent": round(unknown_percent, 4),
+            "positive_negative_ratio": round(pos_neg_ratio, 4) if np.isfinite(pos_neg_ratio) else "inf",
+        },
+        "risks": risks,
+        "output_tables": [
+            "tables/target_modeling_readiness.csv",
+            "tables/feature_leakage_audit.csv",
+            "tables/model_feature_recommendations.csv",
+            "tables/endpoint_quality_audit.csv",
+            "tables/split_leakage_audit.csv",
+            "tables/candidate_ranking_analysis.csv",
+        ],
+    }
+    _write_json(ctx.output_dir / "modeling_decision_summary.json", summary)
+    return summary
+
+
+def build_modeling_decision_report(ctx: RunContext, sections: Dict[str, Any]) -> str:
+    """Build a standalone modeling decision markdown report."""
+
+    summary = build_modeling_decision_summary(ctx, sections)
+    lines = [
+        "# PRING Modeling Decision Report",
+        "",
+        f"**Input:** `{ctx.input_path}`",
+        f"**Resolved run root:** `{ctx.run_root}`",
+        "",
+        "## Recommended modeling formulation",
+        "",
+        f"**{summary['recommended_task']}**",
+        "",
+        "This recommendation is derived from pair-label balance, unknown candidate-pair coverage, feature-leakage risk, endpoint evidence quality, and split/leakage diagnostics.",
+        "",
+        "## Label summary",
+        "",
+        f"- Positive pairs: **{summary['label_summary']['positive_pairs']}**",
+        f"- Curated negative pairs: **{summary['label_summary']['negative_pairs']}**",
+        f"- Unknown candidate pairs: **{summary['label_summary']['unknown_pairs']}**",
+        f"- Unknown percentage: **{summary['label_summary']['unknown_percent']}%**",
+        f"- Positive:negative ratio: **{summary['label_summary']['positive_negative_ratio']}**",
+        "",
+        "## Recommended first models",
+        "",
+    ]
+    lines += [f"- {model}" for model in summary["recommended_first_models"]]
+    lines += ["", "## Primary metrics", ""]
+    lines += [f"- {metric}" for metric in summary["primary_metrics"]]
+    lines += ["", "## Do not use", ""]
+    lines += [f"- {item}" for item in summary["do_not_use"]]
+    lines += ["", "## Main risks and decisions", ""]
+    if summary["risks"]:
+        lines.append("| Risk | Severity | Detail | Recommended action |")
+        lines.append("| --- | --- | --- | --- |")
+        for risk in summary["risks"]:
+            lines.append(
+                "| "
+                + " | ".join(html.escape(str(risk.get(k, ""))) for k in ["risk", "severity", "detail", "recommended_action"])
+                + " |"
+            )
+    else:
+        lines.append("No high-risk issues were detected by the automated decision checks.")
+    lines += ["", "## Decision-support output tables", ""]
+    lines += [f"- `{table}`" for table in summary["output_tables"]]
+    lines.append("")
+    report = "\n".join(lines)
+    (ctx.output_dir / "modeling_decision_report.md").write_text(report, encoding="utf-8")
+    return report
+
+
 def build_markdown_report(ctx: RunContext, sections: Dict[str, Any]) -> str:
     """Build a readable markdown report from analysis outputs."""
 
@@ -1752,6 +2388,21 @@ def build_markdown_report(ctx: RunContext, sections: Dict[str, Any]) -> str:
         f"- SIMILAR_TO edges: **{sim.get('rows', 'NA')}**.",
         "",
     ]
+
+    decision = sections.get("modeling_decision", {}) or {}
+    if decision:
+        label_summary = decision.get("label_summary", {})
+        lines += [
+            "## Modeling decision summary",
+            "",
+            f"- Recommended formulation: **{decision.get('recommended_task', 'NA')}**.",
+            f"- Unknown candidate pairs: **{label_summary.get('unknown_pairs', 'NA')}** ({label_summary.get('unknown_percent', 'NA')}%).",
+            f"- Positive:negative ratio: **{label_summary.get('positive_negative_ratio', 'NA')}**.",
+            f"- Main risk count: **{len(decision.get('risks', []))}**.",
+            "- Full decision report: `modeling_decision_report.md`.",
+            "- Machine-readable decision summary: `modeling_decision_summary.json`.",
+            "",
+        ]
 
     blockers = ml.get("blockers") or []
     warnings = ml.get("warnings") or []
@@ -1793,7 +2444,7 @@ def build_markdown_report(ctx: RunContext, sections: Dict[str, Any]) -> str:
     lines += [
         "## Modeling-preparation outputs",
         "",
-        "The EDA now includes modeling-oriented QA for label balance, train/validation/test split balance, target coverage, pair evidence features, tensor sparsity, zero-variance columns, model edge sets, node degree distributions, compound descriptors, fingerprints, protein enrichment, endpoint supervision, and PyG export readiness.",
+        "The EDA now includes modeling-oriented QA for label balance, train/validation/test split balance, target coverage, pair evidence features, tensor sparsity, zero-variance columns, model edge sets, node degree distributions, compound descriptors, fingerprints, protein enrichment, endpoint supervision, PyG export readiness, identifier-leakage auditing, endpoint-quality auditing, split-leakage checks, candidate-ranking analysis, and a standalone modeling decision report.",
         "",
         "## Output tables",
         "",
@@ -1908,8 +2559,16 @@ def run_analysis(args: argparse.Namespace) -> Path:
     _run_section("similarity", lambda: analyze_similarity(ctx, top_n=args.top_n))
     _run_section("model_graph_topology", lambda: analyze_model_graph_topology(ctx, top_n=args.top_n))
     _run_section("external", lambda: analyze_external_evidence(ctx))
+    _run_section("target_modeling_readiness", lambda: analyze_target_modeling_readiness(ctx))
+    _run_section("feature_leakage_audit", lambda: analyze_feature_leakage_audit(ctx))
+    _run_section("model_feature_recommendations", lambda: analyze_model_feature_recommendations(ctx))
+    _run_section("endpoint_quality_audit", lambda: analyze_endpoint_quality_audit(ctx))
+    _run_section("split_leakage_audit", lambda: analyze_split_leakage_audit(ctx))
+    _run_section("candidate_ranking", lambda: analyze_candidate_ranking_space(ctx))
     _run_section("modeling_recommendations", lambda: analyze_modeling_recommendations(ctx))
 
+    decision_report = build_modeling_decision_report(ctx, sections)
+    sections["modeling_decision"] = _read_json(ctx.output_dir / "modeling_decision_summary.json", {}) or {}
     _write_json(ctx.output_dir / "eda_summary.json", sections)
 
     markdown = build_markdown_report(ctx, sections)
