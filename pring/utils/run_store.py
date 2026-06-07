@@ -1514,6 +1514,19 @@ class RunStore:
             ml_dir=self.ml_dir,
         )
 
+        modeling_stage_export_summary = _write_modeling_stage_exports(
+            self.ml_dir / "modeling",
+            ml_dir=self.ml_dir,
+            node_mapping_rows=node_mapping_rows,
+            relation_mapping_rows=relation_mapping_rows,
+            edge_rows=edge_rows,
+            train_edge_rows=edge_index_train_only_rows,
+            holdout_removed_edge_rows=edge_index_holdout_removed_rows,
+            training_pair_rows=training_pair_rows,
+            candidate_rows=candidate_rows,
+            link_prediction_pair_rows=link_prediction_pair_rows,
+        )
+
         ml_feature_export_summary = _build_ml_feature_export_summary(
             compound_feature_rows=compound_feature_rows,
             protein_feature_rows=protein_feature_rows,
@@ -1527,6 +1540,7 @@ class RunStore:
         ml_feature_export_summary["model_matrices"] = model_matrix_summary
         ml_feature_export_summary["strict_numeric_tensors"] = tensor_summary
         ml_feature_export_summary["pyg_export"] = pyg_export_summary
+        ml_feature_export_summary["modeling_stage_exports"] = modeling_stage_export_summary
         ml_feature_export_summary.setdefault("files", {})["node_features_compound_normalized.csv"] = {"written": True, **normalization_summary.get("compound", {})}
         ml_feature_export_summary.setdefault("files", {})["node_features_protein_normalized.csv"] = {"written": True, **normalization_summary.get("protein", {})}
         ml_feature_export_summary.setdefault("files", {})["node_features_protembed_normalized.csv"] = {"written": True, **normalization_summary.get("protembed", {})}
@@ -1542,6 +1556,7 @@ class RunStore:
         ml_feature_export_summary.setdefault("files", {})["candidate_missing_pairs_all_materialized_compounds.csv"] = {"rows": len(all_materialized_candidate_rows)}
         ml_feature_export_summary.setdefault("files", {})["candidate_missing_pairs_observed_compounds_only.csv"] = {"rows": len(observed_compound_candidate_rows)}
         ml_feature_export_summary.setdefault("files", {})["pyg_export/heterodata.pt"] = pyg_export_summary
+        ml_feature_export_summary.setdefault("files", {})["modeling/"] = modeling_stage_export_summary
         ml_feature_export_summary.setdefault("files", {})["edge_index_train_only.csv"] = {"rows": len(edge_index_train_only_rows)}
         ml_feature_export_summary.setdefault("files", {})["edge_index_holdout_removed_edges.csv"] = {"rows": len(edge_index_holdout_removed_rows)}
         ml_feature_export_summary["leakage_control_export"] = {
@@ -1603,6 +1618,7 @@ class RunStore:
             "model_matrix_summary": model_matrix_summary,
             "strict_numeric_tensor_summary": tensor_summary,
             "pyg_export_summary": pyg_export_summary,
+            "modeling_stage_export_summary": modeling_stage_export_summary,
         }
         summary_path = self.graph_dir / "csv_export_summary.json"
         summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -3103,6 +3119,416 @@ def _write_pyg_export(
     }
 
 
+
+
+def _write_modeling_stage_exports(
+    out_dir: Path,
+    *,
+    ml_dir: Path,
+    node_mapping_rows: list[dict[str, Any]],
+    relation_mapping_rows: list[dict[str, Any]],
+    edge_rows: list[dict[str, Any]],
+    train_edge_rows: list[dict[str, Any]],
+    holdout_removed_edge_rows: list[dict[str, Any]],
+    training_pair_rows: list[dict[str, Any]],
+    candidate_rows: list[dict[str, Any]],
+    link_prediction_pair_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Write stage-organized modeling exports under ``graph/ml/modeling``.
+
+    These files are intentionally additional mirrors of the existing ML exports;
+    they do not change the canonical JSONL graph, Neo4j loading behavior, or the
+    existing ``graph/ml`` files.  The folder is organized around the recommended
+    modeling roadmap:
+
+    * Stage 1: Neo4j GDS baselines using FastRP / GraphSAGE + link prediction.
+    * Stage 2: knowledge graph embedding baselines such as DistMult, ComplEx, RotatE.
+    * Stage 3: heterogeneous GNNs such as R-GCN/HGT with an MLP decoder.
+    """
+    out_dir = Path(out_dir)
+    ml_dir = Path(ml_dir)
+    _clear_tree(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    stage1_dir = out_dir / "stage1_neo4j_gds_baselines"
+    stage2_dir = out_dir / "stage2_kg_embedding_baselines"
+    stage3_dir = out_dir / "stage3_heterogeneous_gnn"
+    scripts_dir = stage1_dir / "cypher"
+    pykeen_dir = stage2_dir / "pykeen"
+    stage3_pyg_dir = stage3_dir / "pyg_export"
+    for d in [stage1_dir, scripts_dir, stage2_dir, pykeen_dir, stage3_dir, stage3_pyg_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    node_id_to_entity: dict[str, str] = {}
+    node_id_to_ref: dict[str, str] = {}
+    node_id_to_label: dict[str, str] = {}
+    entity_rows: list[dict[str, Any]] = []
+    for row in node_mapping_rows:
+        node_id = _stringify_cell(row.get("node_id"))
+        if not node_id:
+            continue
+        entity_id = f"n{node_id}"
+        node_id_to_entity[node_id] = entity_id
+        node_id_to_ref[node_id] = _stringify_cell(row.get("node_ref"))
+        node_id_to_label[node_id] = _stringify_cell(row.get("label"))
+        entity_rows.append(
+            {
+                "entity_id": entity_id,
+                "node_id": node_id,
+                "node_ref": node_id_to_ref[node_id],
+                "node_type": node_id_to_label[node_id],
+            }
+        )
+
+    relation_labels = sorted({_stringify_cell(r.get("schema_label") or r.get("type")) for r in edge_rows if _stringify_cell(r.get("schema_label") or r.get("type"))})
+    relation_labels_with_target = sorted(set(relation_labels) | {"INTERACTS_WITH"})
+    relation_rows = [
+        {"relation_id": idx, "relation_label": rel, "source": "target_link" if rel == "INTERACTS_WITH" else "graph_schema"}
+        for idx, rel in enumerate(relation_labels_with_target)
+    ]
+
+    def graph_triples(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
+        triples: list[dict[str, str]] = []
+        for row in rows:
+            src = node_id_to_entity.get(_stringify_cell(row.get("source_node_id")))
+            dst = node_id_to_entity.get(_stringify_cell(row.get("target_node_id")))
+            rel = _stringify_cell(row.get("schema_label") or row.get("type"))
+            if src and dst and rel:
+                triples.append({"head": src, "relation": rel, "tail": dst})
+        return triples
+
+    all_graph_triples = graph_triples(edge_rows)
+    train_graph_triples = graph_triples(train_edge_rows)
+
+    def pair_to_triple(row: dict[str, Any]) -> Optional[dict[str, str]]:
+        c = node_id_to_entity.get(_stringify_cell(row.get("compound_node_id")))
+        p = node_id_to_entity.get(_stringify_cell(row.get("protein_node_id")))
+        if not c or not p:
+            return None
+        return {"head": c, "relation": "INTERACTS_WITH", "tail": p}
+
+    target_train: list[dict[str, str]] = []
+    target_valid: list[dict[str, str]] = []
+    target_test: list[dict[str, str]] = []
+    pair_stage_rows: list[dict[str, Any]] = []
+    for row in training_pair_rows:
+        label = _stringify_cell(row.get("label")).strip().lower()
+        split = _stringify_cell(row.get("split") or "train").strip().lower()
+        if split in {"validation", "valid"}:
+            split = "val"
+        is_positive = label in {"1", "1.0", "positive", "true"}
+        triple = pair_to_triple(row)
+        out_row = dict(row)
+        out_row["target_relation"] = "INTERACTS_WITH"
+        out_row["stage_use"] = "supervised_link_prediction_label"
+        pair_stage_rows.append(out_row)
+        if not (is_positive and triple):
+            continue
+        if split == "test":
+            target_test.append(triple)
+        elif split == "val":
+            target_valid.append(triple)
+        else:
+            target_train.append(triple)
+
+    candidate_triples: list[dict[str, str]] = []
+    candidate_stage_rows: list[dict[str, Any]] = []
+    for row in candidate_rows:
+        triple = pair_to_triple(row)
+        out_row = dict(row)
+        out_row["target_relation"] = "INTERACTS_WITH"
+        out_row["stage_use"] = "candidate_to_score_not_true_negative"
+        candidate_stage_rows.append(out_row)
+        if triple:
+            candidate_triples.append(triple)
+
+    # Stage 1: Neo4j GDS baselines.
+    _write_rows_csv(stage1_dir / "compound_target_training_pairs_for_gds.csv", pair_stage_rows, columns=_columns(pair_stage_rows) or ML_PAIR_COLUMNS)
+    _write_rows_csv(stage1_dir / "candidate_pairs_for_gds_scoring.csv", candidate_stage_rows, columns=_columns(candidate_stage_rows) or ML_CANDIDATE_COLUMNS)
+    _write_rows_csv(stage1_dir / "node_mapping_reference.csv", entity_rows)
+    _write_rows_csv(stage1_dir / "relationship_schema_counts.csv", _relationship_schema_counts(edge_rows))
+    _write_gds_cypher_scripts(scripts_dir)
+    (stage1_dir / "README.md").write_text(
+        "# Stage 1 — Neo4j GDS baselines\n\n"
+        "Use this folder for quick Neo4j Graph Data Science baselines.  The CSV files preserve the same supervised "
+        "compound-protein pair labels exported by PRING, while the Cypher scripts show how to create an optional direct "
+        "`OBSERVED_INTERACTS_WITH` relationship, project the graph, write FastRP / GraphSAGE embeddings, and configure a "
+        "link-prediction pipeline.\n\n"
+        "Important: candidate pairs are unknown pairs for scoring; they are not true negatives.\n",
+        encoding="utf-8",
+    )
+
+    # Stage 2: KGE baselines.
+    _write_rows_tsv(stage2_dir / "entities.tsv", entity_rows, columns=["entity_id", "node_id", "node_ref", "node_type"])
+    _write_rows_tsv(stage2_dir / "relations.tsv", relation_rows, columns=["relation_id", "relation_label", "source"])
+    _write_rows_tsv(stage2_dir / "all_graph_triples.tsv", all_graph_triples, columns=["head", "relation", "tail"])
+    _write_rows_tsv(stage2_dir / "train_graph_triples_leakage_safe.tsv", train_graph_triples, columns=["head", "relation", "tail"])
+    _write_rows_tsv(stage2_dir / "target_relation_train.tsv", target_train, columns=["head", "relation", "tail"])
+    _write_rows_tsv(stage2_dir / "target_relation_valid.tsv", target_valid, columns=["head", "relation", "tail"])
+    _write_rows_tsv(stage2_dir / "target_relation_test.tsv", target_test, columns=["head", "relation", "tail"])
+    _write_rows_tsv(stage2_dir / "candidate_target_triples_to_score.tsv", candidate_triples, columns=["head", "relation", "tail"])
+    # Header-free files for PyKEEN and similar KGE libraries.
+    _write_triples_no_header(pykeen_dir / "train.tsv", train_graph_triples + target_train)
+    _write_triples_no_header(pykeen_dir / "valid.tsv", target_valid)
+    _write_triples_no_header(pykeen_dir / "test.tsv", target_test)
+    _write_triples_no_header(pykeen_dir / "candidates_to_score.tsv", candidate_triples)
+    (stage2_dir / "README.md").write_text(
+        "# Stage 2 — KG embedding baselines\n\n"
+        "Use `pykeen/train.tsv`, `pykeen/valid.tsv`, and `pykeen/test.tsv` with DistMult, ComplEx, RotatE, or similar "
+        "knowledge graph embedding models.  `train.tsv` contains the leakage-safe training graph plus positive training "
+        "`INTERACTS_WITH` target triples.  Validation/test files contain held-out positive target triples.  "
+        "`candidates_to_score.tsv` contains unknown compound-protein pairs for ranking/scoring.\n",
+        encoding="utf-8",
+    )
+
+    # Stage 3: heterogeneous GNN exports.  Copy the ML-ready files into the stage
+    # folder so HPC jobs can point to one self-contained location.
+    stage3_files = [
+        "node_mapping.csv",
+        "relation_mapping.csv",
+        "edge_index.csv",
+        "edge_index_train_only.csv",
+        "edge_index_holdout_removed_edges.csv",
+        "compound_target_training_pairs.csv",
+        "compound_target_link_prediction_pairs.csv",
+        "positive_compound_target_pairs.csv",
+        "negative_compound_target_pairs.csv",
+        "candidate_missing_compound_target_pairs.csv",
+        "candidate_missing_pairs_all_materialized_compounds.csv",
+        "candidate_missing_pairs_observed_compounds_only.csv",
+        "node_features_compound_tensor.csv",
+        "node_features_compound_tensor_metadata.csv",
+        "node_features_protein_tensor.csv",
+        "node_features_protein_tensor_metadata.csv",
+        "node_features_protembed_tensor.csv",
+        "node_features_protembed_tensor_metadata.csv",
+        "node_features_endpoint_tensor.csv",
+        "node_features_endpoint_tensor_metadata.csv",
+        "node_features_compound_model_matrix.csv",
+        "node_features_protein_model_matrix.csv",
+        "node_features_protembed_model_matrix.csv",
+        "node_features_endpoint_model_matrix.csv",
+        "feature_column_manifest.json",
+        "normalization_stats.json",
+        "modeling_readiness_manifest.json",
+        "gcn_case_study_report.json",
+    ]
+    copied_stage3 = []
+    for name in stage3_files:
+        if _copy_file_if_exists(ml_dir / name, stage3_dir / name):
+            copied_stage3.append(name)
+    for name in [
+        "feature_tensor_manifest.json",
+        "node_type_mapping.json",
+        "edge_type_mapping.json",
+        "train_val_test_edges.json",
+        "heterodata.pt",
+        "heterodata_payload.pt",
+        "train_val_test_edges.pt",
+        "README.md",
+    ]:
+        if _copy_file_if_exists(ml_dir / "pyg_export" / name, stage3_pyg_dir / name):
+            copied_stage3.append(f"pyg_export/{name}")
+    (stage3_dir / "README.md").write_text(
+        "# Stage 3 — Heterogeneous GNN exports\n\n"
+        "Use this folder for R-GCN, HGT, HeteroGraphSAGE, or an MLP decoder over Compound/Protein embeddings. "
+        "For leakage-safe validation/test scoring, use `edge_index_train_only.csv` or `pyg_export/heterodata.pt` with "
+        "the train-only edge-index payload.  `candidate_missing_compound_target_pairs.csv` contains unknown pairs for "
+        "ranking; do not treat these as confirmed negatives.\n",
+        encoding="utf-8",
+    )
+
+    manifest = {
+        "format": "pring_modeling_stage_exports_v1",
+        "root": str(out_dir),
+        "stage1_neo4j_gds_baselines": {
+            "directory": str(stage1_dir),
+            "training_pairs": len(pair_stage_rows),
+            "candidate_pairs": len(candidate_stage_rows),
+            "cypher_scripts": sorted(p.name for p in scripts_dir.glob("*.cypher")),
+        },
+        "stage2_kg_embedding_baselines": {
+            "directory": str(stage2_dir),
+            "entities": len(entity_rows),
+            "relations": len(relation_rows),
+            "all_graph_triples": len(all_graph_triples),
+            "train_graph_triples_leakage_safe": len(train_graph_triples),
+            "target_relation_train": len(target_train),
+            "target_relation_valid": len(target_valid),
+            "target_relation_test": len(target_test),
+            "candidate_target_triples_to_score": len(candidate_triples),
+        },
+        "stage3_heterogeneous_gnn": {
+            "directory": str(stage3_dir),
+            "copied_files": copied_stage3,
+            "copied_file_count": len(copied_stage3),
+            "train_only_edges": len(train_edge_rows),
+            "heldout_removed_edges": len(holdout_removed_edge_rows),
+            "link_prediction_pairs": len(link_prediction_pair_rows),
+        },
+        "label_semantics": {
+            "1": "curated active/potent interaction evidence",
+            "0": "curated inactive or weak evidence under threshold rule",
+            "unknown": "unobserved compound-protein candidate pair; not a true negative",
+        },
+        "leakage_control_note": "Use train-only graph exports for validation/test scoring. Held-out Interaction evidence paths are removed from edge_index_train_only.csv.",
+    }
+    (out_dir / "modeling_stage_manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    (out_dir / "README.md").write_text(
+        "# PRING modeling exports\n\n"
+        "This folder is organized by modeling stage and is generated in addition to the existing PRING graph/ML artifacts.\n\n"
+        "1. `stage1_neo4j_gds_baselines/` — Neo4j GDS FastRP / GraphSAGE / link-prediction scripts and pair tables.\n"
+        "2. `stage2_kg_embedding_baselines/` — triples and PyKEEN-compatible files for DistMult, ComplEx, RotatE.\n"
+        "3. `stage3_heterogeneous_gnn/` — R-GCN/HGT-ready graph edges, pair labels, feature tensors, and PyG payloads.\n\n"
+        "The Neo4j database remains the source of truth. These exports freeze the modeling dataset for reproducible training.\n",
+        encoding="utf-8",
+    )
+    return manifest
+
+
+def _clear_tree(path: Path) -> None:
+    """Remove files/subdirectories under ``path`` without failing the run."""
+    path = Path(path)
+    if not path.exists():
+        return
+    for child in sorted(path.iterdir(), reverse=True):
+        try:
+            if child.is_dir():
+                _clear_tree(child)
+                child.rmdir()
+            else:
+                child.unlink()
+        except Exception:
+            pass
+
+
+def _relationship_schema_counts(edge_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    counts: dict[tuple[str, str, str], int] = {}
+    for row in edge_rows:
+        key = (
+            _stringify_cell(row.get("start_label")),
+            _stringify_cell(row.get("schema_label") or row.get("type")),
+            _stringify_cell(row.get("end_label")),
+        )
+        counts[key] = counts.get(key, 0) + 1
+    return [
+        {"source_label": k[0], "relationship_type": k[1], "target_label": k[2], "relationship_count": v}
+        for k, v in sorted(counts.items(), key=lambda item: (item[0][0], item[0][1], item[0][2]))
+    ]
+
+
+def _write_rows_tsv(path: Path, rows: list[dict[str, Any]], *, columns: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=columns, delimiter="\t", extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({c: row.get(c, "") for c in columns})
+
+
+def _write_triples_no_header(path: Path, triples: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f, delimiter="\t")
+        for row in triples:
+            writer.writerow([row.get("head", ""), row.get("relation", ""), row.get("tail", "")])
+
+
+def _copy_file_if_exists(src: Path, dst: Path) -> bool:
+    src = Path(src)
+    dst = Path(dst)
+    if not src.exists() or not src.is_file():
+        return False
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_bytes(src.read_bytes())
+    return True
+
+
+def _write_gds_cypher_scripts(out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "00_create_observed_interacts_with.cypher").write_text(
+        "// Optional direct modeling relationship for Neo4j GDS link prediction.\n"
+        "// This does not replace PRING Interaction evidence nodes; it only creates a derived relation for GDS.\n"
+        "MATCH (c:Compound)<-[:ASSERTS_CHEMICAL]-(i:Interaction)-[:ASSERTS_TARGET]->(p:Protein)\n"
+        "WITH c, p, count(DISTINCT i) AS evidence_count\n"
+        "MERGE (c)-[r:OBSERVED_INTERACTS_WITH]->(p)\n"
+        "SET r.evidence_count = evidence_count,\n"
+        "    r.source = 'PRING derived modeling relation',\n"
+        "    r.updated_at = datetime();\n",
+        encoding="utf-8",
+    )
+    (out_dir / "01_project_modeling_graph.cypher").write_text(
+        "// Project a heterogeneous PRING graph for embedding and link-prediction baselines.\n"
+        "CALL gds.graph.drop('pring_cyp450_modeling', false) YIELD graphName RETURN graphName;\n\n"
+        "CALL gds.graph.project(\n"
+        "  'pring_cyp450_modeling',\n"
+        "  ['Compound','Protein','Interaction','BioAssay','Endpoint','MeasureGrp','Reference','Substance','Organism','GO','Reactome','Pathway','InterPro','PDB','AlphaFold','UniProt','ProtEmbed','Gene'],\n"
+        "  {\n"
+        "    OBSERVED_INTERACTS_WITH: {orientation: 'UNDIRECTED'},\n"
+        "    ASSERTS_CHEMICAL: {orientation: 'UNDIRECTED'},\n"
+        "    ASSERTS_TARGET: {orientation: 'UNDIRECTED'},\n"
+        "    SUPPORTED_BY_ASSAY: {orientation: 'UNDIRECTED'},\n"
+        "    SUPPORTED_BY_ENDPOINT: {orientation: 'UNDIRECTED'},\n"
+        "    SUPPORTED_BY_REFERENCE: {orientation: 'UNDIRECTED'},\n"
+        "    HAS_MEASURE_GROUP: {orientation: 'UNDIRECTED'},\n"
+        "    HAS_ENDPOINT: {orientation: 'UNDIRECTED'},\n"
+        "    ABOUT_SUBSTANCE: {orientation: 'UNDIRECTED'},\n"
+        "    STANDARDIZED_TO: {orientation: 'UNDIRECTED'},\n"
+        "    SIMILAR_TO: {orientation: 'UNDIRECTED'},\n"
+        "    HAS_GO_ANNOTATION: {orientation: 'UNDIRECTED'},\n"
+        "    MAPS_TO_REACTOME_PATHWAY: {orientation: 'UNDIRECTED'},\n"
+        "    HAS_INTERPRO_DOMAIN: {orientation: 'UNDIRECTED'},\n"
+        "    HAS_PDB_STRUCTURE: {orientation: 'UNDIRECTED'},\n"
+        "    HAS_ALPHAFOLD_MODEL: {orientation: 'UNDIRECTED'},\n"
+        "    HAS_UNIPROT_RECORD: {orientation: 'UNDIRECTED'},\n"
+        "    HAS_PROTEIN_EMBEDDING: {orientation: 'UNDIRECTED'},\n"
+        "    ENCODED_BY: {orientation: 'UNDIRECTED'},\n"
+        "    PARTICIPATES_IN: {orientation: 'UNDIRECTED'}\n"
+        "  }\n"
+        ") YIELD graphName, nodeCount, relationshipCount\n"
+        "RETURN graphName, nodeCount, relationshipCount;\n",
+        encoding="utf-8",
+    )
+    (out_dir / "02_fastrp_embeddings.cypher").write_text(
+        "// FastRP baseline embeddings.\n"
+        "CALL gds.fastRP.write(\n"
+        "  'pring_cyp450_modeling',\n"
+        "  {embeddingDimension: 128, iterationWeights: [0.0, 1.0, 1.0, 1.0], randomSeed: 42, writeProperty: 'pringFastRP'}\n"
+        ") YIELD nodePropertiesWritten, computeMillis\n"
+        "RETURN nodePropertiesWritten, computeMillis;\n",
+        encoding="utf-8",
+    )
+    (out_dir / "03_graphsage_embeddings.cypher").write_text(
+        "// GraphSAGE baseline. Requires suitable node feature properties in the projected graph.\n"
+        "// If this fails because no numeric node properties are projected, use FastRP as the baseline embedding.\n"
+        "CALL gds.beta.graphSage.train(\n"
+        "  'pring_cyp450_modeling',\n"
+        "  {modelName: 'pringGraphSAGE', embeddingDimension: 128, randomSeed: 42, epochs: 10}\n"
+        ") YIELD modelInfo, trainMillis\n"
+        "RETURN modelInfo, trainMillis;\n\n"
+        "CALL gds.beta.graphSage.write(\n"
+        "  'pring_cyp450_modeling',\n"
+        "  {modelName: 'pringGraphSAGE', writeProperty: 'pringGraphSAGE'}\n"
+        ") YIELD nodePropertiesWritten\n"
+        "RETURN nodePropertiesWritten;\n",
+        encoding="utf-8",
+    )
+    (out_dir / "04_link_prediction_pipeline.cypher").write_text(
+        "// Link-prediction pipeline baseline over OBSERVED_INTERACTS_WITH.\n"
+        "// Create OBSERVED_INTERACTS_WITH first using 00_create_observed_interacts_with.cypher.\n"
+        "CALL gds.beta.pipeline.linkPrediction.create('pring_cyp450_lp') YIELD pipelineName RETURN pipelineName;\n\n"
+        "CALL gds.beta.pipeline.linkPrediction.addFeature('pring_cyp450_lp', 'hadamard', {nodeProperties: ['pringFastRP']})\n"
+        "YIELD featureSteps RETURN featureSteps;\n\n"
+        "CALL gds.beta.pipeline.linkPrediction.configureSplit('pring_cyp450_lp', {\n"
+        "  testFraction: 0.2, validationFolds: 3, negativeSamplingRatio: 1.0\n"
+        "}) YIELD splitConfig RETURN splitConfig;\n\n"
+        "CALL gds.beta.pipeline.linkPrediction.train(\n"
+        "  'pring_cyp450_modeling',\n"
+        "  {pipeline: 'pring_cyp450_lp', modelName: 'pring_cyp450_lp_model', targetRelationshipType: 'OBSERVED_INTERACTS_WITH', metrics: ['AUCPR','AUROC']}\n"
+        ") YIELD modelInfo, modelSelectionStats\n"
+        "RETURN modelInfo, modelSelectionStats;\n",
+        encoding="utf-8",
+    )
 
 def _read_tensor_metadata(path: Path) -> list[dict[str, str]]:
     if not Path(path).exists():

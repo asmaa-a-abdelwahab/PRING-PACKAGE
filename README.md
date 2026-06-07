@@ -932,3 +932,7 @@ python -m pring build \
   --out-dir runs \
   --run-id safe_small
 ```
+
+## Modeling exports
+
+PRING writes stage-organized modeling artifacts under `graph/ml/modeling/` when CSV/ML mirrors are materialized. See `docs/MODELING_EXPORTS.md` for the generated files for Neo4j GDS baselines, KG embedding baselines, and heterogeneous GNN models.
