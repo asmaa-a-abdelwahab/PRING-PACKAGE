@@ -86,10 +86,10 @@ python -m pytest -q tests/live/test_live_smoke.py -m neo4j -rs
 | Input parsing, modes, scopes, query planning | `test_query_plan_config.py`, `test_parsers_and_normalizer.py`, `test_target_normalization.py` |
 | PubChem RDF REST/SPARQL extraction helpers | `test_pubchem_core_full.py`, `test_pubchem_rdf_rest_additional.py`, `test_pubchem_sparql_mirror_additional.py` |
 | HTTP clients, retries, throttling, resource controls | `test_http_client.py`, `test_http_resilience.py`, `test_http_throttling_controls.py`, `test_http_and_neo4j_additional.py`, `test_io_and_utils.py` |
-| Graph records, run store, loader, schema | `test_graph_records_and_runstore.py`, `test_loader_and_schema.py` |
+| Graph records, run store, loader, schema | `test_graph_records_and_runstore.py`, `test_loader_and_schema.py`, `test_schema_alignment.py` |
 | Optional metadata and enrichment layers | `test_optional_pubchem_metadata.py`, `test_enrichment_api_fixes.py`, `test_plugins_config_and_derive.py` |
 | Modeling/GCN readiness and similarity fixes | `test_similarity_complete_nodes_and_labeling.py`, `test_recommendation_improvements.py` |
-| Documentation/install/example integrity | `test_documentation_examples.py` |
+| Documentation/install/example integrity | `test_documentation_examples.py`; also checks `schema/README.md`, `docs/FUTURE_DIRECTIONS.md`, and `MANIFEST.in` |
 | Live network/Neo4j smoke tests | `live/test_live_smoke.py` |
 
 ## 7. Manual CLI smoke checks
@@ -119,7 +119,7 @@ Before sharing a new ZIP/release:
 4. Manual demo run without Neo4j.
 5. Small live PubChem run if network access is available.
 6. Neo4j smoke/load-run check if Neo4j is available.
-7. Validate that `README.md`, `examples/README.md`, and local/HPC scripts match current CLI options.
+7. Validate that `README.md`, `examples/README.md`, `schema/README.md`, `docs/FUTURE_DIRECTIONS.md`, and local/HPC scripts match current CLI options.
 
 ## 9. Adding new tests
 

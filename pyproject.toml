@@ -87,12 +87,3 @@ include-package-data = true
 where = ["."]
 include = ["pring*"]
 exclude = ["tests*", "examples*"]
-
-[tool.pytest.ini_options]
-markers = [
-  "live: requires external PubChem or other network services",
-  "neo4j: requires a running Neo4j instance",
-]
-filterwarnings = [
-  "ignore:.*setParseAction.*deprecated.*:pyparsing.exceptions.PyparsingDeprecationWarning",
-]

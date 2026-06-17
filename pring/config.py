@@ -74,7 +74,7 @@ class BuildFlags:
     include_compound_similarity: bool = False
     include_optional_context: bool = True
     include_endpoint_metadata: bool = True
-    include_endpoint_references: bool = True
+    include_endpoint_references: bool = False
     taxids: Tuple[int, ...] = (9606,)
 
 
@@ -232,7 +232,7 @@ class Settings:
             include_compound_similarity=_parse_bool(os.getenv("PRING_INCLUDE_COMPOUND_SIMILARITY"), False),
             include_optional_context=_parse_bool(os.getenv("PRING_INCLUDE_OPTIONAL_CONTEXT"), True),
             include_endpoint_metadata=_parse_bool(os.getenv("PRING_INCLUDE_ENDPOINT_METADATA"), True),
-            include_endpoint_references=_parse_bool(os.getenv("PRING_INCLUDE_ENDPOINT_REFERENCES"), True),
+            include_endpoint_references=_parse_bool(os.getenv("PRING_INCLUDE_ENDPOINT_REFERENCES"), False),
             taxids=_parse_taxids(os.getenv("PRING_TAXID", "9606")) or (9606,),
         )
         caps = BuildCaps(
@@ -284,10 +284,13 @@ class Settings:
             resources=resources,
             textmining_file=Path(textmining_file) if textmining_file else None,
             textmining_source=os.getenv("PRING_TEXTMINING_SOURCE", "auto").strip().lower() or "auto",
+            textmining_pubmed_fallback=_parse_bool(os.getenv("PRING_TEXTMINING_PUBMED_FALLBACK"), True),
             compound_similarity_method=os.getenv("PRING_COMPOUND_SIMILARITY_METHOD", "2d"),
             compound_similarity_threshold=int(os.getenv("PRING_COMPOUND_SIMILARITY_THRESHOLD", "90")),
             activity_threshold_um=_float_or_none(os.getenv("PRING_ACTIVITY_THRESHOLD_UM"), None),
             weak_activity_as_negative=_parse_bool(os.getenv("PRING_WEAK_ACTIVITY_AS_NEGATIVE"), False),
+            max_candidate_missing_pairs=_int_or_none(os.getenv("PRING_MAX_CANDIDATE_MISSING_PAIRS"), None),
+            candidate_pair_mode=os.getenv("PRING_CANDIDATE_PAIR_MODE", "sampled").strip().lower() or "sampled",
             enrichment_timeout_s=float(os.getenv("PRING_ENRICHMENT_TIMEOUT_S", "45.0")),
             enrichment_max_retries=int(os.getenv("PRING_ENRICHMENT_MAX_RETRIES", "1")),
             enrichment_min_delay_s=float(os.getenv("PRING_ENRICHMENT_MIN_DELAY_S", "0.25")),

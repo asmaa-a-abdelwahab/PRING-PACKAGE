@@ -108,7 +108,7 @@ def test_emit_from_measuregroups_yields_full_row_stream_with_optional_context():
     ex = PubChemSparqlMirrorExtractor(DummyClient())
     ex._select_evidence_rows_for_measuregroups = lambda *a, **k: [binding]
 
-    rows = list(ex._emit_from_measuregroups(["measuregroup:MG1"], BuildCaps(max_endpoints_per_pair=1), BuildFlags(include_optional_context=True)))
+    rows = list(ex._emit_from_measuregroups(["measuregroup:MG1"], BuildCaps(max_endpoints_per_pair=1), BuildFlags(include_optional_context=True, include_endpoint_references=True)))
     kinds = {r["kind"] for r in rows}
     assert {"measuregroup", "bioassay", "mg_bioassay", "gene", "mg_gene", "protein", "mg_protein", "cellline", "mg_cellline", "anatomy", "cell_anatomy", "organism", "mg_organism", "compound", "substance", "endpoint", "reference", "ep_reference"}.issubset(kinds)
 

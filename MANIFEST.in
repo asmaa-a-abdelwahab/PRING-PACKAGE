@@ -1,0 +1,13 @@
+include README.md
+include pyproject.toml
+include pytest.ini
+include requirements*.txt
+include install_pytorch_cuda.md
+include config.yaml
+include chem_ids.txt
+include target_ids.txt
+recursive-include docs *.md
+recursive-include schema *.dot *.svg *.png *.md
+recursive-include examples *.md *.txt *.csv *.sh *.ps1 *.sbatch *.py
+recursive-include scripts *.py *.sbatch *.ps1
+recursive-include tests *.py *.md

@@ -82,7 +82,7 @@ digraph PRING_Final_ImplementationReady_Thesis {
     color="lavender";
 
     BioAssay   [label="BioAssay\nkey: aid\nprops: title, assay_type?, activity_outcome_method?, pubchem_uri?"];
-    MeasureGrp [label="MeasureGroup\nkey: measuregroup_id\nprops: panel_row?, assay_context?, target_panel?, pubchem_uri?"];
+    MeasureGrp [label="MeasureGrp / MeasureGroup\nkey: mg_id\nprops: panel_row?, assay_context?, target_panel?, pubchem_uri?"];
     Endpoint   [label="Endpoint\nkey: endpoint_id\nprops: endpoint_type, value, unit, qualifier?,\nvalue_float?, value_molar?, -log10M?, outcome/activity label?, score?"];
   }
 
@@ -121,7 +121,7 @@ digraph PRING_Final_ImplementationReady_Thesis {
     color="gray92";
 
     Cooc     [label="Cooccurrence\nkey: cooc_id\nprops: score, sentence_count?, mention_context?"];
-    TextMine [label="TextMiningMethod\nkey: method_id\nprops: name, version, source"];
+    TextMine [label="TextMine / TextMiningMethod\nkey: textmine_id\nprops: name, version, source"];
   }
 
   // --------------------------------------------------------------------------

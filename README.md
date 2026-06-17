@@ -30,6 +30,10 @@ PRING can:
 12. [Testing](#12-testing)
 13. [Troubleshooting](#13-troubleshooting)
 14. [Limitations](#14-limitations)
+15. [Schema alignment and publication readiness](#15-schema-alignment-and-publication-readiness)
+16. [Future directions](#16-future-directions)
+17. [Minimal safe commands](#17-minimal-safe-commands)
+18. [Modeling exports](#18-modeling-exports)
 
 ---
 
@@ -309,7 +313,7 @@ For a new case study:
 
 ---
 
-## 4.5. Explore run data with EDA
+## 4.4. Explore run data with EDA
 
 After a build or `load-run` rematerialization, generate a modeling-focused exploratory analysis report directly from the package:
 
@@ -895,7 +899,64 @@ Also check `manifest.json` to confirm the inferred mode/scope and actual cap val
 
 ---
 
-## 15. Minimal safe commands
+## 15. Schema alignment and publication readiness
+
+The schema folder is part of the published package, not only a figure source. Use:
+
+```text
+schema/pring-implementation-ready-schema.dot
+schema/pring-implementation-ready-schema.svg
+schema/pring-implementation-ready-schema.png
+schema/README.md
+```
+
+for the implementation-aligned schema used in documentation, Neo4j schema validation, and publication figures. The implementation-ready schema follows the current runtime node labels and keys from `pring.config.Settings.node_keys`, including `MeasureGrp` keyed by `mg_id`, `TextMine` keyed by `textmine_id`, and the derived `Interaction` layer keyed by `interaction_id`.
+
+Use:
+
+```bash
+python -m pring load-run \
+  --run-dir runs/<run_id> \
+  --schema-dot schema/pring-implementation-ready-schema.dot \
+  --rematerialize-schema true \
+  --rematerialize-csv true \
+  --validate-dot-schema true \
+  --load-neo4j false
+```
+
+when checking an archived run before publication. This refreshes deterministic derived artifacts and validates schema compatibility without requiring Neo4j loading.
+
+Before publishing a package release, run the following release gate:
+
+```bash
+python -m pytest -q tests -m "not live and not neo4j"
+python -m pytest -q tests -m "not live and not neo4j" --cov=pring --cov-report=term-missing
+python -m pring demo --load-neo4j false --out-dir runs --run-id release_demo --overwrite-run true
+python -m pring eda --run-path runs/release_demo --output-dir runs/release_demo/analysis/eda
+```
+
+Recommended manual checks:
+
+- Open `README.md`, `examples/README.md`, `examples/hpc/README_HPC.md`, `tests/README_TESTS.md`, `schema/README.md`, and `docs/FUTURE_DIRECTIONS.md`.
+- Confirm that every example command uses public CLI commands: `demo`, `build`, `load-run`, `schema`, or `eda`.
+- Confirm that the implementation schema images were regenerated after editing the DOT file.
+- Run live PubChem and Neo4j smoke tests only when external services are available.
+
+---
+
+## 16. Future directions
+
+The future roadmap is maintained in:
+
+```text
+docs/FUTURE_DIRECTIONS.md
+```
+
+The main planned directions are PubChem FTP/bulk ingestion, stronger ontology alignment, schema versioning, endpoint harmonization, confidence scoring, richer GNN/KGE exports, explainability, Docker/Singularity packaging, CI expansion, and publication artifact archiving.
+
+---
+
+## 17. Minimal safe commands
 
 ### Windows PowerShell demo
 
@@ -933,6 +994,6 @@ python -m pring build \
   --run-id safe_small
 ```
 
-## Modeling exports
+## 18. Modeling exports
 
 PRING writes stage-organized modeling artifacts under `graph/ml/modeling/` when CSV/ML mirrors are materialized. See `docs/MODELING_EXPORTS.md` for the generated files for Neo4j GDS baselines, KG embedding baselines, and heterogeneous GNN models.

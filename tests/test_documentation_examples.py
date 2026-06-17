@@ -114,3 +114,34 @@ def test_example_seed_files_use_one_identifier_per_line():
                 continue
             assert "#" not in stripped, f"Inline comments are not supported in {rel_path}: {line!r}"
             assert " " not in stripped, f"Use one identifier per line in {rel_path}: {line!r}"
+
+
+def test_publication_readiness_docs_and_manifest_are_present():
+    required_files = [
+        "schema/README.md",
+        "docs/FUTURE_DIRECTIONS.md",
+        "MANIFEST.in",
+        "schema/pring-implementation-ready-schema.dot",
+        "schema/pring-implementation-ready-schema.svg",
+        "schema/pring-implementation-ready-schema.png",
+    ]
+    for rel_path in required_files:
+        assert (ROOT / rel_path).exists(), rel_path
+
+    readme = _read("README.md")
+    for expected in [
+        "## 15. Schema alignment and publication readiness",
+        "## 16. Future directions",
+        "schema/README.md",
+        "docs/FUTURE_DIRECTIONS.md",
+    ]:
+        assert expected in readme
+
+    manifest = _read("MANIFEST.in")
+    for expected in [
+        "recursive-include docs",
+        "recursive-include schema",
+        "recursive-include examples",
+        "recursive-include tests",
+    ]:
+        assert expected in manifest

@@ -1442,7 +1442,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         compound_similarity_threshold=similarity_threshold,
         activity_threshold_um=activity_threshold_um,
         weak_activity_as_negative=weak_activity_as_negative,
-        textmining_pubmed_fallback=(getattr(args, "textmining_pubmed_fallback", None) != "false"),
+        textmining_pubmed_fallback=(settings.textmining_pubmed_fallback if getattr(args, "textmining_pubmed_fallback", None) is None else getattr(args, "textmining_pubmed_fallback") == "true"),
         max_candidate_missing_pairs=(settings.max_candidate_missing_pairs if getattr(args, "max_candidate_missing_pairs", None) is None else _parse_int_or_none(args.max_candidate_missing_pairs)),
         candidate_pair_mode=(settings.candidate_pair_mode if getattr(args, "candidate_pair_mode", None) is None else args.candidate_pair_mode),
     )

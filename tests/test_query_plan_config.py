@@ -38,3 +38,27 @@ def test_parse_taxids_accepts_mixed_formats_and_deduplicates():
     assert _parse_taxids("9606,TAXID10090,9606") == (9606, 10090)
     assert _parse_taxids("") is None
     assert _parse_taxids(None) is None
+
+
+def test_settings_from_env_reads_latest_modeling_and_textmining_knobs(monkeypatch):
+    from pring.config import Settings
+
+    monkeypatch.setenv("PRING_INCLUDE_ENDPOINT_REFERENCES", "true")
+    monkeypatch.setenv("PRING_TEXTMINING_PUBMED_FALLBACK", "false")
+    monkeypatch.setenv("PRING_MAX_CANDIDATE_MISSING_PAIRS", "none")
+    monkeypatch.setenv("PRING_CANDIDATE_PAIR_MODE", "all")
+
+    settings = Settings.from_env()
+
+    assert settings.flags.include_endpoint_references is True
+    assert settings.textmining_pubmed_fallback is False
+    assert settings.max_candidate_missing_pairs is None
+    assert settings.candidate_pair_mode == "all"
+
+
+def test_settings_default_endpoint_references_are_throttle_safe(monkeypatch):
+    from pring.config import Settings
+
+    monkeypatch.delenv("PRING_INCLUDE_ENDPOINT_REFERENCES", raising=False)
+    settings = Settings.from_env()
+    assert settings.flags.include_endpoint_references is False
