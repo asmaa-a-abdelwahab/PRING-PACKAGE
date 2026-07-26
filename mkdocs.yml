@@ -1,0 +1,107 @@
+site_name: PRING-PACKAGE
+site_description: Reproducible PubChem knowledge-graph construction and modeling-data exports
+site_url: https://asmaa-a-abdelwahab.github.io/PRING-PACKAGE/
+repo_url: https://github.com/asmaa-a-abdelwahab/PRING-PACKAGE
+repo_name: asmaa-a-abdelwahab/PRING-PACKAGE
+edit_uri: edit/main/docs/
+copyright: PRING contributors
+
+docs_dir: docs
+site_dir: site
+strict: true
+
+exclude_docs: |
+  archive/**
+  APPLIED_FIXES_*.md
+  CYP450_FINAL_GCN_READINESS_FIXES_*.md
+  CYP450_GCN_FIXES_*.md
+  CYP450_GCN_READINESS_UPDATES.md
+  ENRICHMENT_API_FIXES_*.md
+  FINAL_5CYP450_QA_FIXES_*.md
+  PATCH_NOTES_*.md
+  PUBLICATION_READINESS_REPORT.md
+  PRING_IMPLEMENTATION_CHECKLIST.md
+  RESOURCE_SAFETY_PATCH_NOTES.md
+  USER_PACKAGE_READINESS_NOTES.md
+  planning.md
+
+theme:
+  name: material
+  language: en
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - search.highlight
+    - search.suggest
+    - content.code.copy
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: cyan
+      toggle:
+        icon: material/weather-night
+        name: Use dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: cyan
+      toggle:
+        icon: material/weather-sunny
+        name: Use light mode
+  icon:
+    repo: fontawesome/brands/github
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+
+extra_css:
+  - assets/stylesheets/extra.css
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/asmaa-a-abdelwahab/PRING-PACKAGE
+
+nav:
+  - Home: index.md
+  - Start:
+      - Installation and quick start: getting-started.md
+      - Complete workflows: Workflows.md
+      - Configuration reference: PRING_CONFIG_MATRIX.md
+  - Architecture:
+      - System architecture: architecture.md
+      - Schema and provenance: schema-and-provenance.md
+      - PubChem transformation story: pring_pubchem_storyline.md
+  - Data and modeling:
+      - Modeling exports: MODELING_EXPORTS.md
+      - Run-data EDA: RUN_DATA_EDA_PIPELINE.md
+      - Enrichment layer: ENRICHMENT_LAYER.md
+      - PubChem text-mining endpoint: PUBCHEM_TEXTMINING_ENDPOINT.md
+      - Protein embeddings: OPTIONAL_TRANSFORMER_PROTEIN_EMBEDDINGS.md
+  - Operations:
+      - Resource and network safety: THROTTLING_AND_HYBRID_USAGE.md
+      - Validation and release: validation-and-release.md
+      - Scientific validity: scientific-validity.md
+  - Roadmap: FUTURE_DIRECTIONS.md

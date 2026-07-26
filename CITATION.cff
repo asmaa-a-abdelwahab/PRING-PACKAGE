@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+message: "If you use PRING-PACKAGE, cite the archived release and associated thesis or publication."
+title: "PRING-PACKAGE: PubChem RDF interaction knowledge-graph construction"
+type: software
+authors:
+  - name: "PRING contributors"
+repository-code: "https://github.com/asmaa-a-abdelwahab/PRING-PACKAGE"
+url: "https://asmaa-a-abdelwahab.github.io/PRING-PACKAGE/"
+version: 0.2.0
+date-released: 2026-07-26
+

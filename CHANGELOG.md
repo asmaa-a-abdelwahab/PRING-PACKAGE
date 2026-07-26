@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Add a searchable GitHub Pages documentation site and automated deployment.
+- Add Python 3.10–3.12 CI, contribution guidance, security reporting, citation
+  metadata, and consistent text-file rules.
+- Remove committed build and coverage products and ignore future generated
+  documentation/build output.
+- Move dated patch notes and internal readiness reports into an excluded
+  documentation archive.
+
 ## 0.2.0 — 2026-07-26
 
 - Align repository identity with `PRING-PACKAGE` while retaining the stable

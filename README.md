@@ -1,5 +1,10 @@
 # PRING-PACKAGE — PubChem RDF Interaction Knowledge Graph Builder
 
+[![CI](https://github.com/asmaa-a-abdelwahab/PRING-PACKAGE/actions/workflows/ci.yml/badge.svg)](https://github.com/asmaa-a-abdelwahab/PRING-PACKAGE/actions/workflows/ci.yml)
+[![Documentation](https://github.com/asmaa-a-abdelwahab/PRING-PACKAGE/actions/workflows/docs.yml/badge.svg)](https://asmaa-a-abdelwahab.github.io/PRING-PACKAGE/)
+
+**Documentation:** <https://asmaa-a-abdelwahab.github.io/PRING-PACKAGE/>
+
 PRING builds **Neo4j-ready** and **GCN/link-prediction-ready** knowledge graphs from PubChem RDF evidence. It was developed for CYP450 compound–enzyme interaction studies, but the workflow is generic enough for other compound–protein or compound–gene interaction use cases.
 
 PRING can:

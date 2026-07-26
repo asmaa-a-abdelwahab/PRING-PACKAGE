@@ -1,0 +1,18 @@
+* text=auto
+*.py text eol=lf
+*.sh text eol=lf
+*.sbatch text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.ps1 text eol=lf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.svg text eol=lf
+*.zip binary
+*.pt binary
+*.pth binary
+*.joblib binary
+
