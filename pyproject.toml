@@ -44,7 +44,7 @@ dependencies = [
 
 [project.urls]
 Repository = "https://github.com/asmaa-a-abdelwahab/PRING-PACKAGE"
-Documentation = "https://github.com/asmaa-a-abdelwahab/PRING-PACKAGE#readme"
+Documentation = "https://asmaa-a-abdelwahab.github.io/PRING-PACKAGE/"
 
 [project.optional-dependencies]
 dev = [

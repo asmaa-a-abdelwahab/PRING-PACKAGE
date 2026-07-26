@@ -378,7 +378,7 @@ def _protect_build_run_dir(run_dir: Path, *, overwrite: bool = False, resume: bo
     )
 
 
-def _copy_existing_run_artifacts(source_run_dir: Path, target_run_dir: Path) -> None:
+def _copy_existing_run_artifacts(source_run_dir: Path, target_run_dir: Path) -> dict:
     """Copy canonical run artifacts for non-destructive ``load-run --run-id``.
 
     ``load-run`` historically refreshed the source folder in place. When the user
@@ -404,7 +404,7 @@ def _copy_existing_run_artifacts(source_run_dir: Path, target_run_dir: Path) -> 
         "copied_at": datetime.now().isoformat(),
         "note": "Canonical graph artifacts copied from source run; raw HTTP cache intentionally not copied.",
     }
-    (target_run_dir / "manifest.json").write_text(json.dumps(load_manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    return load_manifest
 
 
 def _node_ref(label: object, key: dict) -> str:
@@ -545,13 +545,13 @@ def _load_existing_run_to_neo4j(
     log.info("📦 Existing run mode: source_run_dir=%s target_run_dir=%s", source_run_dir, store.run_dir)
     log.info("No PubChem extraction will be executed; loading canonical JSONL graph artifacts from disk.")
     if source_run_dir.resolve() != store.run_dir.resolve():
-        _copy_existing_run_artifacts(source_run_dir, store.run_dir)
+        load_manifest = _copy_existing_run_artifacts(source_run_dir, store.run_dir)
         log.info("Copied canonical artifacts from %s to %s before rematerialization.", source_run_dir, store.run_dir)
+    else:
+        load_manifest = _read_json_file(store.run_dir / "manifest.json")
 
     # Persist the effective load-run settings in the target manifest so QA reports
     # can resolve schema files and explain which label/candidate policy was used.
-    manifest_path = store.run_dir / "manifest.json"
-    load_manifest = _read_json_file(manifest_path)
     load_manifest.setdefault("paths", {})
     if settings.schema_dot_path:
         schema_path = _resolve_existing_path(settings.schema_dot_path, source_run_dir=source_run_dir) or Path(settings.schema_dot_path)
@@ -573,7 +573,7 @@ def _load_existing_run_to_neo4j(
         "candidate_pair_mode": settings.candidate_pair_mode,
         "max_candidate_missing_pairs": settings.max_candidate_missing_pairs,
     }
-    manifest_path.write_text(json.dumps(load_manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    store.write_manifest(load_manifest)
 
     node_count_before = _count_jsonl_files(store.nodes_dir)
     rel_count_before = _count_jsonl_files(store.rels_dir)

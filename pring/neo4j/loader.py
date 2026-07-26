@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from pring.config import Settings
@@ -137,6 +137,11 @@ def _sanitize_relationship_record(rel: Dict[str, Any]) -> Dict[str, Any]:
 class Neo4jLoader:
     settings: Settings
     driver: Neo4jDriver
+    _allowed_relationships: Optional[set[Tuple[str, str, str]]] = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
 
     def ensure_schema(self) -> None:
         self.driver.execute_many(constraint_statements(self.settings.node_keys))
@@ -151,6 +156,9 @@ class Neo4jLoader:
             raise ValueError("Settings.node_keys missing schema labels: " + ", ".join(sorted(missing_labels)))
 
         rel_map = relationship_type_map_from_dot(edges, overrides=self.settings.rel_type_overrides)
+        self._allowed_relationships = {
+            (src, dst, rtype) for (src, dst, _), rtype in rel_map.items()
+        }
         seen: Dict[Tuple[str, str, str], Tuple[str, str, str]] = {}
         for (src, dst, lab), rtype in rel_map.items():
             key = (src, dst, rtype)
@@ -195,6 +203,19 @@ SET n += row.props
             if not label:
                 continue
             safe_n = _sanitize_node_record(n)
+            required_keys = self.settings.node_keys.get(label)
+            if not required_keys:
+                raise ValueError(f"No node key mapping for label '{label}'")
+            missing_keys = [
+                key
+                for key in required_keys
+                if safe_n["key"].get(key) in (None, "")
+            ]
+            if missing_keys:
+                raise ValueError(
+                    f"Node '{label}' is missing required key value(s): "
+                    + ", ".join(missing_keys)
+                )
             buffers.setdefault(label, []).append(safe_n)
             if len(buffers[label]) >= self.settings.batch_size:
                 flush(label)
@@ -237,14 +258,53 @@ SET r += coalesce(row.props, {{}})
             buffers[key] = []
 
         for r in rels:
-            rtype = r.get("type") or rel_type_from_schema_label(r.get("schema_label", ""))
             s = r.get("start", {}) or {}
             e = r.get("end", {}) or {}
             sl, el = s.get("label"), e.get("label")
             if not (sl and el):
                 continue
+            schema_label = str(r.get("schema_label") or r.get("type") or "")
+            rtype = (
+                r.get("type")
+                or self.settings.rel_type_overrides.get(
+                    (sl, el, schema_label)
+                )
+                or rel_type_from_schema_label(schema_label)
+            )
+            if not rtype:
+                raise ValueError(
+                    f"Relationship {sl}->{el} has no schema label/type."
+                )
             key = (rtype, sl, el)
             safe_r = _sanitize_relationship_record(r)
+            for endpoint_name, endpoint_label, endpoint in (
+                ("start", sl, safe_r["start"]),
+                ("end", el, safe_r["end"]),
+            ):
+                required_keys = self.settings.node_keys.get(endpoint_label)
+                if not required_keys:
+                    raise ValueError(
+                        f"Missing node key mapping for endpoints: {sl}->{el}"
+                    )
+                missing_keys = [
+                    required_key
+                    for required_key in required_keys
+                    if endpoint["key"].get(required_key) in (None, "")
+                ]
+                if missing_keys:
+                    raise ValueError(
+                        f"Relationship {sl}-[{rtype}]->{el} {endpoint_name} "
+                        "endpoint is missing required key value(s): "
+                        + ", ".join(missing_keys)
+                    )
+            if (
+                self._allowed_relationships is not None
+                and (sl, el, rtype) not in self._allowed_relationships
+            ):
+                raise ValueError(
+                    f"Relationship {sl}-[{rtype}]->{el} is not allowed by "
+                    "the validated DOT schema."
+                )
             buffers.setdefault(key, []).append(safe_r)
             if len(buffers[key]) >= self.settings.batch_size:
                 flush(key)

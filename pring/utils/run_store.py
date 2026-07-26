@@ -4,9 +4,11 @@ import csv
 import hashlib
 import json
 import math
+import os
 import platform
 import random
 import re
+import subprocess
 from datetime import datetime, timezone
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -17,6 +19,60 @@ from pring import __version__
 from pring.transform.target_normalization import normalize_node_record
 from pring.transform.endpoint_normalization import normalize_endpoint_node_record, normalize_endpoint_props
 from pring.transform.metadata_normalization import normalize_metadata_node_record
+
+
+LABEL_POLICY_ID = "pring-endpoint-activity-v2-interval-aware"
+
+
+def _source_commit() -> Optional[str]:
+    """Return an explicitly supplied or locally discoverable source revision."""
+    configured = os.getenv("PRING_SOURCE_COMMIT", "").strip()
+    if configured:
+        return configured
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[2],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        commit = result.stdout.strip()
+        return commit or None
+    except Exception:
+        return None
+
+
+def _ordered_rows_sha256(rows: Iterable[dict[str, Any]]) -> str:
+    """Hash complete row content in its deterministic export order."""
+    digest = hashlib.sha256()
+    count = 0
+    for row in rows:
+        payload = json.dumps(
+            row,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=str,
+        ).encode("utf-8")
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+        count += 1
+    digest.update(count.to_bytes(8, "big"))
+    return digest.hexdigest()
+
+
+def _file_sha256(path: Path) -> Optional[str]:
+    """Return the digest of an exported artifact without loading it into memory."""
+    path = Path(path)
+    if not path.exists() or not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 ML_ENDPOINT_AGG_FEATURE_COLUMNS = [
@@ -190,17 +246,17 @@ class RunStore:
         enriched = dict(manifest)
         enriched.setdefault("manifest_schema", "pring-package-run-manifest-v2")
         enriched.setdefault("created_at_utc", datetime.now(timezone.utc).isoformat())
-        enriched.setdefault(
-            "framework",
-            {
-                "repository": "PRING-PACKAGE",
-                "package": "pring",
-                "version": __version__,
-                "python_version": platform.python_version(),
-                "python_implementation": platform.python_implementation(),
-                "platform": platform.platform(),
-            },
-        )
+        enriched.setdefault("label_policy_id", LABEL_POLICY_ID)
+        source_commit = _source_commit()
+        framework = dict(enriched.get("framework") or {})
+        framework.setdefault("repository", "PRING-PACKAGE")
+        framework.setdefault("package", "pring")
+        framework.setdefault("version", __version__)
+        framework.setdefault("source_commit", source_commit)
+        framework.setdefault("python_version", platform.python_version())
+        framework.setdefault("python_implementation", platform.python_implementation())
+        framework.setdefault("platform", platform.platform())
+        enriched["framework"] = framework
         serialized = json.dumps(enriched, indent=2, ensure_ascii=False, sort_keys=True)
         enriched["manifest_content_sha256"] = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
         path.write_text(
@@ -1397,6 +1453,23 @@ class RunStore:
 
         training_pair_rows = pair_rows + negative_rows
         link_prediction_pair_rows = training_pair_rows + candidate_rows
+        train_pair_rows = [
+            row for row in training_pair_rows
+            if str(row.get("split") or "").strip().lower() == "train"
+        ]
+        train_compound_refs = {
+            str(row.get("compound_node_ref") or "").strip()
+            for row in train_pair_rows
+            if str(row.get("compound_node_ref") or "").strip()
+        }
+        train_protein_refs = {
+            str(row.get("protein_node_ref") or "").strip()
+            for row in train_pair_rows
+            if str(row.get("protein_node_ref") or "").strip()
+        }
+        train_endpoint_refs: set[str] = set()
+        for row in train_pair_rows:
+            train_endpoint_refs.update(_split_ref_list(row.get("evidence_endpoints")))
 
         heldout_pair_keys = {
             (str(r.get("compound_node_ref") or ""), str(r.get("protein_node_ref") or ""))
@@ -1417,14 +1490,26 @@ class RunStore:
             if any((c, p) in heldout_pair_keys for c in compounds for p in proteins):
                 heldout_interaction_refs.add(interaction_ref)
         heldout_evidence_nodes = heldout_interaction_refs | heldout_endpoint_refs | heldout_measuregroup_refs
+        heldout_compound_refs = {
+            compound_ref for compound_ref, _protein_ref in heldout_pair_keys
+        }
+        edge_index_transductive_outcome_safe_rows = []
         edge_index_train_only_rows = []
         edge_index_holdout_removed_rows = []
         for edge in edge_rows:
-            touches_heldout = (
-                str(edge.get("start_node_ref") or "") in heldout_evidence_nodes
-                or str(edge.get("end_node_ref") or "") in heldout_evidence_nodes
+            start_ref = str(edge.get("start_node_ref") or "")
+            end_ref = str(edge.get("end_node_ref") or "")
+            touches_heldout_evidence = (
+                start_ref in heldout_evidence_nodes
+                or end_ref in heldout_evidence_nodes
             )
-            if touches_heldout:
+            touches_heldout_compound = (
+                start_ref in heldout_compound_refs
+                or end_ref in heldout_compound_refs
+            )
+            if not touches_heldout_evidence:
+                edge_index_transductive_outcome_safe_rows.append(dict(edge))
+            if touches_heldout_evidence or touches_heldout_compound:
                 edge_index_holdout_removed_rows.append(dict(edge))
             else:
                 edge_index_train_only_rows.append(dict(edge))
@@ -1436,6 +1521,15 @@ class RunStore:
             guard.checkpoint("ml:features:compound", force=True)
         protein_feature_rows = _build_protein_feature_rows(node_records_by_ref, node_id_by_ref, protein_annotation_maps=protein_annotation_maps)
         protembed_feature_rows = _build_protembed_feature_rows(node_records_by_ref, node_id_by_ref)
+        train_protein_accessions = {
+            _uniprot_acc_from_protein_id(str(_parse_node_ref(ref)[1].get("protein_id") or ""))
+            for ref in train_protein_refs
+        }
+        train_protembed_refs = {
+            str(row.get("node_ref") or "").strip()
+            for row in protembed_feature_rows
+            if str(row.get("uniprot_acc") or "").strip() in train_protein_accessions
+        }
         if guard is not None:
             guard.checkpoint("ml:features:protein", force=True)
         endpoint_feature_rows = _build_endpoint_feature_rows(
@@ -1453,21 +1547,25 @@ class RunStore:
                 self.ml_dir / "node_features_compound_normalized.csv",
                 compound_feature_rows,
                 id_columns={"node_id", "node_ref", "cid", "preferred_name"},
+                fit_node_refs=train_compound_refs,
             ),
             "protein": _write_normalized_feature_table(
                 self.ml_dir / "node_features_protein_normalized.csv",
                 protein_feature_rows,
                 id_columns={"node_id", "node_ref", "protein_id", "uniprot_id", "name", "cyp_symbol"},
+                fit_node_refs=train_protein_refs,
             ),
             "protembed": _write_normalized_feature_table(
                 self.ml_dir / "node_features_protembed_normalized.csv",
                 protembed_feature_rows,
                 id_columns={"node_id", "node_ref", "embedding_id", "protein_id", "uniprot_acc", "method", "model_family", "model_name"},
+                fit_node_refs=train_protembed_refs,
             ),
             "endpoint": _write_normalized_feature_table(
                 self.ml_dir / "node_features_endpoint_normalized.csv",
                 endpoint_feature_rows,
                 id_columns={"node_id", "node_ref", "endpoint_id", "endpoint_type", "activity_label_thresholded", "supervision_label"},
+                fit_node_refs=train_endpoint_refs,
             ),
         }
         model_matrix_summary = {
@@ -1475,21 +1573,25 @@ class RunStore:
                 self.ml_dir / "node_features_compound_model_matrix.csv",
                 compound_feature_rows,
                 id_columns={"node_id", "node_ref", "cid", "preferred_name"},
+                fit_node_refs=train_compound_refs,
             ),
             "protein": _write_model_matrix_feature_table(
                 self.ml_dir / "node_features_protein_model_matrix.csv",
                 protein_feature_rows,
                 id_columns={"node_id", "node_ref", "protein_id", "uniprot_id", "name", "cyp_symbol"},
+                fit_node_refs=train_protein_refs,
             ),
             "protembed": _write_model_matrix_feature_table(
                 self.ml_dir / "node_features_protembed_model_matrix.csv",
                 protembed_feature_rows,
                 id_columns={"node_id", "node_ref", "embedding_id", "protein_id", "uniprot_acc", "method", "model_family", "model_name"},
+                fit_node_refs=train_protembed_refs,
             ),
             "endpoint": _write_model_matrix_feature_table(
                 self.ml_dir / "node_features_endpoint_model_matrix.csv",
                 endpoint_feature_rows,
                 id_columns={"node_id", "node_ref", "endpoint_id", "endpoint_type", "activity_label_thresholded", "supervision_label"},
+                fit_node_refs=train_endpoint_refs,
             ),
         }
         tensor_summary = {
@@ -1497,27 +1599,39 @@ class RunStore:
                 self.ml_dir / "node_features_compound_tensor.csv",
                 compound_feature_rows,
                 id_columns={"node_id", "node_ref", "cid", "preferred_name"},
+                fit_node_refs=train_compound_refs,
             ),
             "protein": _write_strict_tensor_feature_table(
                 self.ml_dir / "node_features_protein_tensor.csv",
                 protein_feature_rows,
                 id_columns={"node_id", "node_ref", "protein_id", "uniprot_id", "name", "cyp_symbol"},
+                fit_node_refs=train_protein_refs,
             ),
             "protembed": _write_strict_tensor_feature_table(
                 self.ml_dir / "node_features_protembed_tensor.csv",
                 protembed_feature_rows,
                 id_columns={"node_id", "node_ref", "embedding_id", "protein_id", "uniprot_acc", "method", "model_family", "model_name"},
+                fit_node_refs=train_protembed_refs,
             ),
             "endpoint": _write_strict_tensor_feature_table(
                 self.ml_dir / "node_features_endpoint_tensor.csv",
                 endpoint_feature_rows,
                 id_columns={"node_id", "node_ref", "endpoint_id", "endpoint_type", "activity_label_thresholded", "supervision_label"},
+                fit_node_refs=train_endpoint_refs,
             ),
         }
+        (self.ml_dir / "normalization_stats.json").write_text(
+            json.dumps(normalization_summary, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
         _write_rows_csv(self.ml_dir / "node_mapping.csv", node_mapping_rows)
         _write_rows_csv(self.ml_dir / "relation_mapping.csv", relation_mapping_rows)
         _write_rows_csv(self.ml_dir / "edge_index.csv", edge_rows)
+        _write_rows_csv(
+            self.ml_dir / "edge_index_transductive_outcome_safe.csv",
+            edge_index_transductive_outcome_safe_rows,
+        )
         _write_rows_csv(self.ml_dir / "edge_index_train_only.csv", edge_index_train_only_rows)
         _write_rows_csv(self.ml_dir / "edge_index_holdout_removed_edges.csv", edge_index_holdout_removed_rows)
         _write_rows_csv(self.ml_dir / "node_features_compound.csv", compound_feature_rows)
@@ -1586,6 +1700,9 @@ class RunStore:
         ml_feature_export_summary.setdefault("files", {})["pyg_export/heterodata.pt"] = pyg_export_summary
         ml_feature_export_summary.setdefault("files", {})["modeling/"] = modeling_stage_export_summary
         ml_feature_export_summary.setdefault("files", {})["edge_index_train_only.csv"] = {"rows": len(edge_index_train_only_rows)}
+        ml_feature_export_summary.setdefault("files", {})["edge_index_transductive_outcome_safe.csv"] = {
+            "rows": len(edge_index_transductive_outcome_safe_rows)
+        }
         ml_feature_export_summary.setdefault("files", {})["edge_index_holdout_removed_edges.csv"] = {"rows": len(edge_index_holdout_removed_rows)}
         ml_feature_export_summary["leakage_control_export"] = {
             "train_only_edge_index_file": "edge_index_train_only.csv",
@@ -1594,11 +1711,18 @@ class RunStore:
             "heldout_interaction_nodes": len(heldout_interaction_refs),
             "heldout_endpoint_nodes": len(heldout_endpoint_refs),
             "heldout_measuregroup_nodes": len(heldout_measuregroup_refs),
+            "heldout_compound_nodes": len(heldout_compound_refs),
             "removed_edge_count": len(edge_index_holdout_removed_rows),
-            "note": "Use edge_index_train_only.csv for message passing when validating/test-scoring held-out curated links to avoid evidence-path leakage.",
+            "evaluation_protocol": "cold_compound_inductive",
+            "transductive_outcome_safe_edge_index_file": "edge_index_transductive_outcome_safe.csv",
+            "preprocessing_fit_scope": "train_only",
+            "train_compound_nodes_for_fit": len(train_compound_refs),
+            "train_protein_nodes_for_fit": len(train_protein_refs),
+            "train_protembed_nodes_for_fit": len(train_protembed_refs),
+            "train_endpoint_nodes_for_fit": len(train_endpoint_refs),
+            "note": "edge_index_train_only.csv removes held-out compound neighborhoods and their outcome evidence for cold-compound evaluation. The separate transductive file removes outcome evidence but retains held-out compound context and must be reported as transductive.",
         }
         ml_feature_export_summary.setdefault("case_study_report", {}).setdefault("leakage_control", {}).update(ml_feature_export_summary["leakage_control_export"])
-        (self.ml_dir / "normalization_stats.json").write_text(json.dumps(normalization_summary, indent=2, ensure_ascii=False), encoding="utf-8")
         (self.ml_dir / "modeling_readiness_manifest.json").write_text(json.dumps(ml_feature_export_summary, indent=2, ensure_ascii=False), encoding="utf-8")
         (self.ml_dir / "gcn_case_study_report.json").write_text(
             json.dumps(ml_feature_export_summary.get("case_study_report", {}), indent=2, ensure_ascii=False),
@@ -1607,6 +1731,49 @@ class RunStore:
         (self.ml_dir / "feature_column_manifest.json").write_text(
             json.dumps(ml_feature_export_summary.get("feature_column_manifest", {}), indent=2, ensure_ascii=False),
             encoding="utf-8",
+        )
+
+        # The stage export is created before the aggregate readiness manifests
+        # to avoid recursive manifest content. Synchronize those late-written
+        # artifacts now so Stage 3 remains a self-contained, reproducible input.
+        stage3_dir = self.ml_dir / "modeling" / "stage3_heterogeneous_gnn"
+        late_stage3_files = [
+            "normalization_stats.json",
+            "modeling_readiness_manifest.json",
+            "gcn_case_study_report.json",
+            "feature_column_manifest.json",
+        ]
+        copied_files = modeling_stage_export_summary[
+            "stage3_heterogeneous_gnn"
+        ].setdefault("copied_files", [])
+        for name in late_stage3_files:
+            if _copy_file_if_exists(self.ml_dir / name, stage3_dir / name):
+                if name not in copied_files:
+                    copied_files.append(name)
+        copied_files.sort()
+        modeling_stage_export_summary["stage3_heterogeneous_gnn"][
+            "copied_file_count"
+        ] = len(copied_files)
+        (self.ml_dir / "modeling" / "modeling_stage_manifest.json").write_text(
+            json.dumps(
+                modeling_stage_export_summary,
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        # Reflect the finalized stage-copy inventory in the root readiness file.
+        (self.ml_dir / "modeling_readiness_manifest.json").write_text(
+            json.dumps(
+                ml_feature_export_summary,
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        _copy_file_if_exists(
+            self.ml_dir / "modeling_readiness_manifest.json",
+            stage3_dir / "modeling_readiness_manifest.json",
         )
 
         summary["label_config"] = {
@@ -1618,6 +1785,7 @@ class RunStore:
             "relation_mapping_records": len(relation_mapping_rows),
             "edge_index_records": len(edge_rows),
             "edge_index_train_only_records": len(edge_index_train_only_rows),
+            "edge_index_transductive_outcome_safe_records": len(edge_index_transductive_outcome_safe_rows),
             "edge_index_holdout_removed_records": len(edge_index_holdout_removed_rows),
             "compound_feature_records": len(compound_feature_rows),
             "protein_feature_records": len(protein_feature_rows),
@@ -2635,7 +2803,7 @@ def _build_ml_feature_export_summary(
             "0": "curated inactive or weak endpoint evidence when configured",
             "unknown": "unobserved compound-target candidate; not a true negative",
         },
-        "recommended_gnn_setup": "Prefer heterogeneous link prediction (HGT/R-GCN/HeteroGraphSAGE) using Compound, Protein, ProtEmbed, Endpoint, Interaction, BindingDB and SIMILAR_TO relations. Use edge_index_train_only.csv for validation/test message passing; homogeneous GCN over projected Compound/Protein nodes is a baseline only.",
+        "recommended_gnn_setup": "Prefer heterogeneous link prediction (HGT/R-GCN/HeteroGraphSAGE) using Compound, Protein, ProtEmbed, Endpoint, Interaction, BindingDB and SIMILAR_TO relations. Use edge_index_train_only.csv for cold-compound validation/test message passing; use edge_index_transductive_outcome_safe.csv only for explicitly transductive evaluations. Homogeneous GCN over projected Compound/Protein nodes is a baseline only.",
     }
 
 
@@ -2647,7 +2815,26 @@ def _split_ref_list(value: Any) -> set[str]:
     return {part.strip() for part in text.split("|") if part.strip()}
 
 
-def _write_normalized_feature_table(path: Path, rows: list[dict[str, Any]], *, id_columns: set[str]) -> dict[str, Any]:
+def _fit_rows_for_stats(
+    rows: list[dict[str, Any]],
+    fit_node_refs: Optional[set[str]],
+) -> tuple[list[dict[str, Any]], str]:
+    if fit_node_refs is None:
+        return rows, "all_rows_legacy"
+    fit_rows = [
+        row for row in rows
+        if _stringify_cell(row.get("node_ref")).strip() in fit_node_refs
+    ]
+    return fit_rows, "train_only"
+
+
+def _write_normalized_feature_table(
+    path: Path,
+    rows: list[dict[str, Any]],
+    *,
+    id_columns: set[str],
+    fit_node_refs: Optional[set[str]] = None,
+) -> dict[str, Any]:
     """Write an augmented feature table with z-scored numeric columns.
 
     The original feature exports remain untouched. This companion table keeps
@@ -2656,9 +2843,10 @@ def _write_normalized_feature_table(path: Path, rows: list[dict[str, Any]], *, i
     quick baseline GCN/ML experiments; production loaders may still apply their
     own split-specific scaling.
     """
+    fit_rows, fit_scope = _fit_rows_for_stats(rows, fit_node_refs)
     numeric_values: dict[str, list[float]] = {}
     rejected: set[str] = set()
-    for row in rows:
+    for row in fit_rows:
         for key, value in row.items():
             if key in id_columns or str(key).startswith(("key_", "props_")):
                 continue
@@ -2710,6 +2898,8 @@ def _write_normalized_feature_table(path: Path, rows: list[dict[str, Any]], *, i
     _write_rows_csv(path, normalized_rows, columns=_columns(normalized_rows) or _columns(rows))
     return {
         "rows": len(rows),
+        "fit_rows": len(fit_rows),
+        "fit_scope": fit_scope,
         "normalized_numeric_columns": len(numeric_cols),
         "numeric_columns": numeric_cols,
         "missing_numeric_cells_imputed": missing_cells,
@@ -2776,7 +2966,13 @@ def _is_model_metadata_column(column: str, id_columns: set[str]) -> bool:
     return base.endswith(_MODEL_METADATA_SUFFIXES)
 
 
-def _write_model_matrix_feature_table(path: Path, rows: list[dict[str, Any]], *, id_columns: set[str]) -> dict[str, Any]:
+def _write_model_matrix_feature_table(
+    path: Path,
+    rows: list[dict[str, Any]],
+    *,
+    id_columns: set[str],
+    fit_node_refs: Optional[set[str]] = None,
+) -> dict[str, Any]:
     """Write a tensor-ready numeric feature matrix with no NaN/inf values.
 
     The output keeps only stable identifier columns plus numeric ``x_*`` feature
@@ -2786,11 +2982,12 @@ def _write_model_matrix_feature_table(path: Path, rows: list[dict[str, Any]], *,
     loaders without pandas-side imputation.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    fit_rows, fit_scope = _fit_rows_for_stats(rows, fit_node_refs)
     numeric_values: dict[str, list[float]] = {}
     rejected: set[str] = set()
     excluded_metadata: set[str] = set()
     id_cols_present = sorted({c for row in rows for c in row.keys() if c in id_columns})
-    for row in rows:
+    for row in fit_rows:
         for key, value in row.items():
             key_text = str(key)
             if _is_model_metadata_column(key_text, id_columns):
@@ -2850,6 +3047,8 @@ def _write_model_matrix_feature_table(path: Path, rows: list[dict[str, Any]], *,
     _write_rows_csv(path, matrix_rows, columns=cols)
     return {
         "rows": len(rows),
+        "fit_rows": len(fit_rows),
+        "fit_scope": fit_scope,
         "numeric_feature_columns": len(numeric_cols),
         "matrix_columns": len(cols),
         "missing_numeric_cells_imputed": missing_cells,
@@ -2862,7 +3061,13 @@ def _write_model_matrix_feature_table(path: Path, rows: list[dict[str, Any]], *,
     }
 
 
-def _write_strict_tensor_feature_table(path: Path, rows: list[dict[str, Any]], *, id_columns: set[str]) -> dict[str, Any]:
+def _write_strict_tensor_feature_table(
+    path: Path,
+    rows: list[dict[str, Any]],
+    *,
+    id_columns: set[str],
+    fit_node_refs: Optional[set[str]] = None,
+) -> dict[str, Any]:
     """Write a numeric-only tensor CSV plus a row-alignment metadata sidecar.
 
     Unlike ``*_model_matrix.csv``, this file intentionally contains no node IDs,
@@ -2873,12 +3078,12 @@ def _write_strict_tensor_feature_table(path: Path, rows: list[dict[str, Any]], *
     matrix_path = Path(path).with_name(Path(path).name.replace("_tensor.csv", "_model_matrix.csv"))
     # Reuse the exact same numeric feature discovery/imputation rules as the
     # model-matrix exporter to keep feature columns consistent.
-    temp_rows: list[dict[str, Any]] = []
+    fit_rows, fit_scope = _fit_rows_for_stats(rows, fit_node_refs)
     numeric_values: dict[str, list[float]] = {}
     rejected: set[str] = set()
     excluded_metadata: set[str] = set()
     id_cols_present = sorted({c for row in rows for c in row.keys() if c in id_columns})
-    for row in rows:
+    for row in fit_rows:
         for key, value in row.items():
             key_text = str(key)
             if _is_model_metadata_column(key_text, id_columns):
@@ -2944,6 +3149,8 @@ def _write_strict_tensor_feature_table(path: Path, rows: list[dict[str, Any]], *
     _write_rows_csv(metadata_path, metadata_rows, columns=["row_idx"] + id_cols_present)
     return {
         "rows": len(rows),
+        "fit_rows": len(fit_rows),
+        "fit_scope": fit_scope,
         "tensor_columns": len(tensor_cols),
         "numeric_feature_columns": len(numeric_cols),
         "metadata_file": metadata_path.name,
@@ -3175,7 +3382,8 @@ def _write_pyg_export(
                 data[edge_type].edge_index = edge_index
             data.graph_scope = "train_only"
             data.full_edge_index_available_in = "heterodata_payload.pt:edge_index_by_type"
-            data.train_edge_index_contract = "heldout_interaction_evidence_removed"
+            data.train_edge_index_contract = "heldout_compound_neighborhood_and_interaction_evidence_removed"
+            data.evaluation_protocol = "cold_compound_inductive"
             link_store = data[("Compound", "interacts_with", "Protein")]
             link_store.edge_label_index = link_edge_label_index
             link_store.edge_label = link_edge_label
@@ -3195,7 +3403,8 @@ def _write_pyg_export(
         "# PRING PyG/DGL-friendly export\n\n"
         "This folder contains heterogeneous graph/link-prediction exports for the CYP450 case study. "
         "Use `heterodata.pt` for leakage-safe training/validation/test message passing. "
-        "When it is a PyG HeteroData object, its edges are train-only and `graph_scope` is `train_only`; "
+        "When it is a PyG HeteroData object, held-out compound neighborhoods and outcome evidence are removed, "
+        "its `graph_scope` is `train_only`, and `evaluation_protocol` is `cold_compound_inductive`; "
         "the full and train-only edge dictionaries remain explicit in `heterodata_payload.pt`. "
         "Never use the full edge dictionary for held-out evaluation.\n",
         encoding="utf-8",
@@ -3206,6 +3415,7 @@ def _write_pyg_export(
         "torch_available": torch_written,
         "torch_geometric_heterodata": torch_geometric_written,
         "heterodata_default_graph_scope": "train_only",
+        "evaluation_protocol": "cold_compound_inductive",
         "full_graph_location": "heterodata_payload.pt:edge_index_by_type",
         "torch_error": torch_error,
         "node_type_count": len(node_type_mapping),
@@ -3390,6 +3600,7 @@ def _write_modeling_stage_exports(
         "node_mapping.csv",
         "relation_mapping.csv",
         "edge_index.csv",
+        "edge_index_transductive_outcome_safe.csv",
         "edge_index_train_only.csv",
         "edge_index_holdout_removed_edges.csv",
         "compound_target_training_pairs.csv",
@@ -3435,31 +3646,74 @@ def _write_modeling_stage_exports(
     (stage3_dir / "README.md").write_text(
         "# Stage 3 — Heterogeneous GNN exports\n\n"
         "Use this folder for R-GCN, HGT, HeteroGraphSAGE, or an MLP decoder over Compound/Protein embeddings. "
-        "For leakage-safe validation/test scoring, use `edge_index_train_only.csv` or `pyg_export/heterodata.pt` with "
-        "the train-only edge-index payload.  `candidate_missing_compound_target_pairs.csv` contains unknown pairs for "
+        "For cold-compound validation/test scoring, use `edge_index_train_only.csv` or `pyg_export/heterodata.pt`; "
+        "held-out compound neighborhoods and outcome evidence are removed. "
+        "`edge_index_transductive_outcome_safe.csv` retains held-out compound context and must be reported as transductive. "
+        "`candidate_missing_compound_target_pairs.csv` contains unknown pairs for "
         "ranking; do not treat these as confirmed negatives.\n",
         encoding="utf-8",
     )
 
-    split_registry = sorted({
+    split_registry_rows = sorted(
         (
-            _stringify_cell(row.get("split_group")),
-            _stringify_cell(row.get("split")),
-            _stringify_cell(row.get("split_strategy")),
-        )
-        for row in training_pair_rows
-    })
-    split_registry_id = hashlib.sha256(
-        json.dumps(split_registry, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            {
+                "compound_node_ref": _stringify_cell(row.get("compound_node_ref")),
+                "protein_node_ref": _stringify_cell(row.get("protein_node_ref")),
+                "label": _stringify_cell(row.get("label")),
+                "split_group": _stringify_cell(row.get("split_group")),
+                "split": _stringify_cell(row.get("split")),
+                "split_strategy": _stringify_cell(row.get("split_strategy")),
+            }
+            for row in training_pair_rows
+        ),
+        key=lambda row: (
+            row["compound_node_ref"],
+            row["protein_node_ref"],
+            row["label"],
+        ),
+    )
+    split_registry_id = _ordered_rows_sha256(split_registry_rows)
+    content_hashes = {
+        "node_mapping_sha256": _ordered_rows_sha256(node_mapping_rows),
+        "edge_index_sha256": _ordered_rows_sha256(edge_rows),
+        "train_edge_index_sha256": _ordered_rows_sha256(train_edge_rows),
+        "training_pairs_sha256": _ordered_rows_sha256(training_pair_rows),
+        "candidate_pairs_sha256": _ordered_rows_sha256(candidate_rows),
+    }
+    for name in [
+        "node_features_compound_tensor.csv",
+        "node_features_protein_tensor.csv",
+        "node_features_protembed_tensor.csv",
+        "node_features_endpoint_tensor.csv",
+        "node_features_compound_model_matrix.csv",
+        "node_features_protein_model_matrix.csv",
+        "node_features_protembed_model_matrix.csv",
+        "node_features_endpoint_model_matrix.csv",
+        "normalization_stats.json",
+    ]:
+        digest = _file_sha256(ml_dir / name)
+        if digest:
+            content_hashes[f"{name}_sha256"] = digest
+    feature_schema_id = hashlib.sha256(
+        json.dumps(
+            {
+                name: content_hashes.get(f"{name}_sha256")
+                for name in sorted(
+                    path.name
+                    for path in ml_dir.glob("node_features_*_tensor.csv")
+                )
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
     ).hexdigest()
     dataset_id = hashlib.sha256(
         json.dumps(
             {
-                "node_count": len(node_mapping_rows),
-                "edge_count": len(edge_rows),
-                "training_pair_count": len(training_pair_rows),
-                "candidate_pair_count": len(candidate_rows),
+                "content_hashes": content_hashes,
                 "split_registry_id": split_registry_id,
+                "feature_schema_id": feature_schema_id,
+                "label_policy_id": LABEL_POLICY_ID,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -3470,7 +3724,11 @@ def _write_modeling_stage_exports(
         "repository": "PRING-PACKAGE",
         "dataset_id": dataset_id,
         "split_registry_id": split_registry_id,
-        "split_registry_group_count": len(split_registry),
+        "split_registry_row_count": len(split_registry_rows),
+        "content_hashes": content_hashes,
+        "feature_schema_id": feature_schema_id,
+        "label_policy_id": LABEL_POLICY_ID,
+        "graph_scope": "cold_compound_inductive_train_only",
         "determinism": {
             "split_algorithm": "sha1_modulo_10_over_compound_similarity_component",
             "split_ratios": {"train": 0.7, "validation": 0.2, "test": 0.1},
@@ -3501,6 +3759,7 @@ def _write_modeling_stage_exports(
             "train_only_edges": len(train_edge_rows),
             "heldout_removed_edges": len(holdout_removed_edge_rows),
             "link_prediction_pairs": len(link_prediction_pair_rows),
+            "evaluation_protocol": "cold_compound_inductive",
         },
         "label_semantics": {
             "1": "curated active/potent interaction evidence",
@@ -3512,7 +3771,7 @@ def _write_modeling_stage_exports(
             "exclude_from_training": True,
             "note": "Production predictions are inference records and must never be materialized as supervised labels or training evidence.",
         },
-        "leakage_control_note": "Use train-only graph exports for validation/test scoring. Held-out Interaction evidence paths are removed from edge_index_train_only.csv.",
+        "leakage_control_note": "Use edge_index_train_only.csv for cold-compound evaluation; held-out compound neighborhoods and Interaction evidence are removed. Use the separately named transductive export only for explicitly transductive claims.",
     }
     (out_dir / "modeling_stage_manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
     (out_dir / "README.md").write_text(
@@ -3785,7 +4044,9 @@ def _endpoint_supervision_label(
     evidence, 0 for curated inactive evidence, and None for ambiguous,
     unspecified, or unsupported endpoints. If ``activity_threshold_um`` is set,
     numeric molar potency values weaker than the threshold can be exported as
-    negative/weak evidence when ``weak_activity_as_negative`` is true.
+    negative/weak evidence when ``weak_activity_as_negative`` is true. Interval
+    qualifiers are interpreted conservatively: a bound is labeled only when it
+    proves the value lies on one side of the configured threshold.
     """
     if not endpoint_record:
         return None
@@ -3801,20 +4062,42 @@ def _endpoint_supervision_label(
     # supervision_label / supervision_label_name from the thresholding step.
     # Without this shortcut, reports could incorrectly classify all endpoints as
     # ambiguous when the raw outcome fields were unavailable in that artifact.
-    direct_label = g("props_supervision_label", "supervision_label")
-    if direct_label not in (None, ""):
-        text = str(direct_label).strip().lower()
-        if text in {"1", "1.0", "true", "active", "positive"}:
+    # A previously exported direct label may have been derived under another
+    # threshold. Reuse it only when no explicit threshold policy is being
+    # applied; thresholded rematerialization must recompute from raw evidence.
+    if activity_threshold_um is None:
+        direct_label = g("props_supervision_label", "supervision_label")
+        if direct_label not in (None, ""):
+            text = str(direct_label).strip().lower()
+            if text in {"1", "1.0", "true", "active", "positive"}:
+                return 1
+            if text in {"0", "0.0", "false", "inactive", "negative", "inactive_or_weak"}:
+                return 0
+        direct_label_name = _norm_label(
+            g(
+                "props_supervision_label_name",
+                "supervision_label_name",
+                "props_activity_label",
+                "activity_label",
+            )
+        )
+        if direct_label_name in {"active", "positive", "curated_active"}:
             return 1
-        if text in {"0", "0.0", "false", "inactive", "negative", "inactive_or_weak"}:
+        if direct_label_name in {
+            "inactive",
+            "inactive_or_weak",
+            "negative",
+            "curated_inactive",
+        }:
             return 0
-    direct_label_name = _norm_label(g("props_supervision_label_name", "supervision_label_name", "props_activity_label", "activity_label"))
-    if direct_label_name in {"active", "positive", "curated_active"}:
-        return 1
-    if direct_label_name in {"inactive", "inactive_or_weak", "negative", "curated_inactive"}:
-        return 0
-    if direct_label_name in {"ambiguous", "ambiguous_or_unlabeled", "unknown", "unlabeled", "curated_unlabeled"}:
-        return None
+        if direct_label_name in {
+            "ambiguous",
+            "ambiguous_or_unlabeled",
+            "unknown",
+            "unlabeled",
+            "curated_unlabeled",
+        }:
+            return None
 
     values = [
         g("props_activity_flag", "activity_flag"),
@@ -3825,12 +4108,18 @@ def _endpoint_supervision_label(
         g("props_activity_label", "activity_label"),
     ]
     normalized_values = {_norm_label(v) for v in values if _norm_label(v)}
-    if normalized_values & {"inactive", "negative", "no_activity", "not_active"}:
-        return 0
-    if normalized_values & {"inconclusive", "indeterminate", "ambiguous", "unspecified", "unknown"}:
-        explicit_ambiguous = True
-    else:
-        explicit_ambiguous = False
+    explicit_inactive = bool(
+        normalized_values & {"inactive", "negative", "no_activity", "not_active"}
+    )
+    explicit_active = bool(
+        normalized_values & {"active", "hit", "positive"}
+    )
+    explicit_ambiguous = bool(
+        normalized_values
+        & {"inconclusive", "indeterminate", "ambiguous", "unspecified", "unknown"}
+    )
+    if explicit_ambiguous or (explicit_active and explicit_inactive):
+        return None
 
     endpoint_type = _norm_label(g("props_endpoint_type", "endpoint_type", "props_type", "type"))
     outcome_type = _norm_label(g("props_outcome_label", "outcome_label", "props_label", "label"))
@@ -3843,18 +4132,31 @@ def _endpoint_supervision_label(
             if molar is not None:
                 threshold_molar = float(activity_threshold_um) * 1e-6
                 qualifier = _norm_label(g("props_qualifier_symbol", "qualifier_symbol", "props_qualifier", "qualifier"))
-                # <= IC50/Ki/Kd threshold => active. Values clearly above the
-                # threshold can be treated as weak/negative only when requested.
-                if molar <= threshold_molar or qualifier in {"<", "<=", "less_than", "le"}:
-                    return 1
-                if weak_activity_as_negative and molar > threshold_molar:
-                    return 0
-        return 1
+                lower_bound = qualifier in {">", ">=", "greater_than", "ge"}
+                upper_bound = qualifier in {"<", "<=", "less_than", "le"}
+                if upper_bound:
+                    numeric_label = 1 if molar <= threshold_molar else None
+                    if numeric_label == 1 and explicit_inactive:
+                        return None
+                    return numeric_label
+                if lower_bound:
+                    if molar >= threshold_molar and weak_activity_as_negative:
+                        return None if explicit_active else 0
+                    return None
+                if molar <= threshold_molar:
+                    return None if explicit_inactive else 1
+                if weak_activity_as_negative:
+                    return None if explicit_active else 0
+                return None
+            # A numeric potency without a convertible molar unit cannot be
+            # compared with a micromolar threshold.
+            return None
+        return None if explicit_inactive else 1
 
-    if normalized_values & {"active", "hit", "positive"}:
+    if explicit_inactive:
+        return 0
+    if explicit_active:
         return 1
-    if explicit_ambiguous:
-        return None
     return None
 
 

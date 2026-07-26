@@ -1,5 +1,19 @@
 # PRING modeling exports
 
+All generated normalized, model-matrix, and strict tensor feature statistics are
+fitted from training-partition nodes only. Validation, test, and candidate rows
+are transformed using those frozen statistics. Summaries record
+`fit_scope=train_only` and the number of nodes used for each node type.
+
+`dataset_id` is content-addressed from complete node, edge, train-edge,
+supervised-pair, and candidate-pair hashes. `split_registry_id` includes every
+supervised pair assignment rather than only aggregate split counts.
+
+Endpoint supervision uses the versioned
+`pring-endpoint-activity-v2-interval-aware` policy. Inequality-qualified
+measurements are labeled only when the bound proves that the value lies on one
+side of the configured activity threshold; otherwise they remain ambiguous.
+
 PRING now writes stage-organized modeling artifacts under:
 
 ```text

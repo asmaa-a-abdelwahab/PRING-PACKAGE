@@ -11,5 +11,6 @@ htmlcov/
 runs/
 .pytest_cache/
 .hf_cache/
+local_logs/
 schema_old/
 pring.zip

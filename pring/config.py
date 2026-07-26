@@ -161,8 +161,10 @@ class Settings:
     compound_similarity_method: str = "2d"
     compound_similarity_threshold: int = 90
     # Optional supervised-label controls for CYP450 GCN exports.
-    # None means any numeric potency endpoint is positive evidence; when set,
-    # values above the threshold can be handled as weak/negative if requested.
+    # None means any numeric potency endpoint is positive evidence. When set,
+    # only values or qualified bounds that can be compared in molar units are
+    # labeled; stronger values are positive and weaker values become negative
+    # only when weak_activity_as_negative is explicitly enabled.
     activity_threshold_um: Optional[float] = None
     weak_activity_as_negative: bool = False
     max_candidate_missing_pairs: Optional[int] = None

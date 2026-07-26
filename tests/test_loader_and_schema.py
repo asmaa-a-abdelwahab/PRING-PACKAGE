@@ -100,6 +100,14 @@ def test_loader_upsert_nodes_requires_known_keys():
         loader.upsert_nodes([{"label": "Missing", "key": {"x": 1}, "props": {}}])
 
 
+def test_loader_upsert_nodes_rejects_missing_required_key_value():
+    loader = Neo4jLoader(settings=_settings(), driver=RecordingDriver())
+    with pytest.raises(ValueError, match="missing required key"):
+        loader.upsert_nodes(
+            [{"label": "Compound", "key": {"cid": ""}, "props": {}}]
+        )
+
+
 def test_loader_upsert_relationships_groups_by_type_and_pair():
     driver = RecordingDriver()
     loader = Neo4jLoader(settings=_settings(batch_size=1), driver=driver)
@@ -150,6 +158,48 @@ def test_loader_upsert_relationships_requires_known_endpoint_keys():
             "end": {"label": "Structure", "key": {"cid": 1}},
             "props": {},
         }])
+
+
+def test_loader_rejects_relationship_direction_outside_validated_schema(
+    tmp_path: Path,
+):
+    dot = tmp_path / "schema.dot"
+    dot.write_text(
+        'digraph G { Compound; Structure; '
+        'Compound -> Structure [label="HAS_STRUCTURE"]; }',
+        encoding="utf-8",
+    )
+    loader = Neo4jLoader(
+        settings=_settings(schema_dot_path=dot),
+        driver=RecordingDriver(),
+    )
+    loader.validate_against_dot_schema()
+    with pytest.raises(ValueError, match="not allowed by the validated DOT schema"):
+        loader.upsert_relationships(
+            [
+                {
+                    "schema_label": "HAS_STRUCTURE",
+                    "start": {"label": "Structure", "key": {"cid": 1}},
+                    "end": {"label": "Compound", "key": {"cid": 1}},
+                    "props": {},
+                }
+            ]
+        )
+
+
+def test_loader_rejects_relationship_endpoint_with_missing_key_value():
+    loader = Neo4jLoader(settings=_settings(), driver=RecordingDriver())
+    with pytest.raises(ValueError, match="endpoint is missing required key"):
+        loader.upsert_relationships(
+            [
+                {
+                    "schema_label": "HAS_STRUCTURE",
+                    "start": {"label": "Compound", "key": {"cid": None}},
+                    "end": {"label": "Structure", "key": {"cid": 1}},
+                    "props": {},
+                }
+            ]
+        )
 
 
 def test_loader_serializes_nested_properties_for_neo4j():

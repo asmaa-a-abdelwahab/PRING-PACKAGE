@@ -104,14 +104,37 @@ def test_runstore_exports_train_only_edge_index_and_normalized_features(tmp_path
     edge_index = (tmp_path / "graph" / "ml" / "edge_index.csv").read_text(encoding="utf-8-sig")
     edge_index_train = (tmp_path / "graph" / "ml" / "edge_index_train_only.csv").read_text(encoding="utf-8-sig")
     assert len(edge_index_train.splitlines()) < len(edge_index.splitlines())
+    assert f"Compound|cid={heldout_cid}" not in edge_index_train
+    assert (
+        tmp_path
+        / "graph"
+        / "ml"
+        / "edge_index_transductive_outcome_safe.csv"
+    ).exists()
     assert (tmp_path / "graph" / "ml" / "node_features_compound_normalized.csv").exists()
     assert (tmp_path / "graph" / "ml" / "normalization_stats.json").exists()
+    normalization = __import__("json").loads(
+        (tmp_path / "graph" / "ml" / "normalization_stats.json").read_text(encoding="utf-8")
+    )
+    assert normalization["compound"]["fit_scope"] == "train_only"
     tensor_header = (
         tmp_path / "graph" / "ml" / "node_features_compound_tensor.csv"
     ).read_text(encoding="utf-8-sig").splitlines()[0].split(",")
     assert "x_cid" not in tensor_header
     assert "x_properties_cid" not in tensor_header
     assert "missing_properties_cid" not in tensor_header
+    stage_manifest = __import__("json").loads(
+        (
+            tmp_path
+            / "graph"
+            / "ml"
+            / "modeling"
+            / "modeling_stage_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert stage_manifest["label_policy_id"].startswith("pring-endpoint-activity-v2")
+    assert stage_manifest["split_registry_row_count"] == 2
+    assert len(stage_manifest["content_hashes"]["training_pairs_sha256"]) == 64
 
     heterodata_path = tmp_path / "graph" / "ml" / "pyg_export" / "heterodata.pt"
     if heterodata_path.exists():
