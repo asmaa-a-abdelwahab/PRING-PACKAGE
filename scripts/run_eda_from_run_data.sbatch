@@ -13,8 +13,8 @@ set -euo pipefail
 
 # Usage examples:
 #   RUN_ID=cyp450_5enzymes_uncapped_gcn_ready sbatch scripts/run_eda_from_run_data.sbatch
-#   RUN_PATH=/home/asmaaali/PRING/runs/cyp450_5enzymes_uncapped_gcn_ready \
-#   OUTPUT_DIR=/home/asmaaali/PRING/runs/cyp450_5enzymes_uncapped_gcn_ready/analysis/eda \
+#   RUN_PATH=/home/asmaaali/PRING-PACKAGE/runs/cyp450_5enzymes_uncapped_gcn_ready \
+#   OUTPUT_DIR=/home/asmaaali/PRING-PACKAGE/runs/cyp450_5enzymes_uncapped_gcn_ready/analysis/eda \
 #   TOP_N=30 sbatch scripts/run_eda_from_run_data.sbatch
 
 PROJECT_DIR="${PROJECT_DIR:-$PWD}"

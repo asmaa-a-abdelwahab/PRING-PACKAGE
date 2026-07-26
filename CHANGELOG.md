@@ -1,0 +1,16 @@
+# Changelog
+
+## 0.2.0 — 2026-07-26
+
+- Align repository identity with `PRING-PACKAGE` while retaining the stable
+  `pring` Python import and CLI.
+- Add versioned, hashed run and modeling provenance.
+- Exclude projected identifier metadata from modeling tensors.
+- Make train-only edges the default PyG `HeteroData` graph.
+- Preserve parallel evidence relationships with deterministic identities.
+- Honor configured Neo4j encrypted transport.
+- Generate leakage-aware GDS projection scripts from registered training rows.
+
+## 0.1.0
+
+- Initial PRING package implementation.

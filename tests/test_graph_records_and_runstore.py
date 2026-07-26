@@ -106,3 +106,20 @@ def test_runstore_exports_train_only_edge_index_and_normalized_features(tmp_path
     assert len(edge_index_train.splitlines()) < len(edge_index.splitlines())
     assert (tmp_path / "graph" / "ml" / "node_features_compound_normalized.csv").exists()
     assert (tmp_path / "graph" / "ml" / "normalization_stats.json").exists()
+    tensor_header = (
+        tmp_path / "graph" / "ml" / "node_features_compound_tensor.csv"
+    ).read_text(encoding="utf-8-sig").splitlines()[0].split(",")
+    assert "x_cid" not in tensor_header
+    assert "x_properties_cid" not in tensor_header
+    assert "missing_properties_cid" not in tensor_header
+
+    heterodata_path = tmp_path / "graph" / "ml" / "pyg_export" / "heterodata.pt"
+    if heterodata_path.exists():
+        try:
+            import torch
+            from torch_geometric.data import HeteroData
+        except Exception:
+            return
+        obj = torch.load(heterodata_path, map_location="cpu", weights_only=False)
+        if isinstance(obj, HeteroData):
+            assert getattr(obj, "graph_scope", None) == "train_only"

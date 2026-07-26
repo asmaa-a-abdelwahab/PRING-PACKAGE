@@ -1,6 +1,6 @@
 param(
     [string]$ProjectDir = "A:\Repositories\PRING",
-    [string]$VenvDir = "A:\Repositories\PRING\.venv",
+    [string]$VenvDir = "A:\Repositories\PRING-PACKAGE\.venv",
 
     # Existing rematerialized run to load directly.
     # The script will NOT create a new run folder and will NOT copy artifacts.
@@ -574,7 +574,7 @@ finally {
 
 # & ".\run_neo4j_load_local.ps1" `
 #   -ProjectDir "A:\Repositories\PRING" `
-#   -VenvDir "A:\Repositories\PRING\.venv" `
+#   -VenvDir "A:\Repositories\PRING-PACKAGE\.venv" `
 #   -SourceRunId "cyp450_5enzymes_uncapped_raw_rematerialized" `
 #   -Neo4jUri "bolt://localhost:7687" `
 #   -Neo4jUser "neo4j" `

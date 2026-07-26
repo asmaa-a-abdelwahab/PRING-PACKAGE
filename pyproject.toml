@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pring"
-version = "0.1.0"
+version = "0.2.0"
 description = "PubChem RDF Interaction Knowledge Graph Builder for Neo4j and GCN-ready compound-target modeling data."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -41,6 +41,10 @@ dependencies = [
   "pandas>=2.0",
   "numpy>=1.23",
 ]
+
+[project.urls]
+Repository = "https://github.com/asmaa-a-abdelwahab/PRING-PACKAGE"
+Documentation = "https://github.com/asmaa-a-abdelwahab/PRING-PACKAGE#readme"
 
 [project.optional-dependencies]
 dev = [

@@ -1,4 +1,4 @@
-# PRING — PubChem RDF Interaction Knowledge Graph Builder
+# PRING-PACKAGE — PubChem RDF Interaction Knowledge Graph Builder
 
 PRING builds **Neo4j-ready** and **GCN/link-prediction-ready** knowledge graphs from PubChem RDF evidence. It was developed for CYP450 compound–enzyme interaction studies, but the workflow is generic enough for other compound–protein or compound–gene interaction use cases.
 
@@ -11,6 +11,14 @@ PRING can:
 - write canonical JSONL artifacts, readable CSV mirrors, Neo4j import CSVs, and ML/GCN export tables;
 - load a new extraction run into Neo4j, or rebuild/load Neo4j from an existing run folder without querying PubChem again;
 - control memory, CPU, batching, cache size, retry behavior, and SPARQL chunking for laptops, workstations, and HPC clusters.
+
+The repository is named `PRING-PACKAGE`; the stable Python distribution,
+import, module entry point, and CLI remain `pring` for backward compatibility.
+New run manifests identify the repository, package version, runtime, content
+hash, dataset/split registry, and leakage-control policy.
+
+The cross-repository production, thesis, and publication gates are maintained
+in `PRING-APP/docs/REMEDIATION_AND_RELEASE_GATES.md`.
 
 ---
 

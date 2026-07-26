@@ -118,8 +118,26 @@ def test_loader_upsert_relationships_groups_by_type_and_pair():
         },
     ])
     assert len(driver.executed) == 2
-    assert "MERGE (a)-[r:HAS_STRUCTURE]->(b)" in driver.executed[0][0]
-    assert "MERGE (a)-[r:ENCODED_BY]->(b)" in driver.executed[1][0]
+    assert "MERGE (a)-[r:HAS_STRUCTURE {pring_rel_id: row.pring_rel_id}]->(b)" in driver.executed[0][0]
+    assert "MERGE (a)-[r:ENCODED_BY {pring_rel_id: row.pring_rel_id}]->(b)" in driver.executed[1][0]
+    assert driver.executed[0][1]["rows"][0]["pring_rel_id"]
+    assert driver.executed[1][1]["rows"][0]["pring_rel_id"]
+
+
+def test_loader_preserves_parallel_relationship_identity():
+    driver = RecordingDriver()
+    loader = Neo4jLoader(settings=_settings(batch_size=10), driver=driver)
+    base = {
+        "type": "SUPPORTED_BY",
+        "start": {"label": "Endpoint", "key": {"endpoint_id": "E1"}},
+        "end": {"label": "Reference", "key": {"reference_id": "R1"}},
+    }
+    loader.upsert_relationships([
+        {**base, "props": {"source_record": "A"}},
+        {**base, "props": {"source_record": "B"}},
+    ])
+    rows = driver.executed[0][1]["rows"]
+    assert rows[0]["pring_rel_id"] != rows[1]["pring_rel_id"]
 
 
 def test_loader_upsert_relationships_requires_known_endpoint_keys():
