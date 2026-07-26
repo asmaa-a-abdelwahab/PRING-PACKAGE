@@ -86,6 +86,27 @@ Examples:
 | `ASSERTS_TARGET` | `ASSERTS_TARGET` | Derived interaction assertion points to the protein target. |
 | `SUPPORTED_BY_ENDPOINT` | `SUPPORTED_BY_ENDPOINT` | Derived interaction assertion traces back to endpoint evidence. |
 
+## Endpoint measurement contract
+
+`Endpoint` preserves the submitted value, unit, qualifier, outcome, and endpoint
+name, then adds a deterministic scientific-normalization layer. IC50, Ki, Kd,
+EC50, and AC50 share a concentration unit system but remain distinct endpoint
+types and families. Normalized records may contain:
+
+- `endpoint_type`, `endpoint_family`, `endpoint_quantity`, and
+  `endpoint_semantics`;
+- `value_molar`, `value_lower_molar`, `value_upper_molar`, inclusivity flags,
+  `potency_scale_name`, and `potency_value`;
+- `reported_scale`, `qualifier_normalized`, `normalization_status`,
+  `threshold_label_eligible`, and an exclusion reason; and
+- `supervision_label`, `label_policy_id`, `label_decision_reason`,
+  `label_evidence_basis`, and `label_reliability`.
+
+The graph does not convert IC50 into Ki or Kd and does not merge endpoint types
+into a single quantitative target. A binary activity task may apply a declared
+threshold to the supported endpoint types, but the endpoint identity and
+decision provenance remain available for stratified analysis.
+
 ## How to validate schema alignment
 
 Use the schema file during loading or schema creation:

@@ -17,11 +17,17 @@ import gc
 
 from pring import __version__
 from pring.transform.target_normalization import normalize_node_record
-from pring.transform.endpoint_normalization import normalize_endpoint_node_record, normalize_endpoint_props
+from pring.transform.endpoint_normalization import (
+    THRESHOLD_LABEL_ENDPOINT_TYPES,
+    infer_endpoint_type,
+    normalize_endpoint_node_record,
+    normalize_endpoint_props,
+    normalize_qualifier,
+)
 from pring.transform.metadata_normalization import normalize_metadata_node_record
 
 
-LABEL_POLICY_ID = "pring-endpoint-activity-v2-interval-aware"
+LABEL_POLICY_ID = "pring-endpoint-activity-v3-endpoint-aware"
 
 
 def _source_commit() -> Optional[str]:
@@ -400,8 +406,10 @@ class RunStore:
             "endpoint_label_distribution": endpoint_label_distribution,
             "endpoint_label_distribution_thresholded": endpoint_label_distribution_thresholded,
             "label_config": {
+                "label_policy_id": LABEL_POLICY_ID,
                 "activity_threshold_um": activity_threshold_um,
                 "weak_activity_as_negative": weak_activity_as_negative,
+                "threshold_eligible_endpoint_types": sorted(THRESHOLD_LABEL_ENDPOINT_TYPES),
             },
             "interaction_label_distribution_raw": interaction_label_distribution,
             "similarity_report": similarity_report,
@@ -706,22 +714,26 @@ class RunStore:
             label_name, endpoint_key = _parse_node_ref(endpoint_ref)
             if label_name != "Endpoint":
                 continue
-            endpoint_label = _endpoint_supervision_label(
+            endpoint_decision = _endpoint_supervision_decision(
                 props,
                 activity_threshold_um=activity_threshold_um,
                 weak_activity_as_negative=weak_activity_as_negative,
             )
+            endpoint_label = endpoint_decision["label"]
             endpoint_id = endpoint_key.get("endpoint_id") or props.get("endpoint_id")
             if not endpoint_id:
                 continue
-            derived_label = "active" if endpoint_label == 1 else ("inactive_or_weak" if endpoint_label == 0 else "ambiguous_or_unlabeled")
             update_props = {
                 "endpoint_id": endpoint_id,
                 "supervision_label": endpoint_label if endpoint_label is not None else "unknown",
-                "supervision_label_name": derived_label,
+                "supervision_label_name": endpoint_decision["label_name"],
                 "activity_threshold_um": activity_threshold_um,
                 "weak_activity_as_negative": bool(weak_activity_as_negative),
-                "label_rule": "derived by PRING endpoint supervision labeler",
+                "label_policy_id": LABEL_POLICY_ID,
+                "label_rule": "endpoint-aware interval decision under the registered PRING label policy",
+                "label_decision_reason": endpoint_decision["reason"],
+                "label_evidence_basis": endpoint_decision["evidence_basis"],
+                "label_reliability": endpoint_decision["reliability"],
             }
             self.save_node({"label": "Endpoint", "key": {"endpoint_id": endpoint_id}, "props": update_props})
             existing_node_props_by_ref[endpoint_ref] = _merge_nonempty(props, update_props)
@@ -1375,11 +1387,19 @@ class RunStore:
                 pair_rows.append({**base_row, "label": 1, "label_rule": "positive endpoint evidence only"})
             elif neg_n > 0 and pos_n == 0:
                 negative_pair_keys.add(pair_key)
+                weak_n = int(base_row.get("weak_endpoint_count") or 0)
+                inactive_n = int(base_row.get("inactive_endpoint_count") or 0)
+                if weak_n and inactive_n:
+                    negative_source = "source-declared inactive and threshold-defined weak endpoint evidence"
+                elif weak_n:
+                    negative_source = "threshold-defined weak endpoint evidence"
+                else:
+                    negative_source = "source-declared inactive endpoint evidence"
                 negative_rows.append({
                     **base_row,
                     "label": 0,
-                    "negative_source": "curated inactive endpoint evidence",
-                    "label_rule": "negative endpoint evidence only",
+                    "negative_source": negative_source,
+                    "label_rule": "negative/weak endpoint evidence only under registered policy",
                 })
             elif pos_n > 0 and neg_n > 0:
                 ambiguous_pair_keys.add(pair_key)
@@ -1777,8 +1797,10 @@ class RunStore:
         )
 
         summary["label_config"] = {
+            "label_policy_id": LABEL_POLICY_ID,
             "activity_threshold_um": activity_threshold_um,
             "weak_activity_as_negative": bool(weak_activity_as_negative),
+            "threshold_eligible_endpoint_types": sorted(THRESHOLD_LABEL_ENDPOINT_TYPES),
         }
         summary["ml"] = {
             "node_mapping_records": len(node_mapping_rows),
@@ -4037,19 +4059,49 @@ def _endpoint_supervision_label(
     activity_threshold_um: Optional[float] = None,
     weak_activity_as_negative: bool = False,
 ) -> Optional[int]:
-    """Infer a conservative supervised label from an Endpoint record.
+    """Return the label from :func:`_endpoint_supervision_decision`."""
+    return _endpoint_supervision_decision(
+        endpoint_record,
+        activity_threshold_um=activity_threshold_um,
+        weak_activity_as_negative=weak_activity_as_negative,
+    )["label"]
 
-    Accepts either flattened CSV-style keys (``props_activity_flag``) or raw
-    node props keys (``activity_flag``). Returns 1 for curated active/potency
-    evidence, 0 for curated inactive evidence, and None for ambiguous,
-    unspecified, or unsupported endpoints. If ``activity_threshold_um`` is set,
-    numeric molar potency values weaker than the threshold can be exported as
-    negative/weak evidence when ``weak_activity_as_negative`` is true. Interval
-    qualifiers are interpreted conservatively: a bound is labeled only when it
-    proves the value lies on one side of the configured threshold.
+
+def _endpoint_supervision_decision(
+    endpoint_record: dict[str, Any],
+    *,
+    activity_threshold_um: Optional[float] = None,
+    weak_activity_as_negative: bool = False,
+) -> dict[str, Any]:
+    """Return an auditable endpoint-label decision.
+
+    The decision accepts raw node properties and flattened CSV properties.
+    Numeric thresholding is restricted to IC50, Ki, Kd, EC50, and AC50.
+    Endpoint identity is preserved; the common threshold is a declared task
+    convention, not a claim that the quantities are mechanistically
+    interchangeable. Bounds are labeled only when the complete admissible
+    interval lies on one side of the threshold.
     """
+    def result(
+        label: Optional[int],
+        reason: str,
+        evidence_basis: str,
+        reliability: str,
+        *,
+        endpoint_type: Optional[str] = None,
+    ) -> dict[str, Any]:
+        return {
+            "label": label,
+            "label_name": "active" if label == 1 else ("inactive_or_weak" if label == 0 else "ambiguous_or_unlabeled"),
+            "reason": reason,
+            "evidence_basis": evidence_basis,
+            "reliability": reliability,
+            "endpoint_type": endpoint_type or "",
+            "label_policy_id": LABEL_POLICY_ID,
+        }
+
     if not endpoint_record:
-        return None
+        return result(None, "missing_endpoint_record", "none", "insufficient")
 
     def g(*keys: str) -> Any:
         for key in keys:
@@ -4070,9 +4122,9 @@ def _endpoint_supervision_label(
         if direct_label not in (None, ""):
             text = str(direct_label).strip().lower()
             if text in {"1", "1.0", "true", "active", "positive"}:
-                return 1
+                return result(1, "reused_materialized_label", "materialized_policy_output", "policy_reused")
             if text in {"0", "0.0", "false", "inactive", "negative", "inactive_or_weak"}:
-                return 0
+                return result(0, "reused_materialized_label", "materialized_policy_output", "policy_reused")
         direct_label_name = _norm_label(
             g(
                 "props_supervision_label_name",
@@ -4082,14 +4134,14 @@ def _endpoint_supervision_label(
             )
         )
         if direct_label_name in {"active", "positive", "curated_active"}:
-            return 1
+            return result(1, "reused_materialized_label_name", "materialized_policy_output", "policy_reused")
         if direct_label_name in {
             "inactive",
             "inactive_or_weak",
             "negative",
             "curated_inactive",
         }:
-            return 0
+            return result(0, "reused_materialized_label_name", "materialized_policy_output", "policy_reused")
         if direct_label_name in {
             "ambiguous",
             "ambiguous_or_unlabeled",
@@ -4097,7 +4149,7 @@ def _endpoint_supervision_label(
             "unlabeled",
             "curated_unlabeled",
         }:
-            return None
+            return result(None, "reused_materialized_abstention", "materialized_policy_output", "insufficient")
 
     values = [
         g("props_activity_flag", "activity_flag"),
@@ -4119,45 +4171,121 @@ def _endpoint_supervision_label(
         & {"inconclusive", "indeterminate", "ambiguous", "unspecified", "unknown"}
     )
     if explicit_ambiguous or (explicit_active and explicit_inactive):
-        return None
+        return result(None, "explicit_outcome_is_ambiguous_or_conflicting", "source_activity_outcome", "conflicting")
 
-    endpoint_type = _norm_label(g("props_endpoint_type", "endpoint_type", "props_type", "type"))
-    outcome_type = _norm_label(g("props_outcome_label", "outcome_label", "props_label", "label"))
-    has_numeric = _truthy(g("props_has_numeric_value", "has_numeric_value")) or bool(g("props_value_float", "value_float", "props_value_molar", "value_molar"))
-    potency_types = {"ic50", "ec50", "ac50", "ki", "kd", "km", "inh", "potency", "activity"}
+    endpoint_type = infer_endpoint_type(
+        g("props_endpoint_type", "endpoint_type"),
+        g("props_type", "type"),
+        g("props_outcome_label", "outcome_label"),
+        g("props_label", "label"),
+    )
+    has_numeric = (
+        _truthy(g("props_has_numeric_value", "has_numeric_value"))
+        or g(
+            "props_value_float",
+            "value_float",
+            "props_value_molar",
+            "value_molar",
+            "props_value_lower_molar",
+            "value_lower_molar",
+            "props_value_upper_molar",
+            "value_upper_molar",
+        )
+        not in (None, "")
+    )
 
-    if has_numeric and ((endpoint_type in potency_types) or (outcome_type in potency_types)):
-        if activity_threshold_um is not None:
-            molar = _as_float(g("props_value_molar", "value_molar"))
-            if molar is not None:
-                threshold_molar = float(activity_threshold_um) * 1e-6
-                qualifier = _norm_label(g("props_qualifier_symbol", "qualifier_symbol", "props_qualifier", "qualifier"))
-                lower_bound = qualifier in {">", ">=", "greater_than", "ge"}
-                upper_bound = qualifier in {"<", "<=", "less_than", "le"}
-                if upper_bound:
-                    numeric_label = 1 if molar <= threshold_molar else None
-                    if numeric_label == 1 and explicit_inactive:
-                        return None
-                    return numeric_label
-                if lower_bound:
-                    if molar >= threshold_molar and weak_activity_as_negative:
-                        return None if explicit_active else 0
-                    return None
-                if molar <= threshold_molar:
-                    return None if explicit_inactive else 1
-                if weak_activity_as_negative:
-                    return None if explicit_active else 0
-                return None
-            # A numeric potency without a convertible molar unit cannot be
-            # compared with a micromolar threshold.
-            return None
-        return None if explicit_inactive else 1
+    if activity_threshold_um is None:
+        if explicit_inactive:
+            return result(0, "source_declared_inactive", "source_activity_outcome", "source_asserted", endpoint_type=endpoint_type)
+        if explicit_active:
+            return result(1, "source_declared_active", "source_activity_outcome", "source_asserted", endpoint_type=endpoint_type)
+        if has_numeric:
+            return result(
+                None,
+                "numeric_endpoint_requires_a_declared_activity_threshold",
+                "numeric_endpoint",
+                "insufficient",
+                endpoint_type=endpoint_type,
+            )
+        return result(None, "no_supported_activity_evidence", "none", "insufficient", endpoint_type=endpoint_type)
+
+    threshold_um = _as_float(activity_threshold_um)
+    if threshold_um is None or not math.isfinite(threshold_um) or threshold_um <= 0:
+        return result(None, "invalid_nonpositive_activity_threshold", "configuration", "invalid_policy", endpoint_type=endpoint_type)
+    threshold_molar = threshold_um * 1e-6
+
+    if has_numeric and endpoint_type in THRESHOLD_LABEL_ENDPOINT_TYPES:
+        lower = _as_float(g("props_value_lower_molar", "value_lower_molar"))
+        upper = _as_float(g("props_value_upper_molar", "value_upper_molar"))
+        lower_inclusive = _truthy(g("props_value_lower_inclusive", "value_lower_inclusive"))
+        upper_inclusive = _truthy(g("props_value_upper_inclusive", "value_upper_inclusive"))
+        molar = _as_float(g("props_value_molar", "value_molar"))
+        qualifier = normalize_qualifier(
+            g("props_qualifier_normalized", "qualifier_normalized", "props_qualifier_symbol", "qualifier_symbol", "props_qualifier", "qualifier")
+        )
+
+        # Backward compatibility for records created before explicit interval
+        # fields were introduced.
+        if lower is None and upper is None and molar is not None:
+            if qualifier == "eq":
+                lower = upper = molar
+                lower_inclusive = upper_inclusive = True
+            elif qualifier == "lt":
+                upper, upper_inclusive = molar, False
+            elif qualifier == "le":
+                upper, upper_inclusive = molar, True
+            elif qualifier == "gt":
+                lower, lower_inclusive = molar, False
+            elif qualifier == "ge":
+                lower, lower_inclusive = molar, True
+
+        finite_bounds = all(
+            value is None or (math.isfinite(value) and value > 0)
+            for value in (lower, upper)
+        )
+        if not finite_bounds:
+            return result(None, "invalid_nonpositive_or_nonfinite_interval", "numeric_endpoint", "invalid_measurement", endpoint_type=endpoint_type)
+        if qualifier in {"approx", "unknown"}:
+            return result(None, "approximate_or_unknown_qualifier_has_no_defensible_interval", "numeric_endpoint", "insufficient", endpoint_type=endpoint_type)
+        if lower is None and upper is None:
+            return result(None, "numeric_endpoint_has_no_convertible_molar_interval", "numeric_endpoint", "insufficient", endpoint_type=endpoint_type)
+
+        # Active means the complete interval is at or below tau.
+        positive_supported = upper is not None and upper <= threshold_molar
+        # Weak/negative means the complete interval is strictly above tau.
+        # For a lower bound of "> tau", equality of the stored bound is safe;
+        # for ">= tau", equality includes the active boundary and must abstain.
+        negative_supported = lower is not None and (
+            lower > threshold_molar
+            or (lower == threshold_molar and not lower_inclusive)
+        )
+
+        if positive_supported:
+            if explicit_inactive:
+                return result(None, "numeric_active_conflicts_with_source_inactive", "numeric_and_source_evidence", "conflicting", endpoint_type=endpoint_type)
+            reliability = "concordant_source_and_threshold" if explicit_active else "threshold_supported"
+            return result(1, "complete_interval_at_or_below_threshold", "numeric_endpoint_threshold", reliability, endpoint_type=endpoint_type)
+        if negative_supported and weak_activity_as_negative:
+            if explicit_active:
+                return result(None, "numeric_weak_conflicts_with_source_active", "numeric_and_source_evidence", "conflicting", endpoint_type=endpoint_type)
+            reliability = "concordant_source_and_threshold" if explicit_inactive else "threshold_supported"
+            return result(0, "complete_interval_strictly_above_threshold", "numeric_endpoint_threshold", reliability, endpoint_type=endpoint_type)
+        if negative_supported and not weak_activity_as_negative:
+            return result(None, "weak_numeric_activity_not_configured_as_negative", "numeric_endpoint_threshold", "policy_abstention", endpoint_type=endpoint_type)
+        return result(None, "measurement_interval_crosses_activity_threshold", "numeric_endpoint_threshold", "insufficient", endpoint_type=endpoint_type)
+
+    if has_numeric and endpoint_type not in THRESHOLD_LABEL_ENDPOINT_TYPES:
+        if explicit_inactive:
+            return result(0, "unsupported_numeric_type_but_source_declared_inactive", "source_activity_outcome", "source_asserted", endpoint_type=endpoint_type)
+        if explicit_active:
+            return result(1, "unsupported_numeric_type_but_source_declared_active", "source_activity_outcome", "source_asserted", endpoint_type=endpoint_type)
+        return result(None, "endpoint_type_not_eligible_for_threshold_labeling", "numeric_endpoint", "insufficient", endpoint_type=endpoint_type)
 
     if explicit_inactive:
-        return 0
+        return result(0, "source_declared_inactive_without_comparable_numeric_endpoint", "source_activity_outcome", "source_asserted", endpoint_type=endpoint_type)
     if explicit_active:
-        return 1
-    return None
+        return result(1, "source_declared_active_without_comparable_numeric_endpoint", "source_activity_outcome", "source_asserted", endpoint_type=endpoint_type)
+    return result(None, "no_supported_activity_evidence", "none", "insufficient", endpoint_type=endpoint_type)
 
 
 def _as_int(value: Any) -> Optional[int]:
@@ -4336,15 +4464,26 @@ def _aggregate_endpoint_pair_features(
         endpoint_type = _norm_label(_first_nonempty_prop(rec, "props_endpoint_type", "endpoint_type", "props_type", "type")) or "unknown"
         endpoint_type = endpoint_type.lower()
         type_counts[endpoint_type] = type_counts.get(endpoint_type, 0) + 1
-        label = _endpoint_supervision_label(
+        decision = _endpoint_supervision_decision(
             rec,
             activity_threshold_um=activity_threshold_um,
             weak_activity_as_negative=weak_activity_as_negative,
         )
+        label = decision["label"]
         if label == 1:
             active += 1
         elif label == 0:
-            if _endpoint_is_threshold_weak(rec, activity_threshold_um=activity_threshold_um) or "weak" in str(_first_nonempty_prop(rec, "props_supervision_label_name", "supervision_label_name") or "").lower():
+            if (
+                decision["evidence_basis"] == "numeric_endpoint_threshold"
+                or "weak" in str(
+                    _first_nonempty_prop(
+                        rec,
+                        "props_supervision_label_name",
+                        "supervision_label_name",
+                    )
+                    or ""
+                ).lower()
+            ):
                 weak += 1
             else:
                 inactive += 1
@@ -4375,19 +4514,6 @@ def _aggregate_endpoint_pair_features(
         "inactive_endpoint_count": inactive,
     })
     return out
-
-
-def _endpoint_is_threshold_weak(endpoint_record: dict[str, Any], *, activity_threshold_um: Optional[float]) -> bool:
-    if activity_threshold_um is None:
-        return False
-    molar = _as_float(_first_nonempty_prop(endpoint_record, "props_value_molar", "value_molar"))
-    if molar is None:
-        return False
-    try:
-        return molar > float(activity_threshold_um) * 1e-6
-    except Exception:
-        return False
-
 
 def _build_bindingdb_pair_features(
     node_records_by_ref: dict[str, dict[str, Any]],
@@ -4734,11 +4860,12 @@ def _build_endpoint_feature_rows(
         # Earlier versions exported raw endpoint labels here, which made
         # node_features_endpoint.csv inconsistent with Endpoint.csv and the
         # compound-target training pairs.
-        sup_label = _endpoint_supervision_label(
+        decision = _endpoint_supervision_decision(
             rec,
             activity_threshold_um=activity_threshold_um,
             weak_activity_as_negative=weak_activity_as_negative,
         )
+        sup_label = decision["label"]
         has_numeric = _truthy(rec.get("props_has_numeric_value")) or rec.get("props_value_float") not in (None, "") or rec.get("props_value_molar") not in (None, "")
         rows.append({
             "node_id": node_id_by_ref.get(ref, ""),
@@ -4748,7 +4875,11 @@ def _build_endpoint_feature_rows(
             "value_raw": rec.get("props_value_raw", rec.get("props_value", "")),
             "value_float": rec.get("props_value_float", ""),
             "value_molar": rec.get("props_value_molar", ""),
+            "value_lower_molar": rec.get("props_value_lower_molar", ""),
+            "value_upper_molar": rec.get("props_value_upper_molar", ""),
             "negative_log10_molar": rec.get("props_negative_log10_molar", ""),
+            "potency_scale_name": rec.get("props_potency_scale_name", ""),
+            "potency_value": rec.get("props_potency_value", ""),
             "unit_raw": rec.get("props_unit", ""),
             "unit_uri": rec.get("props_unit_uri", ""),
             "unit_curie": rec.get("props_unit_curie", ""),
@@ -4756,11 +4887,22 @@ def _build_endpoint_feature_rows(
             "unit_symbol": rec.get("props_unit_symbol", ""),
             "qualifier": rec.get("props_qualifier", ""),
             "qualifier_symbol": rec.get("props_qualifier_symbol", ""),
+            "qualifier_normalized": rec.get("props_qualifier_normalized", ""),
+            "endpoint_family": rec.get("props_endpoint_family", ""),
+            "endpoint_quantity": rec.get("props_endpoint_quantity", ""),
+            "reported_scale": rec.get("props_reported_scale", ""),
+            "normalization_status": rec.get("props_normalization_status", ""),
+            "threshold_label_eligible": rec.get("props_threshold_label_eligible", ""),
+            "threshold_label_exclusion_reason": rec.get("props_threshold_label_exclusion_reason", ""),
             "outcome_label": rec.get("props_outcome_label", ""),
             "outcome_label_normalized": rec.get("props_outcome_label_normalized", ""),
             "activity_flag": rec.get("props_activity_flag", ""),
             "supervision_label": "" if sup_label is None else sup_label,
-            "supervision_label_name": "active" if sup_label == 1 else ("inactive_or_weak" if sup_label == 0 else "ambiguous_or_unlabeled"),
+            "supervision_label_name": decision["label_name"],
+            "label_policy_id": decision["label_policy_id"],
+            "label_decision_reason": decision["reason"],
+            "label_evidence_basis": decision["evidence_basis"],
+            "label_reliability": decision["reliability"],
             "score": rec.get("props_score", ""),
             "has_numeric_value": has_numeric,
             "measuregroup_count": ctx.get("measuregroup_count", 0),

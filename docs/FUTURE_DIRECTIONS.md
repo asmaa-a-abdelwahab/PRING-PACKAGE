@@ -18,7 +18,10 @@ This document lists practical future directions for improving PRING after the cu
 
 ## 3. Label harmonization and confidence scoring
 
-- **Endpoint threshold harmonization**: support configurable rules for IC50, AC50, Ki, Kd, EC50, inhibition percent, and qualitative outcomes.
+- **Assay-specific threshold profiles**: extend the endpoint-aware v3 policy
+  with registered per-endpoint and per-assay thresholds when a scientific
+  protocol justifies them; retain the common-threshold mode for reproducible
+  sensitivity analysis.
 - **Conflict resolution**: summarize contradictory assay outcomes with transparent aggregation rules, confidence scores, and evidence counts.
 - **Assay-aware splitting**: prevent data leakage by supporting compound-level, assay-level, target-level, and time-aware train/test split strategies.
 - **Negative-label calibration**: distinguish confirmed inactive evidence from unknown candidate pairs and weak numeric activity above threshold.

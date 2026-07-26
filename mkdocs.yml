@@ -98,6 +98,7 @@ nav:
       - Schema and provenance: schema-and-provenance.md
       - PubChem transformation story: pring_pubchem_storyline.md
   - Data and modeling:
+      - Endpoint normalization: ENDPOINT_NORMALIZATION.md
       - Modeling exports: MODELING_EXPORTS.md
       - Run-data EDA: RUN_DATA_EDA_PIPELINE.md
       - Enrichment layer: ENRICHMENT_LAYER.md

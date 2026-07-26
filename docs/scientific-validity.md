@@ -29,10 +29,31 @@ make a modeling claim valid by itself.
   truth.
 - Per-target performance can differ sharply from aggregate metrics.
 
+## Endpoint-normalization validity
+
+IC50, Ki, Kd, EC50, and AC50 are normalized to molar concentration and may be
+represented as `pX = -log10(X[M])`, but they are not interchangeable response
+variables. IC50 is assay-dependent inhibition potency; Ki is an inhibition
+constant estimated under a stated model; Kd is an equilibrium binding
+dissociation constant; EC50 is functional potency; and AC50 is a
+screening/curve-fit activity concentration. PRING does not automatically
+convert between them.
+
+The v3 label policy requires a predeclared positive concentration threshold for
+numeric evidence, preserves inequality bounds, abstains for intervals crossing
+the threshold, and excludes unsupported units, nonpositive values, approximate
+values without an uncertainty interval, Km, and generic Activity/Potency/INH
+measurements from numeric threshold labeling. A source-declared PubChem
+active/inactive outcome remains traceable as `source_asserted`; it is not
+represented as independently verified biological truth.
+
+See [Scientific endpoint normalization and label
+policy](ENDPOINT_NORMALIZATION.md) for endpoint definitions, formulas,
+decision rules, and acceptance tests.
+
 ## Reporting
 
 Report class prevalence, split construction, sample exclusions, calibration,
 confidence intervals, per-target results, abstentions, failed inputs, and
 external-validity limitations. Qualify predictions as computational hypotheses,
 not clinical or causal conclusions.
-

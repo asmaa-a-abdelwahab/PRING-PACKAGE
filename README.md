@@ -509,8 +509,8 @@ Use caps to keep runs reproducible and resource-safe.
 
 | Option | Meaning |
 |---|---|
-| `--activity-threshold-um N` | Potency threshold in micromolar for labels. Example: `10`. |
-| `--weak-activity-as-negative true/false` | Treat weaker numeric activity as negative/weak when a threshold is set. |
+| `--activity-threshold-um N` | Predeclared positive threshold in micromolar for numeric IC50, Ki, Kd, EC50, and AC50 labels. Without it, numeric-only records remain unlabeled. Example: `10`. |
+| `--weak-activity-as-negative true/false` | Treat an eligible numeric interval wholly above the threshold as negative/weak. This defines a modeling class, not proven biological non-interaction. |
 | `--candidate-pair-mode sampled/all` | Export sampled or all unobserved compound-target pairs. |
 | `--max-candidate-missing-pairs N/none` | Maximum unknown candidate pairs to export. Use `none` with care. |
 | `--case-study-mode exploratory/final-cyp450` | Optional QA preset. Final CYP450 mode expects uncapped modeling candidates. |
@@ -965,7 +965,7 @@ The future roadmap is maintained in:
 docs/FUTURE_DIRECTIONS.md
 ```
 
-The main planned directions are PubChem FTP/bulk ingestion, stronger ontology alignment, schema versioning, endpoint harmonization, confidence scoring, richer GNN/KGE exports, explainability, Docker/Singularity packaging, CI expansion, and publication artifact archiving.
+The main planned directions are PubChem FTP/bulk ingestion, stronger ontology alignment, schema versioning, assay- and endpoint-specific threshold profiles, confidence calibration, richer GNN/KGE exports, explainability, Docker/Singularity packaging, CI expansion, and publication artifact archiving.
 
 ---
 

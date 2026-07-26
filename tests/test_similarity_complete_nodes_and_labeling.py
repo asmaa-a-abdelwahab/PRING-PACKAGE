@@ -40,7 +40,14 @@ def test_similarity_layer_emits_complete_target_compound_nodes():
 
 
 def test_endpoint_supervision_label_accepts_raw_and_flattened_records():
-    assert _endpoint_supervision_label({"endpoint_type": "IC50", "value_molar": 2e-6, "has_numeric_value": True}) == 1
-    assert _endpoint_supervision_label({"props_endpoint_type": "IC50", "props_value_molar": "2e-6", "props_has_numeric_value": "true"}) == 1
+    assert _endpoint_supervision_label({"endpoint_type": "IC50", "value_molar": 2e-6, "has_numeric_value": True}) is None
+    assert _endpoint_supervision_label(
+        {"endpoint_type": "IC50", "value_molar": 2e-6, "has_numeric_value": True},
+        activity_threshold_um=10,
+    ) == 1
+    assert _endpoint_supervision_label(
+        {"props_endpoint_type": "IC50", "props_value_molar": "2e-6", "props_has_numeric_value": "true"},
+        activity_threshold_um=10,
+    ) == 1
     assert _endpoint_supervision_label({"activity_flag": "inactive"}) == 0
     assert _endpoint_supervision_label({"endpoint_type": "IC50", "value_molar": 20e-6, "has_numeric_value": True}, activity_threshold_um=10, weak_activity_as_negative=True) == 0

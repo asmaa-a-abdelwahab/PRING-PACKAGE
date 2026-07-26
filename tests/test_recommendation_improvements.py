@@ -42,9 +42,15 @@ def test_materialization_deduplicates_nodes_derives_has_source_and_endpoint_csv(
     rel("ABOUT_SUBSTANCE", "Endpoint", {"endpoint_id": "E"}, "Substance", {"sid": 11})
     rel("TESTED_ON", "MeasureGrp", {"mg_id": "MG"}, "Protein", {"protein_id": "P08684"})
 
-    derived = store.materialize_schema_derived_graph()
+    derived = store.materialize_schema_derived_graph(
+        activity_threshold_um=10,
+        weak_activity_as_negative=True,
+    )
     assert derived["added_relationships"] >= 1
-    summary = store.materialize_csv_mirrors()
+    summary = store.materialize_csv_mirrors(
+        activity_threshold_um=10,
+        weak_activity_as_negative=True,
+    )
     assert summary["nodes"]["Compound"]["records"] == 1
 
     endpoint_csv = (store.nodes_csv_dir / "Endpoint.csv").read_text(encoding="utf-8-sig")
@@ -89,7 +95,10 @@ def test_ml_export_filters_dangling_similarity_and_exports_curated_negative(tmp_
     rel("TESTED_ON", "MeasureGrp", {"mg_id": "MG1"}, "Protein", {"protein_id": "P08684"})
     rel("TESTED_ON", "MeasureGrp", {"mg_id": "MG2"}, "Protein", {"protein_id": "P08684"})
 
-    summary = store.materialize_csv_mirrors()
+    summary = store.materialize_csv_mirrors(
+        activity_threshold_um=10,
+        weak_activity_as_negative=True,
+    )
     assert summary["ml"]["skipped_relationships_missing_nodes"].get("SIMILAR_TO") == 1
 
     with (store.ml_dir / "edge_index.csv").open(encoding="utf-8-sig", newline="") as f:
@@ -108,5 +117,5 @@ def test_ml_export_filters_dangling_similarity_and_exports_curated_negative(tmp_
     assert pos[0]["label"] == "1"
     assert len(neg) == 1
     assert neg[0]["label"] == "0"
-    assert neg[0]["negative_source"] == "curated inactive endpoint evidence"
+    assert neg[0]["negative_source"] == "source-declared inactive endpoint evidence"
     assert len(cand) == 2

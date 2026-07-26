@@ -10,9 +10,15 @@ supervised-pair, and candidate-pair hashes. `split_registry_id` includes every
 supervised pair assignment rather than only aggregate split counts.
 
 Endpoint supervision uses the versioned
-`pring-endpoint-activity-v2-interval-aware` policy. Inequality-qualified
-measurements are labeled only when the bound proves that the value lies on one
-side of the configured activity threshold; otherwise they remain ambiguous.
+`pring-endpoint-activity-v3-endpoint-aware` policy. Numeric threshold labels
+require a declared threshold and are restricted to IC50, Ki, Kd, EC50, and
+AC50. Endpoint identity is never erased: a common threshold is a binary-task
+harmonization choice, not evidence that these observables have identical
+mechanistic meaning. Inequality-qualified measurements are labeled only when
+the complete molar interval lies on one side of the configured threshold;
+otherwise the labeler abstains. Endpoint feature exports include the
+normalization status, molar bounds, pX scale, eligibility/exclusion reason, and
+the auditable label-decision basis.
 
 PRING now writes stage-organized modeling artifacts under:
 
