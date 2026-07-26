@@ -13,6 +13,8 @@
   plotting failures until EDA execution so test collection remains import-safe.
 - Upgrade CI and Pages actions to their current Node.js 24 generations and
   document the one-time Pages enablement requirement.
+- Use attempt-specific Pages artifact names so rerunning a workflow cannot
+  create an ambiguous duplicate `github-pages` artifact.
 
 ## 0.2.0 — 2026-07-26
 
