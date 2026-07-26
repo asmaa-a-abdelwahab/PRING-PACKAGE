@@ -50,6 +50,7 @@ Documentation = "https://github.com/asmaa-a-abdelwahab/PRING-PACKAGE#readme"
 dev = [
   "pytest>=7.4",
   "pytest-cov>=4.1",
+  "matplotlib>=3.7",
 ]
 analysis = [
   "pandas>=2.0",

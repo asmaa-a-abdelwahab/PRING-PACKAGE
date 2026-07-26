@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 import pring.cli as cli
+import pring.analysis.run_eda as run_eda
 from pring.analysis.run_eda import resolve_run_context
 
 
@@ -84,6 +87,42 @@ def test_resolve_run_context_accepts_default_output_dir(tmp_path: Path):
     ctx = resolve_run_context(run)
     assert ctx.run_root == run.resolve()
     assert ctx.output_dir == (run / "analysis" / "eda").resolve()
+
+
+def test_analysis_utilities_import_without_matplotlib():
+    script = """
+import builtins
+
+original_import = builtins.__import__
+
+def import_without_matplotlib(name, *args, **kwargs):
+    if name == "matplotlib" or name.startswith("matplotlib."):
+        raise ModuleNotFoundError("matplotlib intentionally unavailable")
+    return original_import(name, *args, **kwargs)
+
+builtins.__import__ = import_without_matplotlib
+from pring.analysis.run_eda import resolve_run_context
+assert callable(resolve_run_context)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_run_analysis_reports_missing_plotting_dependency(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(run_eda, "plt", None)
+    monkeypatch.setattr(
+        run_eda,
+        "_PLOTTING_IMPORT_ERROR",
+        ModuleNotFoundError("matplotlib intentionally unavailable"),
+    )
+
+    with pytest.raises(RuntimeError, match=r"analysis extra"):
+        run_eda._require_plotting_dependency()
 
 
 def test_eda_command_generates_reports(monkeypatch: object, tmp_path: Path):

@@ -41,6 +41,12 @@ mkdocs build --strict
 ```
 
 The GitHub Actions documentation workflow publishes the generated `site`
-artifact through GitHub Pages. In repository settings, select **GitHub
-Actions** as the Pages source.
+artifact through GitHub Pages. Before the first deployment, a repository
+administrator must open **Settings → Pages → Build and deployment → Source**
+and select **GitHub Actions**. If the workflow reports `Get Pages site failed`
+or an HTTP 404 from `configure-pages`, Pages has not yet been enabled for that
+repository. Re-run the documentation workflow after changing the setting.
 
+Do not add an administrative personal access token merely to enable Pages from
+the workflow. The built-in `GITHUB_TOKEN` is sufficient for routine deployment
+after the one-time repository setting is complete.

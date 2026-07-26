@@ -33,16 +33,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-try:
-    import numpy as np
-    import pandas as pd
-except ImportError as exc:  # pragma: no cover - user environment check
-    raise SystemExit(
-        "Missing required analysis dependencies. Install with:\n"
-        "  pip install pandas numpy matplotlib\n"
-        f"Original error: {exc}"
-    ) from exc
+import numpy as np
+import pandas as pd
 
+_PLOTTING_IMPORT_ERROR: Optional[ImportError] = None
 try:
     import matplotlib
 
@@ -50,11 +44,19 @@ try:
     import matplotlib.pyplot as plt
     warnings.filterwarnings("ignore", category=matplotlib.MatplotlibDeprecationWarning)
 except ImportError as exc:  # pragma: no cover - user environment check
-    raise SystemExit(
-        "Missing required plotting dependency. Install with:\n"
-        "  pip install matplotlib\n"
-        f"Original error: {exc}"
-    ) from exc
+    matplotlib = None  # type: ignore[assignment]
+    plt = None  # type: ignore[assignment]
+    _PLOTTING_IMPORT_ERROR = exc
+
+
+def _require_plotting_dependency() -> None:
+    """Fail at EDA execution time, not while importing analysis utilities."""
+
+    if plt is None:
+        raise RuntimeError(
+            "The EDA command requires matplotlib. Install PRING with the "
+            "analysis extra: python -m pip install -e \".[analysis]\""
+        ) from _PLOTTING_IMPORT_ERROR
 
 
 # -----------------------------------------------------------------------------
@@ -2527,6 +2529,7 @@ def build_html_report(ctx: RunContext, markdown: str) -> str:
 def run_analysis(args: argparse.Namespace) -> Path:
     """Run the full exploratory analysis pipeline."""
 
+    _require_plotting_dependency()
     ctx = resolve_run_context(Path(args.run_path), Path(args.output_dir) if args.output_dir else None)
 
     import time

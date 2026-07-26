@@ -9,6 +9,10 @@
   documentation/build output.
 - Move dated patch notes and internal readiness reports into an excluded
   documentation archive.
+- Install the plotting stack in development environments and defer optional
+  plotting failures until EDA execution so test collection remains import-safe.
+- Upgrade CI and Pages actions to their current Node.js 24 generations and
+  document the one-time Pages enablement requirement.
 
 ## 0.2.0 — 2026-07-26
 
